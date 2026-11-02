@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+artifacts/
+.satria_jobs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.DS_Store

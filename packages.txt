@@ -1,0 +1,9 @@
+libpango-1.0-0
+libpangoft2-1.0-0
+libcairo2
+libgdk-pixbuf-2.0-0
+libffi-dev
+libjpeg-dev
+libopenjp2-7-dev
+shared-mime-info
+ca-certificates
