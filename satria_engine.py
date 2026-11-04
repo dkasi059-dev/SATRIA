@@ -2777,7 +2777,7 @@ def feature_source_maps(base_url, html):
             if urlparse(full).hostname == urlparse(base_url).hostname:
                 js_urls.add(full)
     findings, checked_js = [], []
-    for js_url in list(js_urls)[:30]:
+    for js_url in list(js_urls)[:100]:
         try:
             r = requests.get(js_url, timeout=REQUEST_TIMEOUT,
                              headers={"User-Agent": "DefensiveSecurityAudit/1.0"})
