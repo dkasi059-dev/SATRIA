@@ -119,9 +119,9 @@ FINDINGS_PATH = "artifacts/findings.json"
 OUTPUT_PDF    = "artifacts/laporan_kerentanan.pdf"
 
 # ID model harus mengikuti format provider/model yang digunakan KiosAPI.
-MODEL_PRIMARY = os.getenv("KIOSAPI_MODEL", "mistral-large-4").strip()
+MODEL_PRIMARY = os.getenv("KIOSAPI_MODEL", "agnes-3.0-flash").strip()
 MODEL_FALLBACKS = [
-    os.getenv("KIOSAPI_MODEL_FALLBACK_1", "nemotron-3.5-super-vl").strip(),
+    os.getenv("KIOSAPI_MODEL_FALLBACK_1", "laguna-xs-2.1").strip(),
     os.getenv("KIOSAPI_MODEL_FALLBACK_2", "step-5-preview").strip(),
 ]
 MODEL_FALLBACKS = [m for m in MODEL_FALLBACKS if m and m != MODEL_PRIMARY]
