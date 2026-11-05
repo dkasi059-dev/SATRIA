@@ -12125,297 +12125,953 @@ def run_portswigger_coverage_analyzer(target_url, html, active_raw=None):
 # Final report remains findings-only. Keep the new discovery details in raw
 # diagnostics for engineering review, not as a catalogue in the customer PDF.
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SATRIA PORTSWIGGER LAB ENGINE V4
+# Scenario-aware, evidence-driven checks for the 273 Academy scenarios supplied
+# by the operator. The customer PDF remains findings-only; detailed per-scenario
+# telemetry is retained in active_raw for engineering diagnostics.
+# ══════════════════════════════════════════════════════════════════════════════
+# Design constraints:
+# - Every scenario is registered with a stable ID and an explicit test family.
+# - A scenario is marked tested only when its corresponding request/review ran.
+# - Generic targets never receive Academy-specific internal-network probes.
+# - No credential theft, database/file secret extraction, web-shell upload,
+#   destructive workflow action, brute-force campaign, OOB exfiltration,
+#   cross-user race, or HTTP desynchronization payload is automated.
+# - POST probes are used only for known read-only Academy laboratory endpoints.
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ============================================================================
-# SATRIA SSRF BLACKLIST-FILTER LAB ANALYZER (separate from open-redirect lab)
-# This targets the distinct Academy workflow:
-#   POST /product/stock stockApi=...
-# and tests the documented loopback-alias + path-encoding filter behavior.
-# It is Academy-host-only, authorization-gated, same-origin at the HTTP client,
-# bounded to four POSTs, and reads /admin only. It NEVER calls /admin/delete.
-# ============================================================================
-SATRIA_SSRF_BLACKLIST_FILTER_V1 = True
-SATRIA_SSRF_BLACKLIST_MAX_REQUESTS = 4
-SATRIA_SSRF_BLACKLIST_TIMEOUT = 8
-SATRIA_SSRF_BLACKLIST_LAB_NAME = "SSRF with blacklist-based input filter"
+SATRIA_PORTSWIGGER_LAB_ENGINE_V4 = True
+SATRIA_PORTSWIGGER_LAB_MAX_EXTRA_REQUESTS = 32
+SATRIA_PORTSWIGGER_LAB_TIMEOUT = 7
+SATRIA_PORTSWIGGER_LAB_BODY_LIMIT = 180_000
+SATRIA_PORTSWIGGER_SCENARIOS_EXPECTED = 273
 
 
-def _satria_ssrf_blacklist_stock_endpoint(target_url, crawler_forms, html):
-    """Return only a same-origin POST route whose form explicitly has stockApi."""
-    for form in (crawler_forms or []):
+def _satria_ps4_registry():
+    registry = []
+    for category, raw in SATRIA_PORTSWIGGER_LABS.items():
+        for name in [x.strip() for x in str(raw or "").splitlines() if x.strip()]:
+            key = (str(category) + "::" + str(name)).encode("utf-8", "ignore")
+            scenario_id = hashlib.sha1(key).hexdigest()[:14]
+            n = name.lower()
+            family = "manual_context"
+            if category == "SQL injection": family = "sqli_differential"
+            elif category == "Cross-site scripting": family = "xss_context"
+            elif category == "Cross-site request forgery (CSRF)": family = "csrf_state_binding"
+            elif category == "Clickjacking": family = "frame_protection"
+            elif category == "DOM-based vulnerabilities": family = "dom_source_sink"
+            elif category == "Cross-origin resource sharing (CORS)": family = "cors_origin_policy"
+            elif category == "XML external entity (XXE) injection": family = "xml_parser_surface"
+            elif category == "Server-side request forgery (SSRF)":
+                family = "ssrf_blacklist" if "blacklist" in n else ("ssrf_open_redirect" if "open redirection" in n else ("ssrf_whitelist" if "whitelist" in n else "ssrf_url_sink"))
+            elif category == "HTTP request smuggling": family = "http_desync_manual"
+            elif category == "OS command injection": family = "command_injection_safe_marker"
+            elif category == "Server-side template injection": family = "ssti_arithmetic"
+            elif category == "Path traversal": family = "path_traversal_public_fixture"
+            elif category == "Access control vulnerabilities": family = "access_control_readonly"
+            elif category == "Authentication": family = "authentication_flow_review"
+            elif category == "WebSockets": family = "websocket_handshake"
+            elif category == "Web cache poisoning": family = "cache_key_differential"
+            elif category == "Insecure deserialization": family = "serialization_format_review"
+            elif category == "Information disclosure": family = "public_metadata_paths"
+            elif category == "Business logic vulnerabilities": family = "business_invariant_manual"
+            elif category == "HTTP Host header attacks": family = "host_header_differential"
+            elif category == "OAuth authentication": family = "oauth_metadata_flow"
+            elif category == "File upload vulnerabilities": family = "upload_validation_review"
+            elif category == "JWT": family = "jwt_structure_review"
+            elif category == "Essential skills": family = "discovery_quality"
+            elif category == "Prototype pollution": family = "prototype_source_sink"
+            elif category == "GraphQL API vulnerabilities": family = "graphql_readonly"
+            elif category == "Race conditions": family = "race_condition_manual"
+            elif category == "NoSQL injection": family = "nosql_type_differential"
+            elif category == "API testing": family = "api_surface_discovery"
+            elif category == "Web LLM attacks": family = "llm_surface_inventory"
+            elif category == "Web cache deception": family = "cache_deception_context"
+            registry.append({"scenario_id": scenario_id, "category": category, "name": name, "test_family": family})
+    return registry
+
+
+SATRIA_PORTSWIGGER_SCENARIO_REGISTRY_V4 = _satria_ps4_registry()
+SATRIA_PORTSWIGGER_SCENARIO_COUNT_V4 = len(SATRIA_PORTSWIGGER_SCENARIO_REGISTRY_V4)
+
+
+def _satria_ps4_body(response):
+    try:
+        return str(getattr(response, "text", "") or "")[:SATRIA_PORTSWIGGER_LAB_BODY_LIMIT]
+    except Exception:
+        return ""
+
+
+def _satria_ps4_signature(response):
+    body = _satria_ps4_body(response)
+    normalized = re.sub(r"(?is)<script\b.*?</script>", " ", body)
+    normalized = re.sub(r"(?is)<style\b.*?</style>", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return {"status": int(getattr(response, "status_code", 0) or 0),
+            "length": len(body), "text": normalized[:25000],
+            "body": body}
+
+
+def _satria_ps4_blocked(response):
+    body = _satria_ps4_body(response).lower()
+    status = int(getattr(response, "status_code", 0) or 0)
+    phrases = ("blocked", "not allowed", "invalid url", "url is not allowed",
+               "blacklist", "forbidden", "rejected", "access denied")
+    return status in {400, 401, 403, 422} or any(x in body for x in phrases)
+
+
+def _satria_ps4_same_origin_url(url, target_url):
+    try:
+        return bool(_satria_ps_same_origin(str(url or ""), target_url))
+    except Exception:
+        return False
+
+
+def _satria_ps4_request(url, budget, *, method="GET", data=None, params=None, headers=None,
+                        allow_redirects=False):
+    if budget["requests"] >= budget["max_requests"]:
+        return None, "extra_request_budget_exhausted"
+    if not _satria_ps4_same_origin_url(url, budget["target"]):
+        return None, "out_of_scope_url_rejected"
+    method = str(method or "GET").upper()
+    if method not in {"GET", "HEAD", "OPTIONS", "POST"}:
+        return None, "method_not_allowed"
+    budget["requests"] += 1
+    try:
+        response = _satria_ctx_request(
+            url, method=method, data=data, params=params,
+            headers=headers or HEADERS,
+            timeout=SATRIA_PORTSWIGGER_LAB_TIMEOUT,
+            allow_redirects=allow_redirects,
+        )
+        return response, "ok"
+    except Exception as exc:
+        return None, str(exc)[:180]
+
+
+def _satria_ps4_stock_endpoint(target_url, forms, routes, html):
+    for form in forms or []:
         if not isinstance(form, dict):
             continue
-        method = str(form.get("method") or "GET").lower()
-        fields = {str(x).lower() for x in (form.get("inputs") or [])}
+        fields = [str(x).lower() for x in (form.get("inputs") or [])]
         action = urljoin(str(form.get("url") or target_url), str(form.get("action") or ""))
-        parsed = urlparse(action)
-        if (method == "post" and "stockapi" in fields
-                and parsed.path.rstrip("/").lower() == "/product/stock"
-                and _satria_ps_same_origin(action, target_url)):
+        if (str(form.get("method") or "get").lower() == "post"
+                and "stockapi" in fields
+                and _satria_ps4_same_origin_url(action, target_url)):
             return action
-    # The static fallback is restricted to the known Academy stock-check form.
+    for route in routes or []:
+        if not isinstance(route, dict):
+            continue
+        route_url = str(route.get("url") or "")
+        if (str(route.get("method") or "").upper() == "POST"
+                and urlparse(route_url).path.rstrip("/").lower() == "/product/stock"
+                and _satria_ps4_same_origin_url(route_url, target_url)):
+            return route_url
     source = str(html or "")[:PORTSWIGGER_EXTRA_BODY_LIMIT]
-    if (_satria_ps_is_lab(target_url)
-            and re.search(r"<form[^>]*action=[\"'][^\"']*/product/stock", source, re.I | re.S)
-            and re.search(r"name=[\"']stockApi[\"']", source, re.I)):
+    if _satria_ps_is_lab(target_url) and re.search(r"stockApi|/product/stock|check.stock", source, re.I):
         return urljoin(target_url, "/product/stock")
     return ""
 
 
-def _satria_ssrf_blacklist_blocked(response):
-    body = _satria_ssrf_response_body(response, limit=80_000).lower()
-    status = int(getattr(response, "status_code", 0) or 0)
-    phrases = (
-        "external stock check blocked",
-        "stock check blocked for security reasons",
-        "blocked for security reasons",
-        "invalid stock api",
-        "invalid url",
-        "not allowed",
-        "access denied",
-    )
-    return status in {400, 401, 403, 406, 422} or any(x in body for x in phrases)
+def _satria_ps4_find_query_candidates(urls, limit=12):
+    out, seen = [], set()
+    blocked = re.compile(r"(?:csrf|xsrf|token|password|passwd|secret|session|cookie|auth|api.?key|otp|email|username|login|logout|delete|remove|transfer|checkout|payment)", re.I)
+    for raw in urls or []:
+        try:
+            p = urlparse(str(raw))
+            pairs = parse_qsl(p.query, keep_blank_values=True)
+            for key, value in pairs:
+                ident = (p.path.lower(), str(key).lower())
+                if not key or blocked.search(key) or ident in seen:
+                    continue
+                seen.add(ident)
+                out.append({"url": str(raw), "path": p.path or "/", "key": str(key), "value": str(value)})
+                if len(out) >= limit:
+                    return out
+        except Exception:
+            continue
+    return out
 
 
-def _satria_ssrf_blacklist_admin_markers(body):
-    text = str(body or "")[:180_000]
-    lower = text.lower()
-    heading = bool(re.search(r"<h[1-4][^>]*>[^<]*(?:admin(?:istration)? panel|admin interface|users)", text, re.I)
-                   or re.search(r"<title[^>]*>[^<]*admin", text, re.I))
-    carlos = bool(re.search(r"\bcarlos\b", lower))
-    delete_link = bool(re.search(r"/admin/delete(?:\?|['\" ])", text, re.I))
-    user_context = bool(re.search(r"\busers?\b", lower))
+def _satria_ps4_admin_markers(body):
+    text = str(body or "")
     return {
-        "admin_heading": heading,
-        "carlos_user_marker": carlos,
-        "admin_delete_link_present": delete_link,
-        "user_context": user_context,
-        "strong_admin_page_signal": bool((heading and (carlos or delete_link or user_context)) or (carlos and delete_link)),
+        "admin_heading": bool(re.search(r"<h[1-6][^>]*>\s*(?:admin|users|administrator)|<title>[^<]*(?:admin|users)", text, re.I)),
+        "carlos_reference": bool(re.search(r"\bcarlos\b", text, re.I)),
+        "admin_route_reference": bool(re.search(r"/admin(?:/|%2f)delete", text, re.I)),
     }
 
 
-def run_ssrf_blacklist_filter_analyzer(target_url, crawler_forms=None, html=""):
-    """Safely identify the Academy blacklist-filter bypass without deleting users.
+def run_ssrf_blacklist_filter_analyzer(target_url, html, crawled_forms=None, crawler_routes=None):
+    """Four-stage read-only Academy check for the blacklist-filter SSRF lab.
 
-    The four payloads are confined to the Academy stockApi endpoint. They check:
-      1) canonical 127.0.0.1 is blocked,
-      2) alternate loopback 127.1 is accepted,
-      3) raw /admin is blocked,
-      4) double-encoded /admin returns the read-only admin interface.
-    Only response metadata/boolean markers are retained; response bodies are not.
+    The scanner sends only same-origin POST requests to the Academy stock-check
+    endpoint. The backend is asked to fetch the documented loopback/admin paths;
+    the scanner itself never connects to loopback/private destinations. It never
+    invokes /admin/delete and does not delete or modify a lab user.
     """
-    out = {
-        "enabled": bool(SATRIA_SSRF_BLACKLIST_FILTER_V1),
-        "status": "NOT_ASSESSED",
-        "requests_sent": 0,
-        "stock_endpoint": "",
-        "probe_results": [],
-        "finding": None,
-        "notes": [],
-    }
+    out = {"enabled": True, "status": "NOT_ASSESSED", "requests_sent": 0,
+           "endpoint": "", "stages": [], "finding": None,
+           "notes": ["Lab-only probe; backend request target is limited to documented read-only loopback/admin paths."]}
     if not _satria_ps_is_lab(target_url):
         out["status"] = "SKIPPED_NON_ACADEMY_TARGET"
         return out
     if not RUN_PORTSWIGGER_COVERAGE or not active_probe_enabled():
         out["status"] = "SKIPPED_AUTHORIZATION_REQUIRED"
-        out["notes"].append("Probe blacklist SSRF memerlukan gerbang otorisasi active scan.")
         return out
-
-    stock_endpoint = _satria_ssrf_blacklist_stock_endpoint(target_url, crawler_forms, html)
-    if not stock_endpoint:
-        out["status"] = "STOCK_API_POST_FORM_NOT_DISCOVERED"
-        out["notes"].append("Tidak ditemukan form POST same-origin /product/stock dengan field stockApi; analyzer tidak menebak endpoint lain.")
+    crawl_ctx = _SATRIA_SCAN_CONTEXT.get()
+    crawler_forms = list(crawled_forms or [])
+    crawler_routes = list(crawler_routes or [])
+    endpoint = _satria_ps4_stock_endpoint(target_url, crawler_forms, crawler_routes, html)
+    if not endpoint:
+        out["status"] = "STOCK_API_FORM_NOT_DISCOVERED"
+        out["notes"].append("Form POST stockApi belum ditemukan; tidak ada POST yang dikirim.")
         return out
-    out["stock_endpoint"] = stock_endpoint
-
-    # Order matters: the first and third cases are filter controls; the second
-    # and fourth cases test the corresponding normalization bypasses.
+    out["endpoint"] = urlparse(endpoint).path
+    budget = {"target": target_url, "requests": 0, "max_requests": 4}
     probes = [
         ("canonical_loopback_control", "http://127.0.0.1/"),
-        ("alternate_loopback_127_1", "http://127.1/"),
-        ("raw_admin_path_control", "http://127.1/admin"),
+        ("alternate_loopback", "http://127.1/"),
+        ("admin_path_control", "http://127.1/admin"),
         ("double_encoded_admin_path", "http://127.1/%2561dmin"),
     ]
-    observations = {}
-    for probe_id, stock_api in probes[:SATRIA_SSRF_BLACKLIST_MAX_REQUESTS]:
-        try:
-            response = _satria_ctx_request(
-                stock_endpoint,
-                method="POST",
-                data={"stockApi": stock_api},
-                headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded", "Referer": target_url},
-                timeout=SATRIA_SSRF_BLACKLIST_TIMEOUT,
-                allow_redirects=False,
-            )
-            out["requests_sent"] += 1
-            body = _satria_ssrf_response_body(response, limit=180_000)
-            blocked = _satria_ssrf_blacklist_blocked(response)
-            admin_markers = _satria_ssrf_blacklist_admin_markers(body) if probe_id == "double_encoded_admin_path" else {}
-            row = {
-                "probe": probe_id,
-                "http_status": int(getattr(response, "status_code", 0) or 0),
-                "blocked_by_filter": bool(blocked),
-                "response_bytes": len(body),
-                "admin_markers": admin_markers,
-            }
-            observations[probe_id] = row
-            out["probe_results"].append(row)
-        except Exception as exc:
-            row = {"probe": probe_id, "error": str(exc)[:180]}
-            observations[probe_id] = row
-            out["probe_results"].append(row)
-
-    canonical = observations.get("canonical_loopback_control", {})
-    alias = observations.get("alternate_loopback_127_1", {})
-    raw_admin = observations.get("raw_admin_path_control", {})
-    encoded_admin = observations.get("double_encoded_admin_path", {})
-    alias_accepted = bool(alias and not alias.get("blocked_by_filter") and alias.get("http_status", 0) < 500)
-    encoded_markers = encoded_admin.get("admin_markers") or {}
-    admin_reached = bool(encoded_markers.get("strong_admin_page_signal"))
-    direct_loopback_blocked = bool(canonical.get("blocked_by_filter"))
-    raw_admin_blocked = bool(raw_admin.get("blocked_by_filter"))
-
-    out["differential"] = {
-        "canonical_loopback_blocked": direct_loopback_blocked,
-        "alternate_loopback_accepted": alias_accepted,
-        "raw_admin_path_blocked": raw_admin_blocked,
-        "double_encoded_admin_reached": admin_reached,
-    }
-    if direct_loopback_blocked and alias_accepted and raw_admin_blocked and admin_reached:
-        out["status"] = "SSRF_BLACKLIST_AND_PATH_FILTER_BYPASS_CANDIDATE"
-        out["finding"] = {
-            "type": "SSRF with blacklist-based input filter — loopback and path filter bypass",
-            "severity": "high",
-            "cwe": "CWE-918",
+    results = {}
+    for stage, value in probes:
+        response, error = _satria_ps4_request(
+            endpoint, budget, method="POST", data={"stockApi": value},
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded", "Referer": target_url},
+            allow_redirects=False,
+        )
+        if response is None:
+            results[stage] = {"status": "REQUEST_ERROR", "error": error}
+            continue
+        sig = _satria_ps4_signature(response)
+        blocked = _satria_ps4_blocked(response)
+        markers = _satria_ps4_admin_markers(sig["body"])
+        results[stage] = {"status": "BLOCKED" if blocked else "ACCEPTED_OR_UNBLOCKED",
+                          "http_status": sig["status"], "response_length": sig["length"],
+                          "admin_markers": markers,
+                          "admin_signal": bool(markers["admin_heading"] and (markers["carlos_reference"] or markers["admin_route_reference"]))}
+        out["stages"].append({"stage": stage, **{k: v for k, v in results[stage].items() if k != "admin_markers"},
+                              "admin_markers": markers})
+    out["requests_sent"] = budget["requests"]
+    canonical = results.get("canonical_loopback_control", {})
+    alternate = results.get("alternate_loopback", {})
+    admin_control = results.get("admin_path_control", {})
+    encoded = results.get("double_encoded_admin_path", {})
+    bypass_ip = canonical.get("status") == "BLOCKED" and alternate.get("status") == "ACCEPTED_OR_UNBLOCKED"
+    bypass_path = admin_control.get("status") == "BLOCKED" and encoded.get("admin_signal") is True
+    admin_signal = any(x.get("admin_signal") for x in (encoded, admin_control, alternate))
+    out["stage_summary"] = {"canonical_loopback_blocked": canonical.get("status") == "BLOCKED",
+                             "alternate_loopback_accepted": alternate.get("status") == "ACCEPTED_OR_UNBLOCKED",
+                             "plain_admin_path_blocked": admin_control.get("status") == "BLOCKED",
+                             "double_encoded_admin_reached": encoded.get("admin_signal") is True,
+                             "ip_filter_bypass_pattern": bool(bypass_ip),
+                             "path_filter_bypass_pattern": bool(bypass_path)}
+    if admin_signal:
+        out["status"] = "SSRF_BLACKLIST_AND_PATH_FILTER_BYPASS_CANDIDATE" if (bypass_ip and bypass_path) else "SSRF_INTERNAL_ADMIN_RESPONSE_CANDIDATE"
+        out["finding"] = {"type": "SSRF blacklist and path-filter bypass candidate",
+            "severity": "high" if bypass_path else "medium", "cwe": "CWE-918",
             "owasp": "A10:2021 - Server-Side Request Forgery",
-            "verification": "candidate_ssrf_blacklist_loopback_double_encoding",
-            "evidence": (
-                "Pada POST %s: canonical 127.0.0.1 diblokir; 127.1 tidak diblokir; "
-                "path /admin mentah diblokir; dan path double-encoded menghasilkan indikator halaman admin "
-                "(%s). Pemeriksaan berhenti pada pembacaan halaman; endpoint delete tidak dipanggil."
-                % (urlparse(stock_endpoint).path, json.dumps(encoded_markers, ensure_ascii=False))
-            ),
-            "risk": "Stock checker server-side tampak dapat diarahkan ke loopback internal dan filter path dapat dilewati melalui double URL encoding.",
-            "recommendation": "Gunakan allowlist host/protokol yang ketat setelah canonicalization; normalisasikan URL satu kali secara konsisten; validasi setiap redirect dan blokir seluruh alamat loopback/private setelah DNS resolution.",
-        }
-    elif alias_accepted and direct_loopback_blocked:
-        out["status"] = "SSRF_LOOPBACK_ALIAS_BYPASS_CANDIDATE"
-        out["notes"].append("127.1 diterima sedangkan 127.0.0.1 diblokir; akses admin belum dibuktikan.")
-        out["finding"] = {
-            "type": "SSRF blacklist filter — alternate loopback representation accepted",
+            "verification": "candidate_ssrf_blacklist_path_bypass_v4",
+            "evidence": ("POST %s: canonical loopback=%s; alternate loopback=%s; plain /admin=%s; double-encoded /admin admin markers=%s. The response contains an admin-page signal; no delete endpoint was called." %
+                         (out["endpoint"], canonical.get("status"), alternate.get("status"), admin_control.get("status"), json.dumps(encoded.get("admin_markers", {})))),
+            "risk": "Stock checker may allow an attacker-controlled request to reach a loopback administrative interface after filter bypass.",
+            "recommendation": "Use strict parsed-URL allowlists; resolve and validate the destination IP after every decoding/redirect step; block non-public address ranges; normalize path before applying authorization controls."}
+    elif bypass_ip:
+        out["status"] = "SSRF_ALTERNATE_LOOPBACK_ACCEPTED_CANDIDATE"
+        out["finding"] = {"type": "SSRF filter accepts alternate loopback representation (candidate)",
             "severity": "medium", "cwe": "CWE-918", "owasp": "A10:2021 - Server-Side Request Forgery",
-            "verification": "candidate_ssrf_loopback_alias",
-            "evidence": "Stock checker membedakan canonical 127.0.0.1 yang diblokir dari 127.1 yang diterima. Internal resource access belum dibuktikan.",
-            "risk": "Validasi blacklist mungkin bergantung pada representasi teks IP dan tidak melakukan canonicalization.",
-            "recommendation": "Parse dan canonicalize alamat IP sebelum validasi; blokir seluruh rentang loopback/private, bukan string literal tertentu.",
-        }
+            "verification": "candidate_ssrf_alternate_loopback_v4",
+            "evidence": "POST %s: http://127.0.0.1/ was blocked while http://127.1/ was accepted/unblocked. Internal resource access was not established." % out["endpoint"],
+            "risk": "URL validation may rely on incomplete textual blacklist checks; internal access is not yet proven.",
+            "recommendation": "Parse URLs and validate canonical IP addresses after normalization; reject all loopback/private/link-local destinations."}
     elif out["requests_sent"]:
         out["status"] = "BLACKLIST_FILTER_PROBES_COMPLETED_NO_BYPASS_PROVEN"
-        out["notes"].append("Probe stockApi berjalan, tetapi differential filter dan indikator halaman admin belum memenuhi kriteria kandidat SSRF.")
     else:
-        out["status"] = "BLACKLIST_FILTER_PROBE_FAILED"
+        out["status"] = "PROBES_FAILED"
     return out
 
 
-# Suppress weak UNION-NULL-only noise. A non-error response to UNION SELECT NULL
-# with one column is not enough to report SQL injection, particularly on unrelated
-# Academy labs. Keep it in diagnostics, and report only corroborated SQLi signals.
-_SATRIA_SQLI_BEFORE_WEAK_UNION_FILTER = run_sql_injection_analyzer
+def _satria_ps4_host_header_check(target_url, budget):
+    marker = "satria-host-" + _satria_ps_uuid.uuid4().hex[:12] + ".invalid"
+    observations = []
+    for headers in (
+        {**HEADERS, "X-Forwarded-Host": marker},
+        {**HEADERS, "Forwarded": "host=" + marker},
+    ):
+        response, error = _satria_ps4_request(target_url, budget, headers=headers)
+        if response is None:
+            observations.append({"error": error})
+            continue
+        location = str((response.headers or {}).get("Location", "") or "")
+        body = _satria_ps4_body(response)
+        reflected = marker in location or marker in body
+        observations.append({"status": int(response.status_code), "location_reflection": marker in location,
+                             "body_reflection": marker in body, "reflected": reflected})
+    positive = any(x.get("reflected") for x in observations)
+    finding = None
+    if positive:
+        finding = {"type": "Host/Forwarded header value reflected in response (candidate)", "severity": "medium",
+                   "cwe": "CWE-346", "verification": "candidate_host_header_reflection_v4",
+                   "evidence": "A unique invalid host marker was reflected in Location or response body during X-Forwarded-Host/Forwarded differential checks.",
+                   "risk": "Untrusted proxy headers may influence absolute URL generation or routing; password-reset poisoning is not inferred.",
+                   "recommendation": "Ignore untrusted forwarding headers unless set by a trusted proxy; validate allowed hostnames at the edge and application."}
+    return {"status": "HOST_HEADER_REFLECTION_CANDIDATE" if positive else ("PROBES_COMPLETED_NO_REFLECTION" if observations else "NOT_RUN"),
+            "observations": observations, "finding": finding}
 
-def run_sql_injection_analyzer(target_url, crawled_urls=None, crawled_forms=None):
-    result = _SATRIA_SQLI_BEFORE_WEAK_UNION_FILTER(
-        target_url, crawled_urls=crawled_urls, crawled_forms=crawled_forms
-    )
-    if not isinstance(result, dict):
+
+def _satria_ps4_path_traversal_public_fixture(target_url, candidates, budget):
+    eligible = [x for x in candidates if re.search(r"(?:file|filename|image|path|document|download|folder|template)", x.get("key", ""), re.I)]
+    if not eligible:
+        return {"status": "NO_FILE_PATH_PARAMETER_DISCOVERED", "tested": 0, "finding": None}
+    # A public robots.txt fixture avoids requesting passwd, keys, application config, or user data.
+    fixture_url = urljoin(target_url, "/robots.txt")
+    fixture, err = _satria_ps4_request(fixture_url, budget)
+    if fixture is None or int(fixture.status_code) != 200 or not _satria_ps4_body(fixture).strip():
+        return {"status": "PUBLIC_FIXTURE_UNAVAILABLE", "tested": 0, "finding": None}
+    fixture_body = _satria_ps4_body(fixture).strip()
+    chosen = eligible[:2]
+    tested = []
+    for item in chosen:
+        p = urlparse(item["url"])
+        pairs = parse_qsl(p.query, keep_blank_values=True)
+        for traversal in ("../../../../robots.txt", "..%2f..%2f..%2f..%2frobots.txt"):
+            new_pairs = [(k, traversal if k == item["key"] else v) for k, v in pairs]
+            probe_url = urlunparse(p._replace(query=urlencode(new_pairs, doseq=True)))
+            response, error = _satria_ps4_request(probe_url, budget)
+            if response is None:
+                tested.append({"parameter": item["key"], "error": error})
+                continue
+            body = _satria_ps4_body(response)
+            same_fixture = len(fixture_body) > 12 and fixture_body[:min(100, len(fixture_body))] in body
+            tested.append({"parameter": item["key"], "http_status": int(response.status_code),
+                           "public_fixture_match": bool(same_fixture), "response_length": len(body)})
+            if same_fixture:
+                return {"status": "PUBLIC_FIXTURE_TRAVERSAL_CANDIDATE", "tested": len(tested), "observations": tested,
+                        "finding": {"type": "Path traversal reached public robots.txt fixture (candidate)", "severity": "medium",
+                            "cwe": "CWE-22", "verification": "candidate_path_traversal_public_fixture_v4",
+                            "evidence": "The file-like parameter %s returned content matching the same-origin /robots.txt fixture after a traversal sequence." % item["key"],
+                            "risk": "The endpoint may normalize file paths after validation; access to sensitive files was not tested.",
+                            "recommendation": "Canonicalize paths before authorization; enforce a fixed base directory and reject traversal after decoding."}}
+    return {"status": "NO_PUBLIC_FIXTURE_TRAVERSAL_SIGNAL", "tested": len(tested), "observations": tested, "finding": None}
+
+
+def _satria_ps4_command_injection_safe_marker(target_url, candidates, budget):
+    eligible = [x for x in candidates if re.search(r"^(?:ip|host|domain|cmd|command|ping|target|hostname|address|path)$", x.get("key", ""), re.I)]
+    if not eligible:
+        return {"status": "NO_COMMAND_LIKE_GET_PARAMETER", "tested": 0, "finding": None}
+    item = eligible[0]
+    marker = "SATRIA_CMD_" + _satria_ps_uuid.uuid4().hex[:12]
+    p = urlparse(item["url"])
+    pairs = parse_qsl(p.query, keep_blank_values=True)
+    probe_value = str(item["value"]) + ";echo " + marker
+    new_pairs = [(k, probe_value if k == item["key"] else v) for k, v in pairs]
+    probe_url = urlunparse(p._replace(query=urlencode(new_pairs, doseq=True)))
+    response, error = _satria_ps4_request(probe_url, budget)
+    if response is None:
+        return {"status": "PROBE_ERROR", "tested": 0, "error": error, "finding": None}
+    reflected = marker in _satria_ps4_body(response)
+    finding = None
+    if reflected:
+        finding = {"type": "OS command injection safe echo marker reflected (candidate)", "severity": "high",
+                   "cwe": "CWE-78", "verification": "candidate_os_command_injection_echo_marker_v4",
+                   "evidence": "A unique echo marker appeared in the response after a shell metacharacter was appended to parameter %s at %s." % (item["key"], p.path),
+                   "risk": "The response is consistent with shell command interpretation; no destructive command or data collection was attempted.",
+                   "recommendation": "Avoid shell invocation where possible; use argument arrays and strict allowlists; do not concatenate user input into a command string."}
+    return {"status": "COMMAND_ECHO_MARKER_CANDIDATE" if reflected else "NO_ECHO_MARKER_OBSERVED",
+            "tested": 1, "parameter": item["key"], "marker_reflected": reflected, "finding": finding}
+
+
+def _satria_ps4_ssti_safe_arithmetic(target_url, candidates, budget):
+    eligible = [x for x in candidates if re.search(r"(?:message|template|name|title|content|query|search|product|view)", x.get("key", ""), re.I)]
+    if not eligible:
+        eligible = candidates[:1]
+    if not eligible:
+        return {"status": "NO_GET_PARAMETER_DISCOVERED", "tested": 0, "finding": None}
+    tests = [("{{7*7}}", "49"), ("${7*7}", "49"), ("<%=7*7%>", "49"), ("#{7*7}", "49")]
+    tested = []
+    for item in eligible[:2]:
+        p = urlparse(item["url"])
+        pairs = parse_qsl(p.query, keep_blank_values=True)
+        for expression, expected in tests:
+            new_pairs = [(k, expression if k == item["key"] else v) for k, v in pairs]
+            probe_url = urlunparse(p._replace(query=urlencode(new_pairs, doseq=True)))
+            response, error = _satria_ps4_request(probe_url, budget)
+            if response is None:
+                tested.append({"parameter": item["key"], "error": error})
+                continue
+            body = _satria_ps4_body(response)
+            evaluated = expected in body and expression not in body
+            tested.append({"parameter": item["key"], "expression_family": expression[:12], "evaluated": evaluated,
+                           "http_status": int(response.status_code)})
+            if evaluated:
+                return {"status": "ARITHMETIC_EVALUATION_CANDIDATE", "tested": len(tested), "observations": tested,
+                        "finding": {"type": "Server-side template expression evaluation (candidate)", "severity": "medium",
+                            "cwe": "CWE-1336", "verification": "candidate_ssti_arithmetic_v4",
+                            "evidence": "A harmless arithmetic expression was evaluated in parameter %s; no object disclosure or code execution was attempted." % item["key"],
+                            "risk": "User input may be interpreted as a server-side template expression.",
+                            "recommendation": "Treat user input as data, use context-safe template APIs, and avoid dynamically compiling templates."}}
+    return {"status": "NO_ARITHMETIC_EVALUATION_SIGNAL", "tested": len(tested), "observations": tested, "finding": None}
+
+
+def _satria_ps4_graphql_readonly(target_url, urls, routes, html, budget):
+    candidates = []
+    for row in routes or []:
+        if isinstance(row, dict) and "graphql" in str(row.get("url", "")).lower():
+            candidates.append(str(row.get("url")))
+    candidates.extend([u for u in urls or [] if "graphql" in urlparse(str(u)).path.lower()])
+    if re.search(r"graphql", str(html or ""), re.I):
+        candidates.extend([urljoin(target_url, "/graphql"), urljoin(target_url, "/api/graphql")])
+    candidates = list(dict.fromkeys(x for x in candidates if _satria_ps4_same_origin_url(x, target_url)))[:3]
+    if not candidates:
+        return {"status": "NO_GRAPHQL_ENDPOINT_DISCOVERED", "tested": 0, "observations": []}
+    observations = []
+    for endpoint in candidates:
+        # __typename is a read-only GraphQL meta-field; no introspection or mutation is sent.
+        response, error = _satria_ps4_request(endpoint, budget, method="POST",
+            data=json.dumps({"query": "{ __typename }"}),
+            headers={**HEADERS, "Content-Type": "application/json", "Accept": "application/json"})
+        if response is None:
+            observations.append({"endpoint": urlparse(endpoint).path, "error": error})
+            continue
+        body = _satria_ps4_body(response)
+        parsed_ok = False
+        try:
+            payload = response.json()
+            parsed_ok = isinstance(payload, dict) and ("data" in payload or "errors" in payload)
+        except Exception:
+            pass
+        observations.append({"endpoint": urlparse(endpoint).path, "http_status": int(response.status_code),
+                             "graphql_shape": parsed_ok, "typename_observed": "__typename" in body})
+    return {"status": "GRAPHQL_READONLY_CHECK_COMPLETED", "tested": len(observations), "observations": observations}
+
+
+def _satria_ps4_metadata_checks(target_url, budget):
+    paths = ["/.well-known/openid-configuration", "/openapi.json", "/swagger.json",
+             "/api-docs", "/.git/HEAD", "/server-status", "/debug"]
+    observations = []
+    for path in paths:
+        if budget["requests"] >= budget["max_requests"]:
+            break
+        url = urljoin(target_url, path)
+        response, error = _satria_ps4_request(url, budget, method="HEAD")
+        if response is None:
+            observations.append({"path": path, "error": error})
+            continue
+        observations.append({"path": path, "status": int(response.status_code),
+                             "content_type": str((response.headers or {}).get("Content-Type", ""))[:100],
+                             "content_length": str((response.headers or {}).get("Content-Length", ""))[:30]})
+    return observations
+
+
+def _satria_ps4_jwt_deserialization_review(html):
+    text = str(html or "")[:PORTSWIGGER_EXTRA_BODY_LIMIT]
+    candidates = re.findall(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})(?![A-Za-z0-9_-])", text)
+    jwt_meta = []
+    for token in candidates[:10]:
+        try:
+            import base64 as _b64
+            part = token.split(".", 2)[0]
+            pad = "=" * ((4 - len(part) % 4) % 4)
+            header = json.loads(_b64.urlsafe_b64decode(part + pad).decode("utf-8", "replace"))
+            if isinstance(header, dict):
+                jwt_meta.append({"alg": str(header.get("alg", ""))[:30],
+                                 "kid_present": bool(header.get("kid")), "jku_present": bool(header.get("jku")),
+                                 "jwk_present": bool(header.get("jwk"))})
+        except Exception:
+            continue
+    # Cookie values are never copied; only serialized-format indicators are returned.
+    serialization_hints = []
+    ctx = _SATRIA_SCAN_CONTEXT.get()
+    session = ctx.get("session") if isinstance(ctx, dict) else None
+    if session is not None:
+        try:
+            for cookie in session.cookies:
+                val = str(cookie.value or "")
+                decoded = ""
+                try:
+                    import base64 as _b64
+                    pad = "=" * ((4 - len(val) % 4) % 4)
+                    decoded = _b64.b64decode(val + pad, validate=False).decode("latin1", "ignore")[:80]
+                except Exception:
+                    pass
+                kinds = []
+                if re.search(r"(?:^|;)\s*[a-zA-Z_][\w]*:\d+:", decoded): kinds.append("php_serialization_hint")
+                if decoded.startswith("\xac\xed\x00\x05"): kinds.append("java_serialization_magic")
+                if val.count(".") == 2 and val.startswith("eyJ"): kinds.append("jwt_cookie")
+                if kinds:
+                    serialization_hints.append({"cookie_name": str(cookie.name)[:80], "indicators": kinds})
+        except Exception:
+            pass
+    return {"jwt_tokens_reviewed": len(jwt_meta), "jwt_metadata": jwt_meta,
+            "serialized_cookie_indicators": serialization_hints}
+
+
+def run_portswigger_safe_lab_engine_v4(target_url, html, active_raw=None):
+    """Execute the evidence-driven safe subset and reconcile all 273 scenario rows."""
+    active_raw = active_raw if isinstance(active_raw, dict) else {}
+    crawl = active_raw.get("crawler") or {}
+    urls = [str(x) for x in (crawl.get("urls") or []) if _satria_ps4_same_origin_url(x, target_url)]
+    forms = crawl.get("forms") or []
+    routes = crawl.get("routes") or []
+    candidates = _satria_ps4_find_query_candidates(urls)
+    result = {"engine": "SATRIA_PORTSWIGGER_LAB_ENGINE_V4", "status": "not_started",
+              "requests_sent": 0, "scenario_count": SATRIA_PORTSWIGGER_SCENARIO_COUNT_V4,
+              "scenario_results": [], "checks": {}, "findings": [], "notes": []}
+    if SATRIA_PORTSWIGGER_SCENARIO_COUNT_V4 != SATRIA_PORTSWIGGER_SCENARIOS_EXPECTED:
+        result["notes"].append("Peringatan: jumlah skenario registry %s, expected %s." % (SATRIA_PORTSWIGGER_SCENARIO_COUNT_V4, SATRIA_PORTSWIGGER_SCENARIOS_EXPECTED))
+    if not _satria_ps_is_lab(target_url):
+        result["status"] = "passive_only_non_academy_target"
+        result["scenario_results"] = [{**x, "status": "NOT_RUN_ACADEMY_SCOPE_ONLY", "execution": "NOT_RUN", "tested": False,
+                                        "evidence": "Academy-specific active probes are restricted to per-user lab hosts.",
+                                        "limitation": "Passive discovery only on non-Academy targets."}
+                                       for x in SATRIA_PORTSWIGGER_SCENARIO_REGISTRY_V4]
+        result["notes"].append("Probe eksploitasi khusus Academy tidak dijalankan pada host umum; inventaris dan review statis tetap tersedia dari modul dasar.")
         return result
-    raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
-    findings = list(result.get("findings") or [])
-    weak = [x for x in findings if x.get("verification") == "candidate_sqli_union_null_shape"]
-    if weak:
-        result["findings"] = [x for x in findings if x.get("verification") != "candidate_sqli_union_null_shape"]
-        raw.setdefault("low_confidence_observations", []).extend([
-            {"type": x.get("type"), "evidence": x.get("evidence"),
-             "status": "NOT_REPORTED_NULL_ONLY_SHAPE_INSUFFICIENT"}
-            for x in weak
-        ])
-        for check in raw.get("checks", []) or []:
-            if check.get("name") == "SQL injection UNION attack, determining the number of columns returned by the query":
-                check["status"] = "NULL_ONLY_SHAPE_OBSERVATION_NOT_A_FINDING"
-                check["limitation"] = "Respons non-error saja tidak membuktikan UNION SQLi; perlu bukti kolom marker terpantul, error SQL baru, atau differential Boolean yang berulang."
-    raw["finding_candidates_total"] = len(result.get("findings") or [])
-    result["raw"] = raw
+    if not RUN_PORTSWIGGER_COVERAGE or not active_probe_enabled():
+        result["status"] = "skipped_authorization_required"
+        result["scenario_results"] = [{**x, "status": "NOT_RUN_AUTHORIZATION_REQUIRED", "execution": "NOT_RUN", "tested": False,
+                                        "evidence": "No active request was sent because operator authorization is not enabled.",
+                                        "limitation": "Enable the active-scan authorization gate before running lab probes."}
+                                       for x in SATRIA_PORTSWIGGER_SCENARIO_REGISTRY_V4]
+        result["notes"].append("Tidak ada request tambahan karena gerbang otorisasi belum aktif.")
+        return result
+
+    budget = {"target": target_url, "requests": 0, "max_requests": SATRIA_PORTSWIGGER_LAB_MAX_EXTRA_REQUESTS}
+    # SSRF blacklist: four explicit differential stages on the known read-only stock API.
+    ssrf_blacklist = run_ssrf_blacklist_filter_analyzer(target_url, html, forms, routes)
+    budget["requests"] += int(ssrf_blacklist.get("requests_sent", 0) or 0)
+    if ssrf_blacklist.get("finding"):
+        result["findings"].append(ssrf_blacklist["finding"])
+    result["checks"]["ssrf_blacklist"] = ssrf_blacklist
+
+    # Safe, non-mutating checks for other families.
+    host_check = _satria_ps4_host_header_check(target_url, budget)
+    if host_check.get("finding"):
+        result["findings"].append(host_check["finding"])
+    result["checks"]["host_header"] = host_check
+
+    path_check = _satria_ps4_path_traversal_public_fixture(target_url, candidates, budget)
+    if path_check.get("finding"):
+        result["findings"].append(path_check["finding"])
+    result["checks"]["path_traversal"] = path_check
+
+    cmd_check = _satria_ps4_command_injection_safe_marker(target_url, candidates, budget)
+    if cmd_check.get("finding"):
+        result["findings"].append(cmd_check["finding"])
+    result["checks"]["os_command_injection"] = cmd_check
+
+    ssti_check = _satria_ps4_ssti_safe_arithmetic(target_url, candidates, budget)
+    if ssti_check.get("finding"):
+        result["findings"].append(ssti_check["finding"])
+    result["checks"]["ssti"] = ssti_check
+
+    graphql_check = _satria_ps4_graphql_readonly(target_url, urls, routes, html, budget)
+    result["checks"]["graphql"] = graphql_check
+
+    metadata_checks = _satria_ps4_metadata_checks(target_url, budget)
+    result["checks"]["metadata_paths"] = metadata_checks
+
+    jwt_deser = _satria_ps4_jwt_deserialization_review(html)
+    result["checks"]["jwt_deserialization_review"] = jwt_deser
+
+    # Existing analyzers' evidence is reused, but scenario rows are matched by name,
+    # never by positional index. The exact check result is authoritative.
+    sqli_raw = active_raw.get("sql_injection") or {}
+    sqli_map = {str(x.get("name")): x for x in (sqli_raw.get("checks") or []) if isinstance(x, dict)}
+    param_obs = (active_raw.get("param_fuzzing") or {}).get("observations") or []
+    reflected = [x for x in param_obs if isinstance(x, dict) and x.get("marker_reflected")]
+    csrf_raw = (active_raw.get("portswigger_coverage") or {})
+    csrf_map = {}
+    for cat in csrf_raw.get("categories", []) or []:
+        if cat.get("name") == "Cross-site request forgery (CSRF)":
+            csrf_map = {str(x.get("name")): x for x in cat.get("checks", []) or []}
+    base_coverage = active_raw.get("portswigger_coverage") or {}
+    category_results = []
+    for category, raw_labs in SATRIA_PORTSWIGGER_LABS.items():
+        row_results = []
+        for name in [x.strip() for x in raw_labs.splitlines() if x.strip()]:
+            scenario = next((x for x in SATRIA_PORTSWIGGER_SCENARIO_REGISTRY_V4 if x["category"] == category and x["name"] == name), None)
+            status, evidence, limitation, execution = "NOT_ASSESSED_REQUIRES_CONTEXT", "", "Memerlukan prasyarat khusus atau teknik yang tidak dijalankan otomatis.", "NOT_RUN"
+            if category == "SQL injection":
+                check = sqli_map.get(name)
+                if check:
+                    status, evidence, limitation = str(check.get("status") or "UNKNOWN"), str(check.get("evidence") or ""), str(check.get("limitation") or "")
+                    execution = "EXECUTED" if any(x in status for x in ("TESTED", "PROBES", "FINGERPRINT", "SIGNATURE", "DIFFERENTIAL", "MARKER")) else "PARTIAL_OR_NOT_RUN"
+                else:
+                    limitation = "Analyzer SQLi tidak menghasilkan pemeriksaan bernama sama untuk skenario ini."
+            elif category == "Cross-site scripting":
+                if "steal cookies" in name.lower() or "capture passwords" in name.lower() or "bypass csrf" in name.lower():
+                    status, limitation = "NOT_EXECUTED_IMPACT_TEST", "Pencurian cookie/password atau bypass CSRF tidak dieksekusi."
+                elif name.startswith("Stored"):
+                    status = "STORED_INPUT_NOT_SUBMITTED"
+                    limitation = "POST penyimpanan tidak disubmit otomatis; diperlukan fixture dan browser lab."
+                elif name == "Reflected DOM XSS":
+                    dom = base_coverage.get("safe_checks", {}).get("reflected_dom_xss", {})
+                    status = str(dom.get("status") or "NOT_ASSESSED")
+                    evidence = str(dom.get("evidence") or "")
+                    limitation = str(dom.get("limitation") or "Browser execution belum tersedia.")
+                    execution = "STATIC_AND_MARKER_PROBE" if dom.get("requests_sent") else "STATIC_REVIEW_ONLY"
+                elif name.startswith("DOM XSS"):
+                    domdata = base_coverage.get("safe_checks", {}).get("javascript_review", {})
+                    status = "STATIC_SOURCE_SINK_REVIEW" if domdata.get("patterns") or domdata.get("source_sink_pairs") else "NO_PATTERN_IN_REVIEWED_JS"
+                    evidence = json.dumps(domdata.get("source_sink_pairs", [])[:5], ensure_ascii=False)[:300]
+                    limitation = "Tidak mengirim payload eksekutabel; browser diperlukan untuk pembuktian runtime."
+                    execution = "STATIC_REVIEW"
+                else:
+                    status = "INERT_REFLECTION_OBSERVED" if reflected else "NO_INERT_REFLECTION_OBSERVED"
+                    evidence = "%s reflected marker observations across crawled GET parameters." % len(reflected)
+                    limitation = "Marker tidak mengeksekusi HTML/JavaScript; context breakout/encoding dan browser execution belum dibuktikan."
+                    execution = "GET_MARKER_PROBE" if param_obs else "NO_PARAMETER_PROBE"
+            elif category == "Cross-site request forgery (CSRF)":
+                csrf = csrf_map.get(name, {})
+                if csrf:
+                    status = str(csrf.get("status") or "UNKNOWN")
+                    evidence = str(csrf.get("evidence") or "")[:500]
+                    limitation = str(csrf.get("limitation") or "")[:500]
+                    execution = "AUTHENTICATED_GET_REVIEW" if "AUTHENTICATED" in status or "FORM" in status else "STATIC_OR_MANUAL"
+                else:
+                    status = "CSRF_RESULT_NOT_AVAILABLE"
+            elif category == "Clickjacking":
+                check = next((x for x in base_coverage.get("categories", []) if x.get("name") == category), {})
+                row = next((x for x in check.get("checks", []) if x.get("name") == name), {})
+                status = str(row.get("status") or "FRAME_HEADER_REVIEW_NOT_AVAILABLE")
+                evidence = str(row.get("evidence") or "")
+                limitation = str(row.get("limitation") or "")
+                execution = "HTTP_HEADER_REVIEW" if row else "NOT_RUN"
+            elif category == "DOM-based vulnerabilities":
+                js = base_coverage.get("safe_checks", {}).get("javascript_review", {})
+                status = "STATIC_SOURCE_SINK_REVIEW" if js.get("patterns") or js.get("source_sink_pairs") else "NO_PATTERN_IN_REVIEWED_JS"
+                evidence = json.dumps(js.get("source_sink_pairs", [])[:5], ensure_ascii=False)[:300]
+                limitation = "Static analysis does not prove runtime taint flow or exploitability."
+                execution = "STATIC_REVIEW"
+            elif category == "Cross-origin resource sharing (CORS)":
+                check = next((x for x in base_coverage.get("categories", []) if x.get("name") == category), {})
+                row = next((x for x in check.get("checks", []) if x.get("name") == name), {})
+                status = str(row.get("status") or "CORS_ORIGIN_PROBE_NOT_AVAILABLE")
+                evidence = str(row.get("evidence") or "")
+                limitation = str(row.get("limitation") or "")
+                execution = "ORIGIN_HEADER_DIFFERENTIAL" if row else "NOT_RUN"
+            elif category == "Server-side request forgery (SSRF)":
+                if name == "SSRF with blacklist-based input filter":
+                    status = ssrf_blacklist.get("status", "NOT_ASSESSED")
+                    evidence = json.dumps(ssrf_blacklist.get("stage_summary", {}), ensure_ascii=False)
+                    limitation = "Only the documented read-only /admin response is inspected; no admin action is performed."
+                    execution = "FOUR_STAGE_STOCK_API_TEST" if ssrf_blacklist.get("requests_sent") else "NOT_RUN"
+                elif name == "SSRF with filter bypass via open redirection vulnerability":
+                    chain = active_raw.get("ssrf_open_redirect_chain") or {}
+                    status = str(chain.get("status") or "OPEN_REDIRECT_CHAIN_RESULT_NOT_AVAILABLE")
+                    evidence = str((chain.get("ssrf_chain") or {}).get("evidence") or (chain.get("open_redirect") or {}).get("evidence") or "")
+                    limitation = "A chain candidate requires a separate manual review; no delete action is performed."
+                    execution = "OPEN_REDIRECT_CHAIN" if chain.get("requests_sent") else "NOT_RUN"
+                else:
+                    sinks = [x for x in candidates if re.search(r"url|uri|src|dest|redirect|callback|webhook|fetch|image|proxy|host|target|stockapi", x.get("key", ""), re.I)]
+                    status = "URL_SINK_PARAMETER_DISCOVERED" if sinks else "NO_URL_SINK_PARAMETER_DISCOVERED"
+                    evidence = ", ".join(sorted({x["key"] for x in sinks})[:8])
+                    limitation = "Blind/OOB, whitelist parser, alternate backend and special protocol paths require a lab-specific callback or fixture."
+                    execution = "URL_PARAMETER_INVENTORY"
+            elif category == "OS command injection":
+                status = cmd_check.get("status", "NOT_ASSESSED")
+                evidence = "Safe echo marker test: %s." % cmd_check.get("status", "not run")
+                limitation = "Only one GET parameter was tested with an echo marker; POST/OOB/output-redirection scenarios are not covered."
+                execution = "SAFE_ECHO_MARKER" if cmd_check.get("tested") else "NOT_RUN"
+            elif category == "Server-side template injection":
+                status = ssti_check.get("status", "NOT_ASSESSED")
+                evidence = "Harmless arithmetic templates tested: %s." % ssti_check.get("tested", 0)
+                limitation = "Arithmetic evaluation does not test code context, object disclosure, sandbox escape, or RCE."
+                execution = "ARITHMETIC_PROBES" if ssti_check.get("tested") else "NOT_RUN"
+            elif category == "Path traversal":
+                status = path_check.get("status", "NOT_ASSESSED")
+                evidence = json.dumps(path_check.get("observations", [])[:3], ensure_ascii=False)[:300]
+                limitation = "Only a public robots.txt fixture is requested; sensitive file-read variants are not attempted."
+                execution = "PUBLIC_FIXTURE_PROBE" if path_check.get("tested") else "NOT_RUN"
+            elif category == "HTTP Host header attacks":
+                status = host_check.get("status", "NOT_ASSESSED")
+                evidence = json.dumps(host_check.get("observations", [])[:3], ensure_ascii=False)
+                limitation = "Reset-token poisoning, routing override and account workflow are not executed."
+                execution = "FORWARDED_HEADER_DIFFERENTIAL" if host_check.get("observations") else "NOT_RUN"
+            elif category == "GraphQL API vulnerabilities":
+                status = graphql_check.get("status", "NOT_ASSESSED")
+                evidence = json.dumps(graphql_check.get("observations", [])[:3], ensure_ascii=False)
+                limitation = "Only __typename is sent; no introspection dump, private-field query, brute force or mutation."
+                execution = "READ_ONLY_TYPENAME" if graphql_check.get("tested") else "NOT_RUN"
+            elif category == "Information disclosure":
+                matches = [x for x in metadata_checks if x.get("status") in {200, 206}]
+                status = "PUBLIC_METADATA_PATH_CANDIDATE" if matches else "HEAD_METADATA_PATHS_TESTED_NO_SIGNAL"
+                evidence = json.dumps(matches[:4], ensure_ascii=False)
+                limitation = "HEAD-only checks; response bodies and secret files are not retrieved."
+                execution = "HEAD_PATH_CHECKS" if metadata_checks else "NOT_RUN"
+            elif category == "JWT":
+                status = "JWT_STRUCTURE_REVIEWED" if jwt_deser.get("jwt_tokens_reviewed") else "NO_JWT_TOKEN_IN_REVIEWED_HTML"
+                evidence = json.dumps(jwt_deser.get("jwt_metadata", [])[:3], ensure_ascii=False)
+                limitation = "No signature bypass, weak-secret guessing, token mutation or replay is performed."
+                execution = "STATIC_TOKEN_DECODE"
+            elif category == "Insecure deserialization":
+                hints = jwt_deser.get("serialized_cookie_indicators", [])
+                status = "SERIALIZED_COOKIE_FORMAT_HINT" if hints else "NO_SERIALIZATION_COOKIE_HINT"
+                evidence = json.dumps(hints[:3], ensure_ascii=False)
+                limitation = "No gadget chain, object mutation, PHAR or RCE payload is executed."
+                execution = "COOKIE_FORMAT_REVIEW"
+            elif category == "File upload vulnerabilities":
+                upload_forms = [f for f in forms if isinstance(f, dict) and (f.get("has_file") or "file" in (f.get("input_details") or []))]
+                status = "FILE_UPLOAD_FORM_DISCOVERED" if upload_forms else "NO_FILE_UPLOAD_FORM_DISCOVERED"
+                evidence = "%s upload form(s) inventoried." % len(upload_forms)
+                limitation = "No file is uploaded; web shell, polyglot, race and extension bypass are not executed."
+                execution = "UPLOAD_FORM_INVENTORY"
+            elif category == "Authentication":
+                login_forms = [f for f in forms if isinstance(f, dict) and (any(re.search(r"user|email|pass", str(x), re.I) for x in (f.get("inputs") or [])) or "login" in str(f.get("action", "")).lower())]
+                status = "LOGIN_FORM_DISCOVERED" if login_forms else "NO_LOGIN_FORM_DISCOVERED"
+                evidence = "%s login-like form(s) discovered." % len(login_forms)
+                limitation = "No brute force, account lockout, reset poisoning or 2FA bypass requests are sent."
+                execution = "LOGIN_FORM_INVENTORY"
+            elif category == "Access control vulnerabilities":
+                admin_routes = [u for u in urls if re.search(r"/admin(?:/|$)|/account|/profile", urlparse(u).path, re.I)]
+                status = "SENSITIVE_ROUTE_DISCOVERED" if admin_routes else "NO_SENSITIVE_ROUTE_DISCOVERED"
+                evidence = ", ".join(urlparse(u).path for u in admin_routes[:6])
+                limitation = "Cross-user/role authorization needs two lab accounts; no user ID guessing or mutations."
+                execution = "ROUTE_DISCOVERY"
+            elif category == "WebSockets":
+                wsrefs = re.findall(r"wss?://[^\s\"'<>]+", str(html or ""), re.I)
+                status = "WEBSOCKET_REFERENCE_DISCOVERED" if wsrefs else "NO_WEBSOCKET_REFERENCE_IN_REVIEWED_SOURCE"
+                evidence = "%s websocket reference(s) discovered." % len(wsrefs)
+                limitation = "Handshake/message authorization and CSWSH runtime validation require browser/session context."
+                execution = "SOURCE_INVENTORY"
+            elif category == "OAuth authentication":
+                oauth_meta = [x for x in metadata_checks if x.get("path") == "/.well-known/openid-configuration" and x.get("status") == 200]
+                status = "OIDC_METADATA_ENDPOINT_RESPONDED" if oauth_meta else "OIDC_METADATA_HEAD_CHECK_NO_SIGNAL"
+                evidence = json.dumps(oauth_meta, ensure_ascii=False)
+                limitation = "OAuth linking, state/nonce validation and token handling require provider and test accounts."
+                execution = "OIDC_METADATA_HEAD"
+            elif category == "API testing":
+                api_meta = [x for x in metadata_checks if x.get("path") in {"/openapi.json", "/swagger.json", "/api-docs"} and x.get("status") == 200]
+                status = "API_DOCUMENTATION_ENDPOINT_RESPONDED" if api_meta else "API_DOCUMENTATION_HEAD_CHECK_NO_SIGNAL"
+                evidence = json.dumps(api_meta, ensure_ascii=False)
+                limitation = "Mass assignment and server-side parameter pollution require API schema and a resettable test object."
+                execution = "API_DOCS_HEAD"
+            elif category == "Essential skills":
+                status = "DISCOVERY_COMPLETED" if crawl.get("status") == "completed" else "DISCOVERY_NOT_COMPLETED"
+                evidence = "%s URLs, %s forms, %s JS routes." % (len(urls), len(forms), len(routes))
+                limitation = "Non-standard binary/data structures may require dedicated parsers."
+                execution = "CRAWLER_AND_ROUTE_ANALYSIS"
+            elif category == "Prototype pollution":
+                js_patterns = (base_coverage.get("safe_checks", {}).get("javascript_review", {}) or {}).get("patterns", [])
+                status = "PROTOTYPE_PATTERN_REVIEW" if js_patterns else "NO_PROTOTYPE_PATTERN_IN_REVIEWED_JS"
+                evidence = json.dumps([x for x in js_patterns if "proto" in str(x).lower() or "clobber" in str(x).lower()][:4], ensure_ascii=False)
+                limitation = "No prototype mutation or property exfiltration is performed."
+                execution = "STATIC_JS_REVIEW"
+            elif category == "NoSQL injection":
+                nosql_candidates = [x for x in candidates if re.search(r"user|username|search|filter|query|sort", x.get("key", ""), re.I)]
+                status = "NOSQL_LIKE_PARAMETER_DISCOVERED" if nosql_candidates else "NO_NOSQL_LIKE_PARAMETER_DISCOVERED"
+                evidence = ", ".join(x["key"] for x in nosql_candidates[:5])
+                limitation = "No operator-based auth bypass or record extraction is performed."
+                execution = "PARAMETER_SHAPE_INVENTORY"
+            elif category == "Web LLM attacks":
+                llm_routes = [u for u in urls if re.search(r"llm|chat|prompt|completion|assistant|agent|model", urlparse(u).path, re.I)]
+                status = "LLM_ENDPOINT_DISCOVERED" if llm_routes else "NO_LLM_ENDPOINT_DISCOVERED"
+                evidence = ", ".join(urlparse(u).path for u in llm_routes[:5])
+                limitation = "Prompt injection, tool invocation, secret extraction and agent actions require a sandbox with synthetic data and are not run against live tools."
+                execution = "ENDPOINT_INVENTORY"
+            elif category == "Web cache poisoning":
+                cache = active_raw.get("web_cache_security") or {}
+                status = str(cache.get("status") or "CACHE_ANALYZER_RESULT_NOT_AVAILABLE")
+                evidence = "Existing cache analyzer status: %s." % status
+                limitation = "Cookie mutation, cache-key brute forcing and internal poisoning require a separate scoped test plan."
+                execution = "CACHE_ANALYZER" if cache else "NOT_RUN"
+            elif category == "Web cache deception":
+                cache = active_raw.get("web_cache_security") or {}
+                status = "AUTHENTICATED_CACHE_CONTEXT_REQUIRED"
+                evidence = "Cache analyzer status: %s." % cache.get("status", "not available")
+                limitation = "Requires authenticated synthetic personal response; scanner does not store or expose private content."
+                execution = "CONTEXT_REVIEW"
+            elif category == "XML external entity (XXE) injection":
+                xml_routes = [u for u in urls if re.search(r"xml|soap|upload", u, re.I)]
+                xml_forms = [f for f in forms if any(re.search(r"xml|soap", str(v), re.I) for v in (f.get("inputs") or []))]
+                status = "XML_PARSER_SURFACE_DISCOVERED" if xml_routes or xml_forms else "NO_XML_PARSER_SURFACE_DISCOVERED"
+                evidence = "%s XML-like URL(s), %s XML-like form(s)." % (len(xml_routes), len(xml_forms))
+                limitation = "No external entity, DTD file read, XInclude file retrieval or OOB callback is sent."
+                execution = "XML_SURFACE_INVENTORY"
+            elif category == "HTTP request smuggling":
+                status = "HTTP_DESYNC_SPECIALIZED_TEST_REQUIRED"
+                evidence = "HTTP/1.1 and HTTP/2 front/back-end desynchronization cannot be safely inferred from ordinary GET requests."
+                limitation = "No CL.TE/TE.CL ambiguous framing, queue poisoning, tunneling or pause-based payload is sent."
+                execution = "MANUAL_SPECIALIZED"
+            elif category == "Race conditions":
+                status = "RACE_WORKFLOW_FIXTURE_REQUIRED"
+                evidence = "No state-changing concurrent requests were issued."
+                limitation = "Requires resettable fixture, expected invariant, and explicit concurrency plan."
+                execution = "MANUAL_SPECIALIZED"
+            elif category == "Business logic vulnerabilities":
+                status = "BUSINESS_INVARIANT_FIXTURE_REQUIRED"
+                evidence = "No business-state mutation was issued."
+                limitation = "Requires expected rules, test accounts, resettable data and workflow-specific validation."
+                execution = "MANUAL_SPECIALIZED"
+            elif category == "Web cache poisoning":
+                pass
+            # attach identity and actual execution flag for reliable coverage accounting
+            scenario_id = scenario["scenario_id"] if scenario else hashlib.sha1((category + name).encode()).hexdigest()[:14]
+            row_results.append({"scenario_id": scenario_id, "name": name, "test_family": scenario["test_family"] if scenario else "unknown",
+                                "status": status, "evidence": str(evidence or "")[:650],
+                                "limitation": str(limitation or "")[:650], "execution": execution,
+                                "tested": execution not in {"NOT_RUN", "MANUAL_SPECIALIZED", "CONTEXT_REVIEW"}})
+        category_results.append({"name": category, "total": len(row_results), "checks": row_results})
+
+    result["requests_sent"] = budget["requests"]
+    result["category_results"] = category_results
+    result["scenario_results"] = [row for category in category_results for row in category["checks"]]
+    result["tested_scenarios"] = sum(1 for c in category_results for x in c["checks"] if x["tested"])
+    result["not_tested_scenarios"] = SATRIA_PORTSWIGGER_SCENARIO_COUNT_V4 - result["tested_scenarios"]
+    result["status"] = "completed_with_explicit_coverage" if result["scenario_count"] == SATRIA_PORTSWIGGER_SCENARIOS_EXPECTED else "registry_count_mismatch"
+    result["notes"].extend([
+        "Setiap skenario memiliki test_family dan status tersendiri; hanya eksekusi atau review yang benar-benar berjalan dihitung sebagai tested.",
+        "HTTP desync, race condition, OOB exfiltration, credential theft, web shell, secret file read, dan perubahan akun tidak otomatis dijalankan.",
+        "Kandidat merupakan sinyal untuk validasi manual; tidak ada status yang menyatakan lab solved."
+    ])
     return result
 
 
-# Final active-scan wrapper: run the blacklist-filter analyzer in addition to the
-# separate open-redirect chain analyzer. Keep a per-scan context for its POSTs.
-_SATRIA_BLACKLIST_BASE_ACTIVE_SCAN = run_active_scanning
+def _satria_ps4_merge_coverage(target_url, html, active_raw, base_result):
+    raw = base_result.get("raw", {}) if isinstance(base_result, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    engine_active_raw = dict(active_raw or {})
+    engine_active_raw["portswigger_coverage"] = raw
+    engine = run_portswigger_safe_lab_engine_v4(target_url, html, engine_active_raw)
+    raw["lab_engine_v4"] = engine
+    raw["requests_sent"] = int(raw.get("requests_sent", 0) or 0) + int(engine.get("requests_sent", 0) or 0)
+    raw.setdefault("safe_checks", {})["lab_engine_v4"] = engine.get("checks", {})
+    # Map V4 scenario results back to the internal 273-row registry by exact name.
+    result_lookup = {(cat["name"], row["name"]): row for cat in engine.get("category_results", []) for row in cat.get("checks", [])}
+    for category in raw.get("categories", []) or []:
+        cat_name = category.get("name")
+        for row in category.get("checks", []) or []:
+            mapped = result_lookup.get((cat_name, row.get("name")))
+            if not mapped:
+                continue
+            row.update({"status": mapped["status"], "evidence": mapped["evidence"],
+                        "limitation": mapped["limitation"], "scenario_id": mapped["scenario_id"],
+                        "test_family": mapped["test_family"], "execution": mapped["execution"],
+                        "tested": mapped["tested"]})
+        counts = {}
+        tested_count = 0
+        for row in category.get("checks", []) or []:
+            key = str(row.get("status") or "UNKNOWN")
+            counts[key] = counts.get(key, 0) + 1
+            tested_count += int(bool(row.get("tested")))
+        category["status_counts"] = counts
+        category["tested_scenarios"] = tested_count
+    # Coverage level is now evidence-based, not copied from planned profile mode.
+    counts = {"EXECUTED": 0, "STATIC_REVIEW": 0, "INVENTORY_ONLY": 0, "MANUAL_REQUIRED": 0, "NOT_ASSESSED": 0}
+    for category in raw.get("categories", []) or []:
+        for row in category.get("checks", []) or []:
+            status = str(row.get("status") or "").upper()
+            execution = str(row.get("execution") or "NOT_RUN")
+            if execution in {"MANUAL_SPECIALIZED", "CONTEXT_REVIEW", "NOT_RUN"} or "NOT_ASSESSED" in status or "NOT_RUN" in status or "REQUIRES_CONTEXT" in status:
+                level = "MANUAL_REQUIRED" if execution == "MANUAL_SPECIALIZED" else "NOT_ASSESSED"
+            elif execution in {"STATIC_REVIEW", "STATIC_JS_REVIEW", "STATIC_TOKEN_DECODE", "COOKIE_FORMAT_REVIEW"}:
+                level = "STATIC_REVIEW"
+            elif execution in {"ROUTE_DISCOVERY", "SOURCE_INVENTORY", "ENDPOINT_INVENTORY", "PARAMETER_SHAPE_INVENTORY", "UPLOAD_FORM_INVENTORY", "XML_SURFACE_INVENTORY", "LOGIN_FORM_INVENTORY", "URL_PARAMETER_INVENTORY", "DISCOVERY_QUALITY"}:
+                level = "INVENTORY_ONLY"
+            elif row.get("tested"):
+                level = "EXECUTED"
+            else:
+                level = "NOT_ASSESSED"
+            row["coverage_level"] = level
+            counts[level] += 1
+    raw.setdefault("summary", {})["coverage_level_counts"] = counts
+    raw["summary"].update({"categories_total": len(SATRIA_PORTSWIGGER_LABS),
+                            "lab_scenarios_total": SATRIA_PORTSWIGGER_SCENARIO_COUNT_V4,
+                            "scenarios_actually_executed_or_reviewed": engine.get("tested_scenarios", 0),
+                            "scenarios_not_tested_or_special_context": engine.get("not_tested_scenarios", SATRIA_PORTSWIGGER_SCENARIO_COUNT_V4),
+                            "extra_requests_sent": engine.get("requests_sent", 0),
+                            "coverage_semantics": "Evidence-based; no row is counted as tested solely because a strategy exists."})
+    findings = list(base_result.get("findings", []) or []) if isinstance(base_result, dict) else []
+    for finding in engine.get("findings", []) or []:
+        verification = str(finding.get("verification") or "")
+        if verification and not any(str(x.get("verification") or "") == verification for x in findings if isinstance(x, dict)):
+            findings.append(finding)
+    return {"raw": raw, "findings": findings}
+
+
+# Keep session continuity in SQLi: the original helper used requests.get directly,
+# which silently discarded the per-scan authenticated Academy cookie jar.
+_SATRIA_SQLI_REQUEST_V4_BASE = _satria_sqli_request
+
+def _satria_sqli_request(url, origin, budget):
+    if budget.get("requests", 0) >= SQLI_MAX_REQUESTS or not _satria_sqli_same_origin(url, origin):
+        return None, "request_budget_or_scope_limit"
+    budget["requests"] += 1
+    try:
+        if _satria_ctx_session() is not None:
+            response = _satria_ctx_request(url, method="GET", headers=HEADERS,
+                                           timeout=SQLI_TIMEOUT, allow_redirects=False)
+        else:
+            response = requests.get(url, headers=HEADERS, timeout=SQLI_TIMEOUT,
+                                    allow_redirects=False, verify=True)
+        return response, "ok"
+    except Exception as exc:
+        return None, str(exc)[:180]
+
+
+# Make the V4 scenario runner part of the existing active-scan path. The base
+# scanner retains its existing return shape; findings are merged by verification ID.
+_SATRIA_PS_COVERAGE_V4_BASE = run_portswigger_coverage_analyzer
+
+def run_portswigger_coverage_analyzer(target_url, html, active_raw=None):
+    base = _SATRIA_PS_COVERAGE_V4_BASE(target_url, html, active_raw)
+    try:
+        return _satria_ps4_merge_coverage(target_url, html, active_raw or {}, base)
+    except Exception as exc:
+        raw = base.setdefault("raw", {})
+        raw["lab_engine_v4"] = {"status": "error", "requests_sent": 0,
+                                "scenario_count": SATRIA_PORTSWIGGER_SCENARIO_COUNT_V4,
+                                "notes": ["V4 lab engine error: " + str(exc)[:260]]}
+        return base
+
+
+# Final quality gate: discard weak UNION NULL-only signal. A non-error response to
+# UNION SELECT NULL is not enough to report SQLi unless corroborated by a Boolean,
+# SQL-error, or reflected constant-marker signal on the same parameter/endpoint.
+_SATRIA_ACTIVE_SCAN_V4_BASE = run_active_scanning
 
 def run_active_scanning(target_url, html):
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.max_redirects = 5
-    cookie_header = str(os.getenv("SATRIA_PORTSWIGGER_SESSION_COOKIE", "") or "").strip()
-    if cookie_header and _satria_ps_is_lab(target_url):
-        session.headers.update({"Cookie": cookie_header})
-    context = {"session": session, "target": target_url, "request_ledger": []}
-    token = _SATRIA_SCAN_CONTEXT.set(context)
-    try:
-        result = _SATRIA_BLACKLIST_BASE_ACTIVE_SCAN(target_url, html)
-        if not isinstance(result, dict):
-            result = {"findings": [], "raw": {}, "skipped": False}
-        raw = result.setdefault("raw", {})
-        if result.get("skipped") or raw.get("skipped") or not active_probe_enabled():
-            raw["ssrf_blacklist_filter"] = {
-                "enabled": bool(SATRIA_SSRF_BLACKLIST_FILTER_V1),
-                "status": "SKIPPED_AUTHORIZATION_REQUIRED", "requests_sent": 0,
-                "notes": ["Tidak ada POST stockApi tanpa otorisasi active scan."],
-            }
-            return result
-        try:
-            crawl = raw.get("crawler") or {}
-            ssrf_result = run_ssrf_blacklist_filter_analyzer(
-                target_url, crawler_forms=crawl.get("forms", []), html=html
-            )
-            raw["ssrf_blacklist_filter"] = ssrf_result
-            coverage_raw = raw.get("portswigger_coverage") or {}
-            coverage_raw.setdefault("safe_checks", {})["ssrf_blacklist_filter"] = ssrf_result
-            summary = coverage_raw.setdefault("summary", {})
-            labels = summary.setdefault("safe_probe_families", [])
-            label = "SSRF blacklist filter: bounded stockApi loopback/path differential (Academy only)"
-            if ssrf_result.get("requests_sent") and label not in labels:
-                labels.append(label)
-            finding = ssrf_result.get("finding")
-            if finding:
-                result.setdefault("findings", []).append(finding)
-            for category in coverage_raw.get("categories", []) or []:
-                if category.get("name") == "Server-side request forgery (SSRF)":
-                    for check in category.get("checks", []) or []:
-                        if check.get("name") == SATRIA_SSRF_BLACKLIST_LAB_NAME:
-                            check["status"] = ssrf_result.get("status", "NOT_ASSESSED")
-                            check["evidence"] = json.dumps(ssrf_result.get("differential", {}), ensure_ascii=False)[:650]
-                            check["limitation"] = (
-                                "Hanya membaca hasil stock checker/admin page; tidak menjalankan /admin/delete. "
-                                "Status candidate membutuhkan validasi manual dan bukan klaim lab solved."
-                            )
-                    counts = {}
-                    for check in category.get("checks", []) or []:
-                        key = str(check.get("status") or "UNKNOWN")
-                        counts[key] = counts.get(key, 0) + 1
-                    category["status_counts"] = counts
-            raw.setdefault("discovery_v3", {}).setdefault("session_requests_tracked_after_modules", len(context.get("request_ledger", [])))
-            print("      [SSRF Blacklist] status=%s; requests=%s; finding=%s" % (
-                ssrf_result.get("status"), ssrf_result.get("requests_sent", 0), bool(finding)
-            ))
-        except Exception as exc:
-            raw["ssrf_blacklist_filter"] = {"enabled": True, "status": "ERROR",
-                "requests_sent": 0, "notes": [str(exc)[:240]]}
-            print("      [SSRF Blacklist] Analyzer gagal: %s" % str(exc)[:180])
+    result = _SATRIA_ACTIVE_SCAN_V4_BASE(target_url, html)
+    if not isinstance(result, dict):
         return result
-    finally:
-        try:
-            session.close()
-        finally:
-            _SATRIA_SCAN_CONTEXT.reset(token)
+    findings = result.setdefault("findings", [])
+    raw = result.setdefault("raw", {})
+    sqli = raw.get("sql_injection") or {}
+    strong_sqli = set()
+    for candidate in sqli.get("parameters_tested", []) or []:
+        if candidate.get("quote_error_signatures"):
+            strong_sqli.add((candidate.get("url"), candidate.get("key")))
+        b = candidate.get("boolean_true_false") or {}
+        if b.get("different"):
+            strong_sqli.add((candidate.get("url"), candidate.get("key")))
+    for finding in list(findings):
+        if not isinstance(finding, dict):
+            continue
+        if finding.get("verification") == "candidate_sqli_union_null_shape":
+            evidence = str(finding.get("evidence") or "")
+            matched = False
+            for candidate in sqli.get("parameters_tested", []) or []:
+                if candidate.get("key") and (candidate.get("key") in evidence):
+                    if candidate.get("quote_error_signatures") or (candidate.get("boolean_true_false") or {}).get("different"):
+                        matched = True
+            if not matched:
+                findings.remove(finding)
+    # Consolidate exact duplicate findings generated by overlapping analyzers.
+    deduped, seen = [], set()
+    for finding in findings:
+        if not isinstance(finding, dict):
+            deduped.append(finding)
+            continue
+        key = (str(finding.get("verification") or ""), str(finding.get("type") or ""), str(finding.get("evidence") or "")[:220])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(finding)
+    result["findings"] = deduped
+    return result
 
-SATRIA_SSRF_BLACKLIST_PATCH_V1 = True
