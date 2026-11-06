@@ -23,9 +23,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
+from html import unescape as _html_unescape
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
@@ -4141,7 +4143,28 @@ def _build_pdf_html(result: dict) -> str:
         for c in (lab.get("category_summary") or [])
     )
 
-    return f"""<!doctype html>
+    status_label = {
+        "detected": "TERDETEKSI", "candidate": "KANDIDAT",
+        "not_verified": "BELUM TERBUKTI", "not_applicable": "TIDAK RELEVAN",
+    }
+    appendix_rows = "".join(
+        "<tr>"
+        f"<td>{_esc(r.get('category_title', ''))}</td>"
+        f"<td>{_esc(r.get('title', ''))}</td>"
+        f"<td>{_esc(r.get('level', ''))}</td>"
+        f"<td>{_esc(status_label.get(str(r.get('status', '')), str(r.get('status', ''))))}</td>"
+        "</tr>"
+        for r in (lab.get("per_lab") or [])
+    )
+    appendix_html = ""
+    if appendix_rows:
+        appendix_html = (
+            "<h2>Lampiran &#8212; inventaris " + str(lab.get("labs_total", 0))
+            + " lab PortSwigger</h2>\n<table>\n"
+            "<tr><th>Kategori</th><th>Lab</th><th>Level</th><th>Status</th></tr>\n"
+            + appendix_rows + "</table>\n"
+        )
+        return f"""<!doctype html>
 <html lang="id"><head><meta charset="utf-8"><title>Laporan Kerentanan</title>
 <style>{PDF_CSS}</style></head><body>
 <h1>Laporan Pemindaian Keamanan Web</h1>
@@ -4185,6 +4208,7 @@ def _build_pdf_html(result: dict) -> str:
 </table>
 <p class="small">Temuan hanya diatribusikan ke lab yang seluruh ciri teknisnya terbukti pada target ini.
 Lab yang tidak relevan tidak dilaporkan sebagai temuan.</p>
+{appendix_html}
 </body></html>"""
 
 
@@ -4234,19 +4258,193 @@ def run_pipeline(scrape_data: Optional[dict] = None, *, url: Optional[str] = Non
         configure_runtime(**saved)
 
 
+_PDF_PAGE_W = 595
+_PDF_PAGE_H = 842
+_PDF_MARGIN_X = 45
+_PDF_MARGIN_TOP = 800
+_PDF_MARGIN_BOTTOM = 55
+
+
+def _pdf_escape(text: str) -> str:
+    """Escape teks agar aman sebagai string literal PDF (WinAnsi/latin-1)."""
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if ch in "\\()":
+            out.append("\\" + ch)
+        elif code == 9:
+            out.append(" ")
+        elif 32 <= code <= 126:
+            out.append(ch)
+        elif 160 <= code <= 255:
+            out.append(ch)
+        else:
+            out.append("?")
+    return "".join(out)
+
+
+def _report_text_items(doc_html: str) -> list[tuple[str, str]]:
+    """Ubah HTML laporan menjadi daftar (gaya, baris teks)."""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", doc_html)
+    text = re.sub(r"(?i)<h1[^>]*>", "\n\x01", text)
+    text = re.sub(r"(?i)<h2[^>]*>", "\n\x02", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</t[dh]>", "  |  ", text)
+    text = re.sub(r"(?i)</(tr|table|p|div|li|h[1-6])>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = _html_unescape(text)
+
+    items: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        style = "body"
+        if raw.startswith("\x01"):
+            style, raw = "h1", raw[1:]
+        elif raw.startswith("\x02"):
+            style, raw = "h2", raw[2:] if raw[1:2] == "\x02" else raw[1:]
+        line = re.sub(r"\s+", " ", raw).strip(" |")
+        if not line:
+            if items and items[-1][0] != "blank":
+                items.append(("blank", ""))
+            continue
+        items.append((style, line))
+    return items
+
+
+def _write_builtin_pdf(doc_html: str, out: Path, target: str = "") -> Path:
+    """Tulis PDF valid tanpa dependensi eksternal (Helvetica base-14)."""
+    specs = {"h1": ("/F2", 15.0, 62), "h2": ("/F2", 11.5, 80), "body": ("/F1", 9.2, 106)}
+    lines: list[tuple[str, float, str, float]] = []
+    for style, text in _report_text_items(doc_html):
+        if style == "blank":
+            lines.append(("/F1", 6.0, "", 6.0))
+            continue
+        font, size, width = specs[style]
+        extra = 8.0 if style == "h1" else 5.0 if style == "h2" else 0.0
+        for idx, seg in enumerate(textwrap.wrap(text, width=width) or [""]):
+            lines.append((font, size, seg, extra if idx == 0 else 0.0))
+
+    pages: list[list[tuple[str, float, float, str]]] = []
+    page: list[tuple[str, float, float, str]] = []
+    y = float(_PDF_MARGIN_TOP)
+    for font, size, text, extra in lines:
+        step = size + 3.6
+        if page and (y - step - extra) < _PDF_MARGIN_BOTTOM:
+            pages.append(page)
+            page = []
+            y = float(_PDF_MARGIN_TOP)
+        y -= extra
+        page.append((font, size, y, text))
+        y -= step
+    pages.append(page)
+    total = len(pages)
+
+    footer_left = "SATRIA WebSec - " + target if target else "SATRIA WebSec"
+    footer_left = footer_left[:70]
+    streams: list[bytes] = []
+    for idx, page in enumerate(pages, start=1):
+        cmds = []
+        for font, size, pos_y, text in page:
+            if not text:
+                continue
+            cmds.append(
+                "BT %s %.2f Tf 1 0 0 1 %.2f %.2f Tm (%s) Tj ET"
+                % (font, size, _PDF_MARGIN_X, pos_y, _pdf_escape(text))
+            )
+        cmds.append(
+            "BT /F1 8 Tf 1 0 0 1 %.2f 30 Tm (%s) Tj ET"
+            % (_PDF_MARGIN_X, _pdf_escape(footer_left))
+        )
+        cmds.append(
+            "BT /F1 8 Tf 1 0 0 1 %.2f 30 Tm (%s) Tj ET"
+            % (_PDF_PAGE_W - _PDF_MARGIN_X - 62,
+               _pdf_escape("Halaman %d dari %d" % (idx, total)))
+        )
+        streams.append("\n".join(cmds).encode("latin-1", "replace"))
+
+    objects: dict[int, bytes] = {}
+    objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    kids = " ".join("%d 0 R" % (6 + 2 * i) for i in range(total))
+    objects[2] = (
+        "<< /Type /Pages /Count %d /Kids [%s] >>" % (total, kids)
+    ).encode("latin-1")
+    objects[3] = (
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        b"/Encoding /WinAnsiEncoding >>"
+    )
+    objects[4] = (
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold "
+        b"/Encoding /WinAnsiEncoding >>"
+    )
+    objects[5] = (
+        "<< /Title (Laporan Pemindaian Keamanan Web) "
+        "/Producer (SATRIA WebSec Engine) /Creator (SATRIA WebSec Engine) >>"
+    ).encode("latin-1")
+    for i in range(total):
+        page_id = 6 + 2 * i
+        content_id = 7 + 2 * i
+        objects[page_id] = (
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] "
+            "/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents %d 0 R >>"
+            % (_PDF_PAGE_W, _PDF_PAGE_H, content_id)
+        ).encode("latin-1")
+        stream = streams[i]
+        objects[content_id] = (
+            ("<< /Length %d >>\nstream\n" % len(stream)).encode("latin-1")
+            + stream
+            + b"\nendstream"
+        )
+
+    buf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets: dict[int, int] = {}
+    for num in sorted(objects):
+        offsets[num] = len(buf)
+        buf += ("%d 0 obj\n" % num).encode("latin-1")
+        buf += objects[num]
+        buf += b"\nendobj\n"
+    max_num = max(objects)
+    xref_at = len(buf)
+    buf += ("xref\n0 %d\n" % (max_num + 1)).encode("latin-1")
+    buf += b"0000000000 65535 f \n"
+    for num in range(1, max_num + 1):
+        buf += ("%010d 00000 n \n" % offsets.get(num, 0)).encode("latin-1")
+    buf += (
+        "trailer\n<< /Size %d /Root 1 0 R /Info 5 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (max_num + 1, xref_at)
+    ).encode("latin-1")
+
+    out.write_bytes(bytes(buf))
+    return out
+
+
 def render_pdf(result: dict, path: str = OUTPUT_PDF) -> Path:
-    """Render laporan PDF. Jika WeasyPrint tidak ada, simpan HTML sebagai fallback."""
+    """Render laporan PDF dan SELALU hasilkan file .pdf.
+
+    WeasyPrint dipakai bila tersedia (tata letak penuh). Bila tidak tersedia
+    atau gagal, laporan ditulis sebagai PDF valid memakai penulis PDF bawaan
+    (tanpa dependensi tambahan) sehingga app.py selalu menemukan PDF final.
+    """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     doc = _build_pdf_html(result)
-    if HTML is None:
+
+    if HTML is not None:
+        try:
+            HTML(string=doc).write_pdf(str(out))
+            if out.exists() and out.stat().st_size > 0:
+                print(f"[*] PDF ditulis (WeasyPrint): {out} ({out.stat().st_size:,} bytes)")
+                return out
+        except Exception as exc:
+            print(f"[!] WeasyPrint gagal ({type(exc).__name__}: {exc}); memakai PDF bawaan.")
+
+    try:
+        _write_builtin_pdf(doc, out, target=str(result.get("target") or ""))
+        print(f"[*] PDF ditulis (built-in): {out} ({out.stat().st_size:,} bytes)")
+        return out
+    except Exception as exc:
         fallback = out.with_suffix(".html")
         fallback.write_text(doc, encoding="utf-8")
-        print(f"[!] WeasyPrint tidak tersedia; laporan HTML ditulis: {fallback}")
+        print(f"[!] PDF bawaan gagal ({type(exc).__name__}: {exc}); HTML: {fallback}")
         return fallback
-    HTML(string=doc).write_pdf(str(out))
-    print(f"[*] PDF ditulis: {out}")
-    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
