@@ -4246,5 +4246,192 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# KONFIGURASI RUNTIME — dipakai app.py sebelum pemindaian dijalankan
+# ══════════════════════════════════════════════════════════════════════════════
+
+_RUNTIME_TRUE = {"1", "true", "yes", "on", "y", "ya", "aktif", "enabled", "enable"}
+_RUNTIME_FALSE = {"0", "false", "no", "off", "n", "tidak", "nonaktif", "disabled", "disable", ""}
+
+_BOOL_TARGETS = (
+    "ENABLE_LLM", "RUN_CENSYS", "RUN_NVD", "RUN_ACTIVE_TOOLS",
+    "ACTIVE_SCAN_AUTHORIZED", "ALLOW_PARTIAL_TOOLS",
+)
+_INT_TARGETS = (
+    "REQUEST_TIMEOUT", "MAX_AGENT_ITERATIONS", "MAX_TOKENS_LLM",
+    "KIOSAPI_MAX_OUTPUT_TOKENS", "KIOSAPI_MAX_PROMPT_CHARS",
+    "MAX_PARSED_CHARS", "MAX_RAW_HTML_FOR_VERIFICATION",
+)
+_FLOAT_TARGETS = ("SLEEP_BETWEEN_NVD", "CENSYS_RATE_SLEEP")
+_PATH_TARGETS = ("ARTIFACTS_DIR",)
+
+# target global  ->  nama alternatif yang mungkin dipakai app.py / notebook
+_RUNTIME_ALIASES: dict[str, tuple[str, ...]] = {
+    "ENABLE_LLM": ("llm", "use_llm", "enable_ai", "ai", "llm_enabled",
+                   "enable_llm_analysis", "aktifkan_llm"),
+    "RUN_CENSYS": ("censys", "use_censys", "enable_censys", "censys_enabled"),
+    "RUN_NVD": ("nvd", "use_nvd", "enable_nvd", "nvd_enabled"),
+    "RUN_ACTIVE_TOOLS": ("active_tools", "use_active_tools", "use_tools",
+                         "run_tools", "enable_tools"),
+    "ACTIVE_SCAN_AUTHORIZED": ("authorized", "is_authorized", "authorization",
+                               "active_authorized", "user_authorized",
+                               "confirm_active", "confirm_active_scan",
+                               "izin", "sudah_diizinkan"),
+    "ALLOW_PARTIAL_TOOLS": ("partial_tools", "allow_partial", "tolerate_partial"),
+    "REQUEST_TIMEOUT": ("timeout", "http_timeout", "request_timeout_s",
+                        "timeout_seconds"),
+    "MAX_AGENT_ITERATIONS": ("max_iterations", "agent_iterations",
+                             "max_agent_steps", "iterations"),
+    "MAX_TOKENS_LLM": ("max_tokens", "max_tokens_llm"),
+    "KIOSAPI_MAX_OUTPUT_TOKENS": ("max_output_tokens",),
+    "KIOSAPI_MAX_PROMPT_CHARS": ("max_prompt_chars",),
+    "MAX_PARSED_CHARS": ("max_parsed_chars",),
+    "MAX_RAW_HTML_FOR_VERIFICATION": ("max_raw_html", "max_html_chars"),
+    "MODEL_PRIMARY": ("model", "llm_model", "kiosapi_model", "model_primary",
+                      "nama_model"),
+    "MODEL_FALLBACKS": ("fallback_models", "model_fallback", "model_fallbacks"),
+    "KIOSAPI_BASE_URL": ("base_url", "api_base", "api_base_url", "kiosapi_url"),
+    "KIOSAPI_API_KEY": ("api_key", "llm_api_key", "kiosapi_key", "kiosapi_api_key"),
+    "CENSYS_PAT": ("censys_token", "censys_api_key", "censys_secret", "censys_pat"),
+    "NVD_API_KEY": ("nvd_key", "nvd_api_key"),
+    "ARTIFACTS_DIR": ("output_dir", "artifact_dir", "artifacts", "folder_output"),
+    "SCRAPE_PATH": ("scrape_path", "scrape_result_path"),
+    "FINDINGS_PATH": ("findings_path", "findings_json_path"),
+    "OUTPUT_PDF": ("pdf_path", "report_path", "output_report"),
+    "SLEEP_BETWEEN_NVD": ("nvd_sleep", "sleep_nvd"),
+    "CENSYS_RATE_SLEEP": ("censys_sleep", "sleep_censys"),
+}
+
+_POSITIONAL_FLAGS = (
+    "ENABLE_LLM", "RUN_CENSYS", "RUN_NVD", "RUN_ACTIVE_TOOLS",
+    "ACTIVE_SCAN_AUTHORIZED",
+)
+
+_RUNTIME_CONFIG: dict[str, Any] = {name: globals().get(name) for name in _RUNTIME_ALIASES}
+
+
+def _runtime_key_map() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for target, aliases in _RUNTIME_ALIASES.items():
+        mapping[target.lower()] = target
+        for alias in aliases:
+            mapping[alias] = target
+    return mapping
+
+
+_RUNTIME_KEYS = _runtime_key_map()
+
+
+def _normalize_runtime_key(raw: Any) -> str:
+    return str(raw).strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
+def _coerce_runtime_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in _RUNTIME_TRUE:
+        return True
+    if text in _RUNTIME_FALSE:
+        return False
+    return bool(text)
+
+
+def _coerce_runtime_value(target: str, value: Any) -> Any:
+    if target in _BOOL_TARGETS:
+        return _coerce_runtime_bool(value)
+    if target in _INT_TARGETS:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return globals().get(target)
+    if target in _FLOAT_TARGETS:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return globals().get(target)
+    if target in _PATH_TARGETS:
+        return Path(str(value))
+    if target == "MODEL_FALLBACKS":
+        if isinstance(value, str):
+            parts = value.replace(";", ",").split(",")
+        elif isinstance(value, (list, tuple, set)):
+            parts = list(value)
+        else:
+            parts = [value]
+        return [str(v).strip() for v in parts if str(v).strip()]
+    return value
+
+
+def configure_runtime(*args: Any, **overrides: Any) -> dict[str, Any]:
+    """Terapkan konfigurasi runtime dari app.py / notebook.
+
+    Menerima mapping, objek namespace (mis. hasil argparse), atau keyword apa pun.
+    Nama yang tidak dikenal diabaikan tanpa melempar error, sehingga UI bebas
+    menambah opsi baru. Nilai boolean menerima "1"/"true"/"yes"/"on".
+
+    Contoh:
+        configure_runtime(enable_llm=False, run_censys=True,
+                          authorized=True, timeout=30)
+        configure_runtime({"model": "qwen/qwen3-30b", "max_tokens": 4096})
+    """
+    incoming: dict[str, Any] = {}
+
+    for idx, arg in enumerate(args):
+        if arg is None:
+            continue
+        if isinstance(arg, (bool, int, float, str)):
+            if idx < len(_POSITIONAL_FLAGS):
+                incoming[_POSITIONAL_FLAGS[idx]] = arg
+            continue
+        if hasattr(arg, "keys"):
+            try:
+                incoming.update({str(k): arg[k] for k in arg.keys()})
+                continue
+            except Exception:
+                pass
+        if hasattr(arg, "__dict__"):
+            incoming.update({str(k): v for k, v in vars(arg).items()})
+            continue
+
+    incoming.update(overrides)
+
+    applied: dict[str, Any] = {}
+    ignored: list[str] = []
+    for raw_key, value in incoming.items():
+        key = _normalize_runtime_key(raw_key)
+        target = _RUNTIME_KEYS.get(key)
+        if target is None:
+            ignored.append(str(raw_key))
+            continue
+        new_value = _coerce_runtime_value(target, value)
+        globals()[target] = new_value
+        applied[target] = new_value
+
+    # samakan env agar kode yang membaca os.getenv ikut konsisten
+    for name, env_key in (("ENABLE_LLM", "SATRIA_ENABLE_LLM"),
+                          ("RUN_CENSYS", "SATRIA_RUN_CENSYS"),
+                          ("RUN_NVD", "SATRIA_RUN_NVD")):
+        if name in applied:
+            os.environ[env_key] = "1" if applied[name] else "0"
+
+    # model utama tidak boleh muncul lagi di daftar fallback
+    if "MODEL_PRIMARY" in applied:
+        globals()["MODEL_FALLBACKS"] = [
+            m for m in globals().get("MODEL_FALLBACKS", []) if m != globals()["MODEL_PRIMARY"]
+        ]
+
+    _RUNTIME_CONFIG.update({name: globals().get(name) for name in _RUNTIME_ALIASES})
+    _RUNTIME_CONFIG["_ignored"] = ignored
+    return dict(_RUNTIME_CONFIG)
+
+
+def get_runtime_config() -> dict[str, Any]:
+    """Snapshot konfigurasi runtime yang sedang aktif."""
+    return {name: globals().get(name) for name in _RUNTIME_ALIASES}
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
