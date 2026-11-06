@@ -1,3 +1,4 @@
+%%writefile satria_engine.py
 """SATRIA WebSec engine — core (struktur dipertahankan dari vuln_pipeline.py v27).
 
 API publik yang dipakai bagian lain di GitHub tetap sama:
@@ -2352,7 +2353,8 @@ def p_clickjacking(ctx):
                   f"(HTTP {ctx.status}); halaman {'memuat form' if sensitive else 'tidak memuat form'}."),
         risk="Penyerang dapat menempatkan halaman dalam iframe transparan dan menipu klik pengguna.",
         recommendation="Set X-Frame-Options: DENY/SAMEORIGIN atau CSP frame-ancestors 'self'.",
-        verification="deterministic_frame_header_check",
+        verification="passive_frame_header_absence_only",
+        confidence="candidate",
     )]
 
 
@@ -3924,12 +3926,13 @@ def group_detected(rows: list[dict]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # ORKESTRATOR LAB
 # ══════════════════════════════════════════════════════════════════════════════
-def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 60) -> list[TargetContext]:
-    """Temukan halaman dan endpoint GET pada origin yang sama secara konservatif.
+def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80) -> list[TargetContext]:
+    """Crawl halaman, form GET, dan endpoint yang dirujuk JavaScript pada origin sama.
 
-    Hanya GET tanpa mutasi yang dilakukan pada tahap discovery. Tidak mengikuti
-    redirect lintas-origin, tidak mengunjungi endpoint logout/delete, dan
-    membatasi jumlah halaman agar pemindaian tetap terkendali.
+    Discovery hanya memakai GET dan tidak mengirim form POST atau aksi mutasi.
+    Script eksternal dibatasi, redirect lintas-origin ditolak, dan endpoint
+    destruktif/asset statis dikecualikan. Ini memperluas attack-surface mapping,
+    bukan jaminan eksploitasi seluruh skenario lab.
     """
     from collections import deque
     from urllib.parse import urldefrag, urljoin, urlparse
@@ -3939,12 +3942,41 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 60)
     queue = deque([root_ctx.url])
     seen: set[str] = set()
     contexts: list[TargetContext] = [root_ctx]
-    blocked = re.compile(r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|remove|unsubscribe)(?:/|$)", re.I)
+    scripts_seen: set[str] = set()
+    max_pages = max(1, min(int(os.getenv("SATRIA_MAX_DISCOVERY_PAGES", str(max_pages))), 120))
+    max_scripts = max(0, min(int(os.getenv("SATRIA_MAX_DISCOVERY_SCRIPTS", "24")), 40))
+    blocked = re.compile(r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|remove|unsubscribe|deactivate|purchase|checkout|transfer|payment)(?:/|$)", re.I)
     static_ext = re.compile(r"\.(?:png|jpe?g|gif|svg|ico|css|woff2?|ttf|eot|mp[34]|pdf|zip)(?:$|\?)", re.I)
+    endpoint_pattern = re.compile(
+        r"(?ix)(?:fetch\s*\(|axios\.(?:get|post|put|patch|delete)\s*\(|\$\.ajax\s*\(|\burl\s*[:=])\s*['\"]([^'\"]{1,500})['\"]"
+        r"|['\"]((?:/|\./|\.\./)(?:api|graphql|rest|ajax|account|admin|user|product|search|login|auth|cart|order|comment|upload)[^'\"\s]{0,300})['\"]",
+        re.I,
+    )
 
-    while queue and len(seen) < max(1, min(int(max_pages), 60)):
-        current = queue.popleft()
-        current = urldefrag(current).url
+    def enqueue_candidate(raw: str, base: str) -> None:
+        raw = (raw or "").strip()
+        if not raw or raw.lower().startswith(("javascript:", "mailto:", "tel:", "data:", "blob:", "#")):
+            return
+        candidate = urldefrag(urljoin(base, raw)).url
+        cp = urlparse(candidate)
+        if (cp.scheme.lower(), cp.netloc.lower()) != origin:
+            return
+        if blocked.search(cp.path) or static_ext.search(cp.path + ("?" + cp.query if cp.query else "")):
+            return
+        if candidate not in seen and len(seen) + len(queue) < max_pages * 3:
+            queue.append(candidate)
+
+    def parse_js_for_endpoints(js_text: str, base: str) -> None:
+        if not js_text:
+            return
+        for match in endpoint_pattern.finditer(js_text[:1_500_000]):
+            raw = match.group(1) or match.group(2) or ""
+            # Do not infer arbitrary third-party URLs from bundled/minified JS.
+            if raw.startswith(("/", "./", "../")):
+                enqueue_candidate(raw, base)
+
+    while queue and len(seen) < max_pages:
+        current = urldefrag(queue.popleft()).url
         if current in seen:
             continue
         seen.add(current)
@@ -3956,7 +3988,7 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 60)
 
         if current == root_ctx.url:
             page_ctx = root_ctx
-            html = root_ctx.html or ""
+            page_html = root_ctx.html or ""
         else:
             try:
                 response = requests.get(
@@ -3974,16 +4006,16 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 60)
                 content_type = str(response.headers.get("Content-Type", "")).lower()
                 if content_type and not any(x in content_type for x in ("text/html", "application/xhtml")):
                     continue
-                html = response.text[:MAX_PARSED_CHARS]
+                page_html = response.text[:MAX_PARSED_CHARS]
                 page_ctx = build_target_context(
-                    current, html,
+                    current, page_html,
                     {"status_code": response.status_code,
                      "headers": dict(response.headers), "cookies": []},
                     authorized=root_ctx.authorized,
                 )
             except Exception as exc:
                 root_ctx.http_log.append({"method": "GET", "url": current,
-                                          "error": str(exc)[:120], "phase": "discovery"})
+                                          "error": str(exc)[:160], "phase": "discovery"})
                 continue
 
         if page_ctx is not root_ctx:
@@ -3991,20 +4023,50 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 60)
         soup = page_ctx.soup
         if soup is None:
             continue
+
+        # Links and form actions: GET forms are navigable; POST actions are
+        # recorded as attack-surface metadata but are never submitted here.
         for tag in soup.find_all(["a", "area", "form"]):
             raw = tag.get("href") if tag.name in ("a", "area") else tag.get("action")
-            if not raw or str(raw).strip().lower().startswith(("javascript:", "mailto:", "tel:", "#")):
+            if tag.name == "form" and str(tag.get("method", "get")).lower() != "get":
+                if raw:
+                    root_ctx.http_log.append({"method": str(tag.get("method", "post")).upper(),
+                                              "url": urljoin(current, str(raw)),
+                                              "phase": "form_endpoint_discovered",
+                                              "submitted": False})
                 continue
-            candidate = urljoin(current, str(raw).strip())
-            candidate = urldefrag(candidate).url
-            cp = urlparse(candidate)
-            if (cp.scheme.lower(), cp.netloc.lower()) != origin:
-                continue
-            if blocked.search(cp.path) or static_ext.search(cp.path + ("?" + cp.query if cp.query else "")):
-                continue
-            if candidate not in seen and len(seen) + len(queue) < max_pages * 3:
-                queue.append(candidate)
+            enqueue_candidate(str(raw or ""), current)
 
+        # Inline JavaScript and same-origin external scripts.
+        for script in soup.find_all("script"):
+            if script.get("src"):
+                script_url = urljoin(current, str(script.get("src")))
+                sp = urlparse(script_url)
+                if ((sp.scheme.lower(), sp.netloc.lower()) != origin or
+                        script_url in scripts_seen or len(scripts_seen) >= max_scripts):
+                    continue
+                scripts_seen.add(script_url)
+                try:
+                    sr = requests.get(script_url, timeout=min(ACTIVE_TIMEOUT, 8),
+                                      allow_redirects=False, headers={"User-Agent": UA})
+                    root_ctx.http_log.append({"method": "GET", "url": script_url,
+                                              "status": sr.status_code,
+                                              "len": len(sr.content), "phase": "script_discovery"})
+                    if sr.status_code == 200 and (urlparse(sr.url).scheme, urlparse(sr.url).netloc) == origin:
+                        script_text = sr.text[:1_500_000]
+                        # Masukkan source eksternal ke konteks halaman agar detektor
+                        # DOM-XSS/prototype-pollution dapat menganalisis source/sink,
+                        # bukan hanya mengetahui nama file JavaScript.
+                        page_ctx.js_text = (page_ctx.js_text + "\n" + script_text)[:MAX_PARSED_CHARS]
+                        parse_js_for_endpoints(script_text, current)
+                except Exception as exc:
+                    root_ctx.http_log.append({"method": "GET", "url": script_url,
+                                              "error": str(exc)[:120], "phase": "script_discovery"})
+            else:
+                parse_js_for_endpoints(script.string or script.get_text(" ", strip=False), current)
+
+    root_ctx.http_log.append({"phase": "discovery_summary", "pages": len(contexts),
+                              "scripts": len(scripts_seen), "queued_pages_limit": max_pages})
     return contexts
 
 
@@ -4015,9 +4077,18 @@ def run_lab_scan(ctx) -> dict[str, Any]:
     aggregate_app: dict[str, tuple[bool, str]] = {}
     confirmed_all: list[dict] = []
     candidates_all: list[dict] = []
+    categories_without_detector = [
+        key for key, cat in LAB_DB.items()
+        if not PASSIVE_PROBES.get(cat["probe"]) and not ACTIVE_PROBES.get(cat["probe"])
+    ]
     stats = {"passive_runs": 0, "active_runs": 0, "errors": [],
              "skipped_probes": [], "pages_discovered": len(page_contexts),
-             "discovery_requests": max(0, len(page_contexts) - 1)}
+             "discovery_requests": max(0, len(page_contexts) - 1),
+             "catalog_categories": len(LAB_DB),
+             "catalog_labs": TOTAL_LABS,
+             "passive_probe_families": sorted(PASSIVE_PROBES),
+             "active_probe_families": sorted(ACTIVE_PROBES),
+             "categories_without_detector": categories_without_detector}
 
     for page_ctx in page_contexts:
         page_app = applicability(page_ctx)
@@ -4394,60 +4465,76 @@ def run_pipeline(scrape_data: Optional[dict] = None, *, url: Optional[str] = Non
                  run_censys: Optional[bool] = None,
                  run_nvd: Optional[bool] = None,
                  **runtime_options: Any) -> dict[str, Any]:
-    """Jalankan pipeline SATRIA untuk satu target (API publik, dipakai app.py).
+    """API publik SATRIA; membuat PDF sebelum kembali dan mempertahankan path final.
 
-    Parameter inti sama seperti sebelumnya. Selain itu fungsi ini menerima opsi
-    runtime per-pemanggilan:
-
-        allow_partial_tools, enable_llm, run_censys, run_nvd, timeout, model,
-        max_tokens, api_key, censys_token, nvd_key, output_dir, dan sebagainya.
-
-    Opsi tersebut hanya berlaku selama pemanggilan ini dan dikembalikan seperti
-    semula setelah selesai, sehingga UI yang memanggil berkali-kali tidak saling
-    mempengaruhi. Nama opsi yang tidak dikenal diabaikan tanpa error.
-
-    Contoh (persis seperti app.py):
-        run_pipeline(scrape_data=data, allow_partial_tools=True,
-                     enable_llm=bool(kiosapi_key))
+    Nilai konfigurasi analisis yang bersifat sementara dipulihkan setelah pipeline,
+    tetapi path artefak final sengaja dipertahankan agar app.py membaca file yang
+    benar setelah fungsi selesai.
     """
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
-                        ("enable_llm", enable_llm),
-                        ("run_censys", run_censys),
-                        ("run_nvd", run_nvd),
-                        ("authorized", authorized)):
+                        ("enable_llm", enable_llm), ("run_censys", run_censys),
+                        ("run_nvd", run_nvd), ("authorized", authorized)):
         if value is not None:
             overrides[name] = value
 
-    # Simpan konfigurasi saat ini agar opsi per-pemanggilan tetap terisolasi.
-    # PDF dibuat DI DALAM run_pipeline sebelum konfigurasi dipulihkan, sehingga
-    # app.py dapat langsung membaca engine.OUTPUT_PDF setelah fungsi kembali.
     saved = get_runtime_config() if overrides else None
+    final_pdf: Optional[Path] = None
+    active_artifacts: Optional[Path] = None
     try:
         if overrides:
             configure_runtime(**overrides)
+
+        # Snapshot path sesudah semua konfigurasi diterapkan. Pakai absolute path
+        # agar perubahan working directory Streamlit tidak menggeser lokasi.
+        active_artifacts = Path(ARTIFACTS_DIR).expanduser().resolve()
+        requested_pdf = Path(OUTPUT_PDF).expanduser()
+        if not requested_pdf.is_absolute():
+            requested_pdf = (Path.cwd() / requested_pdf).resolve()
+        requested_pdf.parent.mkdir(parents=True, exist_ok=True)
 
         result = _run_pipeline_impl(
             scrape_data=scrape_data, url=url, html=html,
             authorized=authorized, http_result=http_result
         )
 
-        pdf_path = render_pdf(result, OUTPUT_PDF)
-        pdf_path = Path(pdf_path)
-        if pdf_path.suffix.lower() != ".pdf" or not pdf_path.is_file():
-            raise RuntimeError(f"Renderer tidak menghasilkan file PDF: {pdf_path}")
-        if pdf_path.stat().st_size < 1000:
-            raise RuntimeError(
-                f"PDF final terlalu kecil/tidak valid: {pdf_path} "
-                f"({pdf_path.stat().st_size} byte)"
-            )
-        # Jaga agar nilai OUTPUT_PDF yang dibaca pemanggil selalu menunjuk
-        # ke lokasi file yang benar selama konfigurasi runtime aktif.
-        globals()["OUTPUT_PDF"] = str(pdf_path)
+        # Tulis ke nama sementara di direktori yang sama, validasi signature PDF,
+        # lalu atomik-replace ke nama final. Tidak ada PDF parsial yang terlihat.
+        temp_pdf = requested_pdf.with_name(requested_pdf.stem + ".satria_tmp.pdf")
+        try:
+            if temp_pdf.exists():
+                temp_pdf.unlink()
+            rendered = render_pdf(result, str(temp_pdf))
+            rendered = Path(rendered)
+            if (not rendered.is_file() or rendered.stat().st_size < 1000 or
+                    rendered.read_bytes()[:5] != b"%PDF-"):
+                raise RuntimeError(
+                    f"Renderer tidak menghasilkan PDF valid: {rendered}; "
+                    f"size={rendered.stat().st_size if rendered.exists() else 0}"
+                )
+            os.replace(str(rendered), str(requested_pdf))
+        finally:
+            try:
+                if temp_pdf.exists():
+                    temp_pdf.unlink()
+            except Exception:
+                pass
+
+        if (not requested_pdf.is_file() or requested_pdf.stat().st_size < 1000 or
+                requested_pdf.read_bytes()[:5] != b"%PDF-"):
+            raise RuntimeError(f"PDF final tidak valid setelah penulisan: {requested_pdf}")
+        final_pdf = requested_pdf.resolve()
+        globals()["OUTPUT_PDF"] = str(final_pdf)
         return result
     finally:
         if saved is not None:
             configure_runtime(**saved)
+        # Jangan pulihkan OUTPUT_PDF ke path default lama. app.py memeriksa
+        # engine.OUTPUT_PDF setelah run_pipeline() selesai.
+        if final_pdf is not None and final_pdf.is_file():
+            globals()["OUTPUT_PDF"] = str(final_pdf)
+            # ARTIFACTS_DIR juga diselaraskan dengan direktori artefak job.
+            globals()["ARTIFACTS_DIR"] = final_pdf.parent
 
 
 _PDF_PAGE_W = 595
@@ -4622,7 +4709,7 @@ def render_pdf(result: dict, path: str = OUTPUT_PDF) -> Path:
     if HTML is not None:
         try:
             HTML(string=doc).write_pdf(str(out))
-            if out.exists() and out.stat().st_size > 0:
+            if out.exists() and out.stat().st_size >= 1000 and out.read_bytes()[:5] == b"%PDF-":
                 print(f"[*] PDF ditulis (WeasyPrint): {out} ({out.stat().st_size:,} bytes)")
                 return out
         except Exception as exc:
@@ -4630,6 +4717,8 @@ def render_pdf(result: dict, path: str = OUTPUT_PDF) -> Path:
 
     try:
         _write_builtin_pdf(doc, out, target=str(result.get("target") or ""))
+        if not out.is_file() or out.stat().st_size < 1000 or out.read_bytes()[:5] != b"%PDF-":
+            raise RuntimeError("Renderer bawaan menghasilkan berkas yang bukan PDF valid.")
         print(f"[*] PDF ditulis (built-in): {out} ({out.stat().st_size:,} bytes)")
         return out
     except Exception as exc:
