@@ -3985,9 +3985,9 @@ def _resolve_inputs(scrape_data: Optional[dict] = None, url: Optional[str] = Non
     return target_url, page_html
 
 
-def run_pipeline(scrape_data: Optional[dict] = None, *, url: Optional[str] = None,
-                 html: Optional[str] = None, authorized: Optional[bool] = None,
-                 http_result: Optional[dict] = None) -> dict[str, Any]:
+def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str] = None,
+                       html: Optional[str] = None, authorized: Optional[bool] = None,
+                       http_result: Optional[dict] = None) -> dict[str, Any]:
     """Jalankan seluruh pipeline SATRIA untuk SATU target.
 
     Parameter
@@ -4186,6 +4186,52 @@ def _build_pdf_html(result: dict) -> str:
 <p class="small">Temuan hanya diatribusikan ke lab yang seluruh ciri teknisnya terbukti pada target ini.
 Lab yang tidak relevan tidak dilaporkan sebagai temuan.</p>
 </body></html>"""
+
+
+def run_pipeline(scrape_data: Optional[dict] = None, *, url: Optional[str] = None,
+                 html: Optional[str] = None, authorized: Optional[bool] = None,
+                 http_result: Optional[dict] = None,
+                 allow_partial_tools: Optional[bool] = None,
+                 enable_llm: Optional[bool] = None,
+                 run_censys: Optional[bool] = None,
+                 run_nvd: Optional[bool] = None,
+                 **runtime_options: Any) -> dict[str, Any]:
+    """Jalankan pipeline SATRIA untuk satu target (API publik, dipakai app.py).
+
+    Parameter inti sama seperti sebelumnya. Selain itu fungsi ini menerima opsi
+    runtime per-pemanggilan:
+
+        allow_partial_tools, enable_llm, run_censys, run_nvd, timeout, model,
+        max_tokens, api_key, censys_token, nvd_key, output_dir, dan sebagainya.
+
+    Opsi tersebut hanya berlaku selama pemanggilan ini dan dikembalikan seperti
+    semula setelah selesai, sehingga UI yang memanggil berkali-kali tidak saling
+    mempengaruhi. Nama opsi yang tidak dikenal diabaikan tanpa error.
+
+    Contoh (persis seperti app.py):
+        run_pipeline(scrape_data=data, allow_partial_tools=True,
+                     enable_llm=bool(kiosapi_key))
+    """
+    overrides: dict[str, Any] = dict(runtime_options)
+    for name, value in (("allow_partial_tools", allow_partial_tools),
+                        ("enable_llm", enable_llm),
+                        ("run_censys", run_censys),
+                        ("run_nvd", run_nvd),
+                        ("authorized", authorized)):
+        if value is not None:
+            overrides[name] = value
+
+    if not overrides:
+        return _run_pipeline_impl(scrape_data=scrape_data, url=url, html=html,
+                                  authorized=authorized, http_result=http_result)
+
+    saved = get_runtime_config()
+    try:
+        configure_runtime(**overrides)
+        return _run_pipeline_impl(scrape_data=scrape_data, url=url, html=html,
+                                  authorized=authorized, http_result=http_result)
+    finally:
+        configure_runtime(**saved)
 
 
 def render_pdf(result: dict, path: str = OUTPUT_PDF) -> Path:
