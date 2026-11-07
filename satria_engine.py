@@ -1,4 +1,3 @@
-%%writefile satria_engine.py
 """SATRIA WebSec engine — core (struktur dipertahankan dari vuln_pipeline.py v27).
 
 API publik yang dipakai bagian lain di GitHub tetap sama:
