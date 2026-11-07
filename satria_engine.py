@@ -1640,18 +1640,28 @@ _RAW_CATALOG: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
 }
 
 
+# Tag pembeda yang ditetapkan manual untuk lab yang ciri khasnya dapat diuji
+# secara aktif. Tanpa ini beberapa lab dalam satu kategori berbagi tag identik,
+# sehingga satu temuan bisa diklaim sebagai lab yang berbeda-beda.
+_LAB_TAG_SET_OVERRIDES: dict[str, frozenset] = {
+    "business_logic-02": frozenset({"business_logic", "negative_quantity"}),
+    "business_logic-04": frozenset({"business_logic", "coupon_reuse"}),
+}
+
+
 def _build_lab_db() -> dict[str, dict]:
     db: dict[str, dict] = {}
     for cat_key, (cat_title, probe, labs) in _RAW_CATALOG.items():
         entries = []
         for idx, (level, title) in enumerate(labs, start=1):
+            lab_id = f"{cat_key}-{idx:02d}"
             entries.append({
-                "id": f"{cat_key}-{idx:02d}",
+                "id": lab_id,
                 "level": level,
                 "title": title,
                 "probe": probe,
                 "category": cat_key,
-                "tags": derive_tags(cat_key, title),
+                "tags": _LAB_TAG_SET_OVERRIDES.get(lab_id) or derive_tags(cat_key, title),
             })
         db[cat_key] = {"title": cat_title, "probe": probe, "labs": entries}
     return db
@@ -2086,6 +2096,13 @@ def _b64url_json(part: str) -> dict:
 
 SQL_ERROR_SIGNATURES = [
     ("sqlite", "sqlite error"),
+    ("sqlite", "sqlite3.operationalerror"),
+    ("sqlite", "sqlite3.databaseerror"),
+    ("sqlite", "unrecognized token"),
+    ("mysql", "pymysql.err"),
+    ("mysql", "mysqli_sql_exception"),
+    ("postgresql", "psycopg2.errors"),
+    ("mssql", "system.data.sqlclient"),
     ("mysql", "you have an error in your sql syntax"),
     ("mysql", "warning: mysql"),
     ("postgresql", "pg_query()"),
@@ -3212,6 +3229,9 @@ def a_reflection(ctx):
             else:
                 ctx_label = "konteks HTML"
             unencoded = payload in body
+            if unencoded:
+                # Nilai muncul mentah di respons = tidak ada encoding output sama sekali.
+                tags.add("nothing_encoded")
             out.append(make_finding(
                 ctx, "xss", tags,
                 type_=f"Reflected XSS terkonfirmasi pada parameter '{name}' ({ctx_label})",
@@ -3426,6 +3446,249 @@ def a_path_traversal(ctx):
                     verification="active_path_traversal_passwd",
                 )]
     return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Business logic — verifikasi aktif (kupon berulang / kuantitas negatif / harga klien)
+# ══════════════════════════════════════════════════════════════════════════════
+COUPON_FIELD_RE = re.compile(r"(coupon|discount|voucher|promo|gift[-_ ]?card|redeem)", re.I)
+BUSINESS_SKIP_RE = re.compile(
+    r"(?:^|/)(?:checkout|payment|pay|purchase|order|delete|remove|logout|sign-?out|transfer|unsubscribe)(?:/|$)",
+    re.I,
+)
+COUPON_CODE_RE = re.compile(
+    r"(?i:coupon|voucher|promo|discount|code)\b.{0,40}?([A-Z][A-Z0-9_-]{3,14})\b")
+TOTAL_LABEL_RE = re.compile(r"(?:grand\s+total|amount\s+due|total\s+price|total|subtotal)", re.I)
+CURRENCY_RE = re.compile(r"(?:[$€£]|usd|eur|idr|rp\.?)\s?(-?\d[\d.,]*)", re.I)
+CART_PATH_RE = re.compile(r"(cart|basket|bag|checkout|order)", re.I)
+QUANTITY_FIELDS = {"quantity", "qty", "count", "num", "units"}
+PRICE_FIELDS = {"price", "amount", "cost", "total"}
+
+
+def _parse_amount(raw: str) -> Optional[float]:
+    """Ubah '1.337,00' / '1,337.00' / '1337' menjadi float."""
+    token = (raw or "").strip()
+    if not token:
+        return None
+    if "," in token and "." in token:
+        if token.rfind(",") > token.rfind("."):
+            token = token.replace(".", "").replace(",", ".")
+        else:
+            token = token.replace(",", "")
+    elif "," in token:
+        token = token.replace(",", ".") if len(token.rsplit(",", 1)[-1]) <= 2 else token.replace(",", "")
+    else:
+        token = token.replace(" ", "")
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def _page_total(page_html: str) -> Optional[float]:
+    """Ambil nilai total keranjang: angka mata uang terdekat setelah label total."""
+    if not page_html:
+        return None
+    best: Optional[float] = None
+    for label in TOTAL_LABEL_RE.finditer(page_html):
+        window = page_html[label.end(): label.end() + 220]
+        match = CURRENCY_RE.search(window) or re.match(r"[^<\d]{0,24}(-?\d[\d.,]*)", window)
+        if not match:
+            continue
+        value = _parse_amount(match.group(1))
+        if value is not None and (best is None or value > best):
+            best = value
+    return best
+
+
+def _coupon_codes(page_html: str) -> list[str]:
+    """Kode kupon yang dipublikasikan halaman, mis. banner 'use code NEWCUST5'."""
+    from html import unescape
+
+    text = unescape(re.sub(r"<[^>]+>", " ", page_html or ""))
+    codes: list[str] = []
+    for match in COUPON_CODE_RE.finditer(text):
+        code = match.group(1).strip().upper()
+        if code.isdigit() or code in codes:
+            continue
+        codes.append(code)
+    return codes[:4]
+
+
+def _form_values(form: dict) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for element in form.get("inputs", []):
+        name = str(element.get("name") or "").strip()
+        if not name:
+            continue
+        kind = str(element.get("type") or "").lower()
+        if kind in {"submit", "button", "image", "file", "reset", "password"}:
+            continue
+        if kind in {"checkbox", "radio"} and not element.get("value"):
+            continue
+        values[name] = str(element.get("value") or "")
+    return values
+
+
+@active("business_logic")
+def a_business_rules(ctx):
+    """Buktikan cacat logika bisnis lewat perbandingan total, bukan dugaan.
+
+    Perilaku yang diuji: kupon sama/bergantian dapat dipakai berulang, kuantitas
+    negatif diterima, dan harga dari klien dipercaya. Hanya form pada origin yang
+    sama yang memuat field kupon/kuantitas/harga yang dikirim ulang, dibatasi
+    belasan permintaan, dan endpoint checkout/pembayaran/penghapusan dilewati.
+    """
+    from urllib.parse import urljoin
+
+    out: list[dict] = []
+    base = urlparse(ctx.url)
+    origin = (base.scheme.lower(), base.netloc.lower())
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA})
+    budget = {"left": 12}
+
+    def submit(action_url: str, payload: dict[str, str]):
+        if budget["left"] <= 0:
+            return None
+        budget["left"] -= 1
+        try:
+            resp = session.post(action_url, data=payload, timeout=ACTIVE_TIMEOUT,
+                                allow_redirects=False, headers={"Referer": ctx.url})
+            ctx.http_log.append({"method": "POST", "url": action_url,
+                                 "status": resp.status_code, "len": len(resp.content),
+                                 "phase": "business_logic"})
+            hops = 0
+            while resp.is_redirect and hops < 2 and budget["left"] > 0:
+                target = urljoin(action_url, resp.headers.get("Location") or "")
+                tp = urlparse(target)
+                if (tp.scheme.lower(), tp.netloc.lower()) != origin:
+                    return None
+                budget["left"] -= 1
+                resp = session.get(target, timeout=ACTIVE_TIMEOUT, allow_redirects=False,
+                                   headers={"User-Agent": UA})
+                ctx.http_log.append({"method": "GET", "url": target,
+                                     "status": resp.status_code, "len": len(resp.content),
+                                     "phase": "business_logic"})
+                hops += 1
+            return resp
+        except Exception as exc:
+            ctx.http_log.append({"method": "POST", "url": action_url,
+                                 "error": str(exc)[:120], "phase": "business_logic"})
+            return None
+
+    codes = _coupon_codes(ctx.html)
+
+    targets = []
+    for form in ctx.forms:
+        action = urljoin(ctx.url, str(form.get("action") or ctx.url))
+        parsed_action = urlparse(action)
+        if (parsed_action.scheme.lower(), parsed_action.netloc.lower()) != origin:
+            continue
+        if BUSINESS_SKIP_RE.search(parsed_action.path or ""):
+            continue
+        values = _form_values(form)
+        low = {name.lower(): name for name in values}
+        coupon_key = next((low[k] for k in low if COUPON_FIELD_RE.search(k)), None)
+        quantity_key = next((low[k] for k in low if k in QUANTITY_FIELDS), None)
+        price_key = next((low[k] for k in low if k in PRICE_FIELDS), None)
+        if not (coupon_key or quantity_key or price_key):
+            continue
+        # Form umum (mis. pencarian/login) tidak disentuh: hanya field kupon/harga
+        # atau form pada halaman keranjang yang boleh dikirim ulang.
+        if not (coupon_key or price_key) and not CART_PATH_RE.search(
+                urlparse(ctx.url).path or ""):
+            continue
+        targets.append((action, values, coupon_key, quantity_key, price_key))
+
+    for action, values, coupon_key, quantity_key, price_key in targets[:1]:
+        payload = dict(values)
+        if coupon_key:
+            payload[coupon_key] = ""
+        baseline_resp = submit(action, payload)
+        if baseline_resp is None:
+            continue
+        current_total = _page_total(baseline_resp.text or "")
+        if current_total is None:
+            continue
+
+        if coupon_key and codes:
+            before_coupon = current_total
+            same = dict(payload)
+            same[coupon_key] = codes[0]
+            first = submit(action, same)
+            first_total = _page_total(first.text or "") if first is not None else None
+            if first_total is not None and first_total < current_total - 0.009:
+                again = submit(action, same)
+                again_total = _page_total(again.text or "") if again is not None else None
+                reused = again_total is not None and again_total < first_total - 0.009
+                last_total = again_total if reused else first_total
+                if not reused and len(codes) > 1:
+                    other = dict(payload)
+                    other[coupon_key] = codes[1]
+                    alt_resp = submit(action, other)
+                    alt_total = _page_total(alt_resp.text or "") if alt_resp is not None else None
+                    back = submit(action, same)
+                    back_total = _page_total(back.text or "") if back is not None else None
+                    if (alt_total is not None and back_total is not None
+                            and back_total < alt_total - 0.009):
+                        reused, last_total = True, back_total
+                if reused:
+                    out.append(make_finding(
+                        ctx, "business_logic", {"business_logic", "coupon_reuse"},
+                        type_=f"Kupon dapat dipakai berulang pada '{urlparse(action).path or '/'}'",
+                        severity="high",
+                        evidence=(f"Total turun {before_coupon:.2f} -> {first_total:.2f} setelah kupon "
+                                  f"{codes[0]!r}, lalu turun lagi ke {last_total:.2f} ketika kupon "
+                                  f"yang sama/bergantian diterapkan kembali."),
+                        risk=("Aturan pemakaian kupon tidak ditegakkan di server; harga dapat "
+                              "diturunkan berulang sampai di bawah saldo atau nol."),
+                        recommendation=("Simpan pemakaian kupon secara atomik per pengguna/keranjang "
+                                        "dan tolak penerapan ulang kupon yang sudah aktif."),
+                        verification="active_coupon_reuse_differential",
+                    ))
+                # State keranjang sudah berubah; uji berikutnya memakai total ini.
+                current_total = last_total
+
+        if quantity_key:
+            before_qty = current_total
+            negative = dict(payload)
+            negative[quantity_key] = "-1"
+            neg_resp = submit(action, negative)
+            neg_total = _page_total(neg_resp.text or "") if neg_resp is not None else None
+            if neg_total is not None and neg_total < current_total - 0.009:
+                out.append(make_finding(
+                    ctx, "business_logic", {"business_logic", "negative_quantity"},
+                    type_=f"Kuantitas negatif diterima pada field '{quantity_key}'",
+                    severity="high",
+                    evidence=(f"Total berubah dari {before_qty:.2f} menjadi {neg_total:.2f} "
+                              f"ketika '{quantity_key}' dikirim bernilai -1."),
+                    risk="Total belanja dapat diturunkan dengan menambah item berkuantitas negatif.",
+                    recommendation="Validasi batas bawah kuantitas (>= 1) dan hitung ulang total di server.",
+                    verification="active_negative_quantity_differential",
+                ))
+            if neg_total is not None:
+                current_total = neg_total
+
+        if price_key:
+            before_price = current_total
+            tampered = dict(payload)
+            tampered[price_key] = "0.01"
+            price_resp = submit(action, tampered)
+            price_total = _page_total(price_resp.text or "") if price_resp is not None else None
+            if price_total is not None and price_total <= 1.0 < current_total:
+                out.append(make_finding(
+                    ctx, "business_logic", {"business_logic", "client_side_trust"},
+                    type_=f"Server mempercayai harga dari klien pada field '{price_key}'",
+                    severity="high",
+                    evidence=(f"Total mengikuti nilai kiriman klien: {before_price:.2f} -> "
+                              f"{price_total:.2f} saat '{price_key}' diubah menjadi 0.01."),
+                    risk="Harga dapat dimanipulasi sepenuhnya dari sisi klien.",
+                    recommendation="Ambil harga dari katalog server dan abaikan harga kiriman klien.",
+                    verification="active_client_price_tamper",
+                ))
+
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3846,6 +4109,35 @@ def _run_probes(ctx, app: dict[str, tuple[bool, str]]) -> tuple[list[dict], list
 # ══════════════════════════════════════════════════════════════════════════════
 # ATRIBUSI LAB
 # ══════════════════════════════════════════════════════════════════════════════
+# Tag yang BENAR-BENAR dapat dibuktikan oleh probe (pasif maupun aktif).
+# Tag deskriptif yang tidak pernah dipancarkan probe (mis. "stored", "oob",
+# "h2") tidak boleh menjadi syarat mutlak: syarat seperti itu membuat 198 dari
+# 273 lab mustahil terdeteksi meskipun bukti intinya sudah dikonfirmasi.
+PROVABLE_TAGS: frozenset = frozenset({
+    # tag kategori
+    "sql_injection", "xss", "csrf", "clickjacking", "dom", "cors", "xxe", "ssrf",
+    "smuggling", "os_command", "ssti", "path_traversal", "access_control",
+    "authentication", "websockets", "cache_poisoning", "deserialization",
+    "info_disclosure", "business_logic", "host_header", "oauth", "file_upload",
+    "jwt", "essential", "prototype_pollution", "graphql", "race", "nosql", "api",
+    "llm", "cache_deception",
+    # sinyal yang dipancarkan probe
+    "reflected", "nothing_encoded", "attribute_context", "javascript_context",
+    "dom_sink", "doc_write", "inner_html", "jquery_selector", "jquery_anchor",
+    "web_message", "json_parse", "angularjs", "blind", "error_based", "time_based",
+    "union", "login_bypass", "admin_panel", "idor", "role_param", "api_docs",
+    "mass_assignment", "cookie_bruteforce", "password_reset", "two_fa",
+    "client_side_trust", "coupon_reuse", "negative_quantity", "path_mapping",
+    "unkeyed_header", "null_origin", "protocol_confusion", "no_csrf_defense",
+    "java_gadget", "php_object", "ruby_gadget", "serialized_object", "dom_clobbering",
+    "open_redirect", "cookie_manipulation", "content_type_bypass", "webshell",
+    "graphql_endpoint", "backup_file", "debug_exposure", "jwt_weak_key",
+    "jwt_unverified", "jwt_jwk", "jwt_jku", "jwt_kid", "jwt_alg_confusion",
+    "nosql_auth", "nosql_detect", "oauth_implicit", "oauth_redirect", "client_proto",
+    "server_proto", "websocket_hijack", "origin_reflection",
+})
+
+
 def attribute_labs(ctx, confirmed: list[dict], candidates: list[dict],
                    app: dict[str, tuple[bool, str]]) -> list[dict]:
     """Petakan temuan ke lab. Lab hanya 'detected' bila SELURUH tag-nya terbukti."""
@@ -3858,6 +4150,8 @@ def attribute_labs(ctx, confirmed: list[dict], candidates: list[dict],
 
         for lab in cat["labs"]:
             required = set(lab["tags"])
+            provable = required & PROVABLE_TAGS
+            unprovable = required - PROVABLE_TAGS
             row = {
                 "lab_id": lab["id"],
                 "category": cat_key,
@@ -3871,10 +4165,36 @@ def attribute_labs(ctx, confirmed: list[dict], candidates: list[dict],
                 "matched_finding": "",
             }
 
-            hits = [f for f in cat_conf if required <= set(f["tags"])]
-            if hits:
+            # Ciri yang benar-benar dapat dibuktikan probe menjadi syarat inti;
+            # ciri deskriptif yang tidak dapat diuji tidak memblokir bukti inti,
+            # tetapi juga tidak boleh diklaim: lab seperti itu tetap "kandidat".
+            hits = [f for f in cat_conf if provable and provable <= set(f["tags"])]
+            # Lab yang ciri pembedanya tidak dapat diuji dan hanya menyisakan tag
+            # kategori tidak boleh diklaim dari temuan mana pun di kategori itu:
+            # bukti baru pada tingkat kategori, bukan bukti lab tersebut.
+            if hits and not (provable - {cat_key}):
+                row["status"] = STATUS_CANDIDATE
+                row["evidence"] = (
+                    f"bukti baru pada tingkat kategori ({cat_key}); ciri pembeda lab ini "
+                    "belum diuji sehingga tidak diklaim sebagai lab tertentu"
+                )
+                row["matched_finding"] = hits[0]["type"]
+                rows.append(row)
+                continue
+
+            if hits and not unprovable:
                 row["status"] = STATUS_DETECTED
                 row["evidence"] = hits[0]["evidence"]
+                row["matched_finding"] = hits[0]["type"]
+                rows.append(row)
+                continue
+
+            if hits:
+                row["status"] = STATUS_CANDIDATE
+                row["evidence"] = (
+                    f"ciri inti terbukti ({', '.join(sorted(provable))}); ciri pembeda "
+                    f"({', '.join(sorted(unprovable))}) belum diuji"
+                )
                 row["matched_finding"] = hits[0]["type"]
                 rows.append(row)
                 continue
