@@ -1738,6 +1738,20 @@ _LAB_TAG_SET_OVERRIDES: dict[str, frozenset] = {
     "csrf-09": frozenset({"csrf", "samesite_strict_sibling"}),
     "csrf-10": frozenset({"csrf", "referer", "referer_presence"}),
     "csrf-11": frozenset({"csrf", "referer", "referer_broken"}),
+    # DOM — 7 lab dibedakan satu-per-satu.
+    "dom-01": frozenset({"dom", "dom_sink", "web_message"}),
+    "dom-02": frozenset({"dom", "dom_sink", "javascript_context", "web_message"}),
+    "dom-03": frozenset({"dom", "dom_sink", "json_parse", "web_message"}),
+    "dom-04": frozenset({"dom", "dom_sink", "open_redirect"}),
+    "dom-05": frozenset({"dom", "dom_sink", "cookie_manipulation"}),
+    "dom-06": frozenset({"dom", "dom_clobbering"}),
+    "dom-07": frozenset({"attribute_context", "dom", "dom_clobbering"}),
+    # Clickjacking — 5 varian dibedakan satu-per-satu.
+    "clickjacking-01": frozenset({"clickjacking", "cj_token_protected"}),
+    "clickjacking-02": frozenset({"clickjacking", "cj_prefilled"}),
+    "clickjacking-03": frozenset({"clickjacking", "frame_buster"}),
+    "clickjacking-04": frozenset({"clickjacking", "cj_dom_xss"}),
+    "clickjacking-05": frozenset({"clickjacking", "multistep"}),
 }
 
 
@@ -2352,25 +2366,36 @@ def p_xss_dom_sinks(ctx):
 def p_dom_messages(ctx):
     out = []
     js = ctx.js_text or ""
-    if not re.search(r"addEventListener\(\s*['\"]message['\"]", js, re.I):
-        return out
-    if re.search(r"(eval|innerHTML|document\.write|location(\.href)?\s*=)", js, re.I):
-        tags = {"dom", "web_message", "dom_sink"}
-        if re.search(r"JSON\.parse", js, re.I):
-            tags.add("json_parse")
-        if re.search(r"(javascript:|location\s*=)", js, re.I):
-            tags.add("javascript_context")
-        out.append(make_finding(
-            ctx, "dom", tags,
-            type_="DOM XSS via postMessage tanpa validasi origin",
-            severity="high",
-            evidence="Handler 'message' meneruskan data ke sink eksekusi; cuplikan: "
-                     f"\"{_snip(js, 'addEventListener')}\"",
-            risk="Halaman lain dapat mengirim pesan dan mengeksekusi JavaScript di origin target.",
-            recommendation="Validasi event.origin terhadap allowlist dan jangan meneruskan data pesan ke sink HTML/JS.",
-            verification="deterministic_postmessage_sink",
-        ))
-    if re.search(r"(location\s*=\s*[^;\n]{0,40}(location\.(search|hash)|document\.referrer))", js, re.I):
+    html = ctx.html or ""
+
+    # ── Lab 01-03: DOM XSS via web messages (listener + sink) ──
+    if re.search(r"addEventListener\(\s*['\"]message['\"]", js, re.I):
+        sink_m = re.search(
+            r"(innerHTML|outerHTML|document\.write\w*|insertAdjacentHTML|"
+            r"eval\s*\(|location(?:\.href)?\s*=|\.src\s*=|\.href\s*=)",
+            js, re.I)
+        if sink_m:
+            tags = {"dom", "web_message", "dom_sink"}
+            if re.search(r"JSON\.parse", js, re.I):
+                tags.add("json_parse")
+            if re.search(r"(javascript:|location(?:\.href)?\s*=)", js, re.I):
+                tags.add("javascript_context")
+            out.append(make_finding(
+                ctx, "dom", tags,
+                type_="DOM XSS via postMessage tanpa validasi origin",
+                severity="high",
+                evidence="Handler 'message' meneruskan data ke sink eksekusi; cuplikan: "
+                         f"\"{_snip(js, 'addEventListener')}\"",
+                risk="Halaman lain dapat mengirim pesan dan mengeksekusi JavaScript di origin target.",
+                recommendation="Validasi event.origin terhadap allowlist dan jangan meneruskan data pesan ke sink HTML/JS.",
+                verification="deterministic_postmessage_sink",
+            ))
+
+    # ── Lab 04: DOM-based open redirection (tanpa listener pesan) ──
+    if (re.search(r"location(?:\.href)?\s*=", js, re.I)
+            and re.search(r"(location\.(?:search|hash)|exec\s*\(\s*location\b|"
+                          r"URLSearchParams|getParam|document\.referrer|window\.location)",
+                          js, re.I)):
         out.append(make_finding(
             ctx, "dom", {"dom", "open_redirect", "dom_sink"},
             type_="DOM-based open redirection", severity="medium",
@@ -2379,7 +2404,12 @@ def p_dom_messages(ctx):
             recommendation="Validasi tujuan redirect terhadap allowlist path/host.",
             verification="deterministic_dom_redirect",
         ))
-    if re.search(r"document\.cookie\s*=\s*[^;\n]{0,60}(location|document\.URL)", js, re.I):
+
+    # ── Lab 05: DOM-based cookie manipulation (tanpa listener pesan) ──
+    if (re.search(r"document\.cookie\s*=", js, re.I)
+            and re.search(r"(window\.location|location\.(?:search|hash|href)|"
+                          r"document\.URL|URLSearchParams|getParam)",
+                          js, re.I)):
         out.append(make_finding(
             ctx, "dom", {"dom", "cookie_manipulation", "dom_sink"},
             type_="DOM-based cookie manipulation", severity="medium",
@@ -2388,18 +2418,60 @@ def p_dom_messages(ctx):
             recommendation="Jangan menurunkan cookie dari input URL; gunakan HttpOnly untuk cookie sesi.",
             verification="deterministic_dom_cookie",
         ))
-    if re.search(r"(id\s*=\s*['\"][^'\"]+['\"][^>]*name\s*=|document\.getElementById\([^)]*\)\.(src|href))", ctx.html or "", re.I) \
-            and re.search(r"document\.(forms|getElementById)", js, re.I):
+
+    # ── Lab 06: DOM clobbering -> XSS (window.<nama> || fallback + elemen
+    #            id ganda dengan name/href penimpa) ──
+    clobbered = False
+    for m in re.finditer(r"window\.([A-Za-z_$][\w$]*)\s*\|\|", js):
+        name = m.group(1)
+        ids = re.findall(rf"id\s*=\s*[\"']?{re.escape(name)}[\"']?", html, re.I)
+        if len(ids) >= 2 and re.search(
+                rf"id\s*=\s*[\"']?{re.escape(name)}[\"']?[^>]*(?:name\s*=|href\s*=|src\s*=)", html, re.I):
+            out.append(make_finding(
+                ctx, "dom", {"dom", "dom_clobbering", "dom_sink"},
+                type_="DOM clobbering mengaktifkan XSS (variabel global dapat ditimpa elemen)",
+                severity="high",
+                evidence=(f"JS memakai fallback 'window.{name} || ...' dan HTML "
+                          f"memuat {len(ids)} elemen id=\"{name}\", salah satunya "
+                          "dengan atribut name/href penimpa (DOM clobbering)."),
+                risk="Penyerang mengontrol elemen penimpa untuk menimpa variabel global dan memicu XSS.",
+                recommendation="Jangan mengandalkan global DOM; gunakan akses eksplisit dan verifikasi tipe.",
+                verification="deterministic_dom_clobbering_xss",
+            ))
+            clobbered = True
+            break
+
+    # ── Lab 07: clobbering atribut 'attributes' untuk bypass filter HTML ──
+    if (re.search(r"(?:id|name)\s*=\s*[\"']?attributes[\"']?", html, re.I)
+            and re.search(r"\.attributes\b", js)
+            and re.search(r"\.attributes[^\n]{0,80}length|length[^\n]{0,80}\.attributes", js)):
         out.append(make_finding(
-            ctx, "dom", {"dom", "dom_clobbering", "dom_sink", "attribute_context"},
-            type_="Indikasi DOM clobbering (elemen id/name dapat menimpa variabel global)",
-            severity="low",
-            evidence="Halaman memakai akses DOM berdasarkan id/name sementara HTML mengizinkan elemen penimpa.",
-            risk="Penyerang dapat menimpa variabel global untuk melewati filter atau mengubah alur.",
-            recommendation="Gunakan akses eksplisit (querySelector + verifikasi tipe) dan hindari mengandalkan global DOM.",
-            verification="deterministic_dom_clobbering_hint",
-            confidence="candidate",
+            ctx, "dom", {"dom", "dom_clobbering", "attribute_context"},
+            type_="DOM clobbering atribut untuk bypass filter HTML",
+            severity="medium",
+            evidence="HTML memuat elemen id/name \"attributes\" dan JS mengiterasi "
+                     "koleksi .attributes dengan .length (filter dapat di-bypass "
+                     "melalui clobbering).",
+            risk="Penyerang dapat melewati filter atribut HTML dan menyuntik handler event.",
+            recommendation="Verifikasi bahwa objek .attributes adalah milik elemen asli; gunakan sanitizer yang tahan clobbering.",
+            verification="deterministic_dom_clobbering_attributes",
         ))
+        clobbered = True
+
+    # Fallback heuristik lama (candidate) bila pola ketat di atas tidak cocok.
+    if not clobbered:
+        if re.search(r"(id\s*=\s*['\"][^'\"]+['\"][^>]*name\s*=|document\.getElementById\([^)]*\)\.(src|href))", html, re.I) \
+                and re.search(r"document\.(forms|getElementById)", js, re.I):
+            out.append(make_finding(
+                ctx, "dom", {"dom", "dom_clobbering", "dom_sink", "attribute_context"},
+                type_="Indikasi DOM clobbering (elemen id/name dapat menimpa variabel global)",
+                severity="low",
+                evidence="Halaman memakai akses DOM berdasarkan id/name sementara HTML mengizinkan elemen penimpa.",
+                risk="Penyerang dapat menimpa variabel global untuk melewati filter atau mengubah alur.",
+                recommendation="Gunakan akses eksplisit (querySelector + verifikasi tipe) dan hindari mengandalkan global DOM.",
+                verification="deterministic_dom_clobbering_hint",
+                confidence="candidate",
+            ))
     return out
 
 
@@ -5623,6 +5695,8 @@ PROVABLE_TAGS: frozenset = frozenset({
     "csrf_nonsession_cookie", "csrf_cookie_dup", "samesite_lax_override",
     "samesite_strict_redirect", "samesite_strict_sibling",
     "referer", "referer_presence", "referer_broken",
+    "frame_buster", "multistep", "cj_token_protected", "cj_prefilled",
+    "cj_dom_xss",
     "java_gadget", "php_object", "ruby_gadget", "serialized_object", "dom_clobbering",
     "open_redirect", "cookie_manipulation", "content_type_bypass", "webshell",
     "graphql_endpoint", "backup_file", "debug_exposure", "jwt_weak_key",
@@ -7785,9 +7859,23 @@ def _csrf_is_token_field(name: str) -> bool:
             or low in ("_token", "nonce", "__requestverificationtoken"))
 
 
+def _csrf_visible_text(resp) -> str:
+    """Teks terlihat respons: tanpa <script>/<style>/tag dan tanpa nilai
+    input (termasuk hidden). Ini mencegah kata 'csrf' pada
+    <input type=hidden name=csrf> terdeteksi sebagai pesan error."""
+    try:
+        from bs4 import BeautifulSoup as _BS
+        soup = _BS(_dx_text(resp), "html.parser")
+        for el in soup(["script", "style", "input", "textarea", "select", "button"]):
+            el.decompose()
+        return re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+    except Exception:
+        return _sqli_plain(resp)
+
+
 def _csrf_success(resp, baseline_plain: str = "") -> bool:
-    """Sukses = status sukses, bukan redirect login, tanpa kata error, dan ada
-    penanda sukses ATAU teks respons mirip baseline sukses."""
+    """Sukses = status sukses, bukan redirect login, tanpa kata error pada
+    teks terlihat, dan ada penanda sukses ATAU teks terlihat mirip baseline."""
     if resp is None:
         return False
     if resp.status_code not in (200, 201, 202, 302, 303):
@@ -7795,17 +7883,55 @@ def _csrf_success(resp, baseline_plain: str = "") -> bool:
     loc = str(resp.headers.get("Location", "") or "")
     if "login" in loc.lower():
         return False
-    text = _dx_text(resp)
+    text = _csrf_visible_text(resp)
     if _CSRF_ERROR_RE.search(text):
         return False
     if _CSRF_SUCCESS_RE.search(text):
         return True
     if baseline_plain:
         import difflib
-        plain = _sqli_plain(resp)
-        if plain and difflib.SequenceMatcher(None, plain, baseline_plain).ratio() >= 0.85:
+        if text and difflib.SequenceMatcher(None, text, baseline_plain).ratio() >= 0.90:
             return True
     return False
+
+
+def _csrf_display_snapshot(session, display_urls, action_path, field_names):
+    """(nilai field form, teks mentah) halaman tampilan pertama yang 200.
+    Teks dipakai sebagai bukti perubahan state via canary acak."""
+    for u in display_urls:
+        try:
+            resp = session.get(u, timeout=ACTIVE_TIMEOUT, allow_redirects=True)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        raw = resp.text or ""
+        try:
+            from bs4 import BeautifulSoup as _BS
+            soup = _BS(raw, "html.parser")
+        except Exception:
+            return None, raw
+        for form in soup.find_all("form"):
+            f_action = urljoin(u, form.get("action") or u)
+            if (urlparse(f_action).path or "/") != action_path:
+                continue
+            values = {}
+            for el in form.find_all(["input", "textarea"]):
+                name = el.get("name") or ""
+                if name in field_names:
+                    values[name] = (el.get("value") or "") if el.name == "input" else (el.get_text() or "")
+            if values:
+                return values, raw
+        return None, raw
+    return None, None
+
+
+def _csrf_display_values(session, display_urls, action_path, field_names):
+    """Nilai terkini field form pada halaman tampilan (mis. /my-account).
+    Return dict {nama: nilai} atau None bila form tidak ditemukan."""
+    vals, _raw = _csrf_display_snapshot(session, display_urls, action_path, field_names)
+    return vals
+    return None
 
 
 def _csrf_samesite(ctx, session) -> str:
@@ -7868,12 +7994,12 @@ def a_csrf_deep(ctx):
                            "pada cookie sesi.",
             verification=verification))
 
-    def post(action, data, headers=None, follow=False):
+    def post(action, data, headers=None):
         if _scan_deadline_exceeded():
             return None
         try:
             resp = session.post(action, data=data, timeout=ACTIVE_TIMEOUT,
-                                allow_redirects=follow, headers=headers or {})
+                                allow_redirects=True, headers=headers or {})
             ctx.http_log.append({"method": "POST", "url": action,
                                  "status": resp.status_code,
                                  "len": len(resp.content), "phase": "deep_csrf"})
@@ -7913,6 +8039,7 @@ def a_csrf_deep(ctx):
                for i in (form.get("inputs") or [])):
             continue
         fields = {}
+        field_types = {}
         for i in (form.get("inputs") or []):
             name = str(i.get("name") or "").strip()
             typ = str(i.get("type") or "").lower()
@@ -7920,40 +8047,105 @@ def a_csrf_deep(ctx):
                                    "reset", "checkbox", "radio"):
                 continue
             fields[name] = str(i.get("value") or "")
+            field_types[name] = typ
         if not fields:
             continue
         token_names = [n for n in fields if _csrf_is_token_field(n)]
         has_token = bool(token_names)
         label = urlparse(action).path or "/"
+        action_path = urlparse(action).path or "/"
 
-        # ── Baseline: POST valid sama-origin HARUS berhasil ──
+        # Field yang nilainya dapat dibuktikan perubahannya pada halaman
+        # tampilan (mis. email pada /my-account): varian memakai canary acak
+        # sehingga keberhasilan dibuktikan oleh PERUBAHAN STATE, bukan
+        # kemiripan teks respons (anti false-positive).
+        mutable_names = [n for n in fields
+                         if n not in token_names
+                         and field_types.get(n, "") in ("", "text", "email",
+                                                         "search", "url", "tel",
+                                                         "number", "textarea")]
+        canary_field = mutable_names[0] if mutable_names else None
+        canary_is_email = bool(canary_field) and (
+            "email" in canary_field.lower()
+            or field_types.get(canary_field) == "email")
+        display_urls = list(dict.fromkeys([ctx.url, action]))
+
+        # Segarkan nilai field (khususnya token CSRF per-sesi) dari halaman
+        # live pada SESI ini: token pada konteks berasal dari sesi discovery
+        # yang berbeda sehingga baseline akan ditolak bila dipakai apa adanya.
+        live = _csrf_display_values(session, display_urls, action_path, set(fields))
+        if live:
+            for k in list(fields):
+                if k in live and live[k]:
+                    fields[k] = live[k]
+
+        def canary_value():
+            return (f"satria-csrf-{os.urandom(3).hex()}@example.com"
+                    if canary_is_email else f"satria-csrf-{os.urandom(3).hex()}")
+
+        def with_canary(base):
+            vf = dict(base)
+            if canary_field:
+                vf[canary_field] = canary_value()
+            return vf
+
+        def display_before():
+            if not canary_field:
+                return None, None
+            return _csrf_display_snapshot(session, display_urls, action_path,
+                                          [canary_field])
+
+        def succeeded(resp, variant_fields=None, before=None, before_text=None):
+            if resp is None:
+                return False
+            text = _csrf_visible_text(resp)
+            if _CSRF_ERROR_RE.search(text):
+                return False
+            if variant_fields and canary_field:
+                canary = variant_fields.get(canary_field) or ""
+                before_vals, _bt = (before if isinstance(before, tuple) else (before, before_text))
+                # Tier 1: canary acak (tidak mungkin muncul kebetulan) kini
+                # tampil pada halaman tampilan -- perubahan state terbukti.
+                _after_vals, after_text = _csrf_display_snapshot(
+                    session, display_urls, action_path, [canary_field])
+                if canary and before_text is not None and after_text is not None:
+                    if canary in after_text and canary not in (before_text or ""):
+                        return True
+                # Tier 2: nilai field tampilan berubah menjadi nilai varian.
+                if before_vals is not None and _after_vals is not None:
+                    if (_after_vals.get(canary_field) == canary
+                            and before_vals.get(canary_field) != canary):
+                        return True
+            return _csrf_success(resp, baseline_plain)
+
+        def probe(send, base_fields):
+            vf = with_canary(base_fields)
+            before, before_text = display_before()
+            resp = send(vf)
+            return succeeded(resp, vf, before, before_text)
+
+        # ── Baseline: POST valid same-origin HARUS berhasil ──
         baseline = post(action, dict(fields), headers=same_ref)
-        baseline_plain = _sqli_plain(baseline) if baseline is not None else ""
+        baseline_plain = _csrf_visible_text(baseline) if baseline is not None else ""
         if not _csrf_success(baseline, baseline_plain):
             continue  # sesi belum auth / form tidak state-changing: diam total
 
-        def succeeded(resp):
-            return _csrf_success(resp, baseline_plain)
-
-        # ── Varian: tanpa token, tanpa Referer, Origin asing (cross-site) ──
         bare = {k: v for k, v in fields.items() if k not in token_names}
         # Tanpa header Referer/Origin SAMA SEKALI (lab referer_presence)
-        absent = post(action, dict(fields), headers={})
-        absent_ok = succeeded(absent)
-        no_ref = post(action, dict(bare), headers=evil_ref)
-        no_ref_ok = succeeded(no_ref)
-        wrong_ref = post(action, dict(fields), headers=evil_ref)
-        wrong_ref_ok = succeeded(wrong_ref)
+        absent_ok = probe(lambda vf: post(action, vf, headers={}), fields)
+        no_ref_ok = probe(lambda vf: post(action, vf, headers=evil_ref), bare)
+        wrong_ref_ok = probe(lambda vf: post(action, vf, headers=evil_ref), fields)
         # Referer "jahat tapi memuat hostname target" (pola substring/starts-with)
-        tricky_ref = post(action, dict(fields), headers={
-            "Referer": f"https://evil.invalid/{host}/", "Origin": "https://evil.invalid"})
-        tricky_ok = succeeded(tricky_ref)
+        tricky_ok = probe(lambda vf: post(
+            action, vf, headers={
+                "Referer": f"https://evil.invalid/{host}/",
+                "Origin": "https://evil.invalid"}), fields)
 
         if not has_token and no_ref_ok:
             emit({"no_csrf_defense"},
                  f"CSRF tanpa pertahanan pada form '{label}'",
-                 f"POST lintas-situs (tanpa token, Referer/Origin asing) diterima "
-                 f"seperti kiriman normal (HTTP {no_ref.status_code}).",
+                 "POST lintas-situs (tanpa token, Referer/Origin asing) diterima "
+                 "seperti kiriman normal.",
                  "active_csrf_no_defense")
         # Matriks Referer (hanya bila token tidak menjelaskan hasilnya):
         if absent_ok and not wrong_ref_ok:
@@ -7967,14 +8159,7 @@ def a_csrf_deep(ctx):
         # perilaku NORMAL (token adalah pertahanannya) -- bukan referer_broken.
         # referer_broken hanya terbukti bila Referer asing total DITOLAK tetapi
         # Referer yang memuat hostname target DITERIMA (validasi substring).
-        elif tricky_ok and not wrong_ref_ok and has_token:
-            emit({"referer", "referer_broken"},
-                 f"Validasi Referer rusak (substring host) pada '{label}'",
-                 f"Referer asing total ditolak, tetapi "
-                 f"https://evil.invalid/{host}/ diterima: validasi hanya "
-                 "memeriksa substring hostname target.",
-                 "active_csrf_referer_broken")
-        elif tricky_ok and not wrong_ref_ok and not has_token:
+        elif tricky_ok and not wrong_ref_ok:
             emit({"referer", "referer_broken"},
                  f"Validasi Referer rusak (substring host) pada '{label}'",
                  f"Referer asing total ditolak, tetapi "
@@ -7987,7 +8172,7 @@ def a_csrf_deep(ctx):
             bad = dict(fields)
             for n in token_names:
                 bad[n] = _CSRF_BAD_TOKEN
-            if succeeded(post(action, bad, headers=same_ref)):
+            if probe(lambda vf: post(action, vf, headers=same_ref), bad):
                 emit({"csrf_token_present"},
                      f"Token CSRF hanya diperiksa keberadaannya pada '{label}'",
                      f"POST dengan token bernilai salah ({_CSRF_BAD_TOKEN!r}) "
@@ -7998,7 +8183,7 @@ def a_csrf_deep(ctx):
             if foreign is not None:
                 ft = dict(fields)
                 ft[token_names[0]] = foreign
-                if succeeded(post(action, ft, headers=same_ref)):
+                if probe(lambda vf: post(action, vf, headers=same_ref), ft):
                     emit({"csrf_not_session_tied"},
                          f"Token CSRF tidak terikat sesi pengguna pada '{label}'",
                          "Token yang diperoleh dari sesi/anonim lain diterima "
@@ -8022,7 +8207,7 @@ def a_csrf_deep(ctx):
                 tossed = dict(fields)
                 for n in token_names:
                     tossed[n] = known
-                ok = succeeded(post(action, tossed, headers=same_ref))
+                ok = probe(lambda vf: post(action, vf, headers=same_ref), tossed)
                 try:
                     session.cookies.set(cname, saved,
                                         domain=getattr(c, "domain", "") or "",
@@ -8055,10 +8240,15 @@ def a_csrf_deep(ctx):
                          "active_csrf_token_nonsession_cookie")
                 break
 
+        def get_variant(base_fields):
+            vf = with_canary(base_fields)
+            before, before_text = display_before()
+            sep = "&" if urlparse(action).query else "?"
+            resp = get(action + sep + urlencode(vf, doseq=True))
+            return succeeded(resp, vf, before, before_text)
+
         # ── Validasi token hanya untuk POST: GET tanpa token berhasil ──
-        get_url = action + ("&" if urlparse(action).query else "?") + \
-            urlencode(bare, doseq=True)
-        method_ok = succeeded(get(get_url))
+        method_ok = get_variant(bare)
         if method_ok:
             emit({"csrf_method"},
                  f"Validasi CSRF hanya untuk method POST pada '{label}'",
@@ -8070,9 +8260,7 @@ def a_csrf_deep(ctx):
         if samesite == "lax":
             ov = dict(bare)
             ov["_method"] = "POST"
-            ov_url = action + ("&" if urlparse(action).query else "?") + \
-                urlencode(ov, doseq=True)
-            if succeeded(get(ov_url)):
+            if get_variant(ov):
                 emit({"samesite_lax_override"},
                      f"SameSite=Lax ditembus via method override pada '{label}'",
                      "GET top-level (cookie Lax tetap terkirim) dengan "
@@ -8109,10 +8297,8 @@ def a_csrf_deep(ctx):
                                             "path", "target")]
             if redir_names:
                 inner = urlparse(action).path or "/"
-                inner_q = urlencode(bare, doseq=True)
+                inner_q = urlencode(with_canary(bare), doseq=True)
                 target_path = inner + ("?" + inner_q if inner_q else "")
-                chain = ctx.base + "/?".replace("/", "/", 1)
-                done_chain = False
                 for rn in redir_names[:2]:
                     redir_url = _with_param(ctx.url, rn, target_path)
                     resp = get(redir_url, follow=True)
@@ -8125,40 +8311,223 @@ def a_csrf_deep(ctx):
                              "diterima (cookie Strict terkirim pada rantai "
                              "redirect same-site).",
                              "active_csrf_samesite_strict_redirect")
-                        done_chain = True
                         break
-                _ = (chain, done_chain)
+
+        # Kembalikan state ke nilai semula (best-effort).
+        try:
+            post(action, dict(fields), headers=same_ref)
+        except Exception:
+            pass
     return out
 
 
 # ── Clickjacking ────────────────────────────────────────────────────────────
+# Lima lab clickjacking dibuktikan SATU-PER-SATU dengan bukti berbeda:
+#   01 cj_token_protected : halaman dapat di-frame + form state-changing
+#           ber-token CSRF (token adalah satu-satunya pertahanan).
+#   02 cj_prefilled       : nilai input form diisi dari parameter URL
+#           (dibuktikan canary acak muncul sebagai value input tsb).
+#   03 frame_buster       : skrip anti-framing (top/parent vs self).
+#   04 cj_dom_xss         : halaman dapat di-frame + sink DOM XSS yang
+#           membaca parameter URL (sink & sumber terhubung parameter form).
+#   05 multistep          : aksi sensitif dua langkah (langkah 1 memunculkan
+#           form konfirmasi baru yang dibuktikan secara aktif).
 @active("clickjacking")
 def a_clickjack_deep(ctx):
-    headers = ctx.headers or {}
-    xfo = str(headers.get("x-frame-options", "")).lower()
-    csp = str(headers.get("content-security-policy", "")).lower()
-    if xfo or "frame-ancestors" in csp:
-        return []
+    out: list[dict] = []
     if ctx.status in (401, 403, 429) or ctx.status >= 500:
-        return []
-    tags = {"clickjacking"}
-    js = ctx.js_text or ""
-    if re.search(r"(top\s*!==?\s*self|top\s*!=\s*self|self\s*!==?\s*top|frameElement)", js, re.I):
-        tags.add("frame_buster")
-    if len([f for f in ctx.forms or []]) > 1:
-        tags.add("multistep")
-    if any("dom_sink" in (f.get("tags") or []) for f in []):
+        return out
+    # Prasyarat bersama: halaman benar-benar dapat di-frame.
+    xfo = ctx.header("x-frame-options")
+    csp = ctx.header("content-security-policy").lower()
+    if xfo or "frame-ancestors" in csp:
+        return out
+    framable_evidence = (f"Halaman dapat di-frame: tidak ada X-Frame-Options "
+                         f"dan tidak ada CSP frame-ancestors pada {ctx.url} "
+                         f"(HTTP {ctx.status}).")
+
+    def emit(tags, title, evidence, verification):
+        out.append(make_finding(
+            ctx, "clickjacking", tags,
+            type_=title, severity="medium", evidence=evidence,
+            risk="Penyerang dapat menempatkan halaman dalam iframe transparan "
+                 "dan menipu klik pengguna untuk memicu aksi sensitif.",
+            recommendation="Set X-Frame-Options: DENY/SAMEORIGIN atau CSP "
+                           "frame-ancestors 'self'.",
+            verification=verification))
+
+    forms = ctx.forms or []
+    js_all = (ctx.js_text or "") + "\n" + (ctx.html or "")
+
+    # ── Lab 01: basic clickjacking dengan proteksi token CSRF ──
+    for form in forms:
+        if str(form.get("method") or "").lower() != "post":
+            continue
+        names = [str(i.get("name") or "") for i in (form.get("inputs") or [])]
+        if not any(_csrf_is_token_field(n) for n in names):
+            continue
+        action = str(form.get("action") or ctx.url)
+        emit({"clickjacking", "cj_token_protected"},
+             "Basic clickjacking: satu-satunya pertahanan adalah token CSRF",
+             framable_evidence + f" Form state-changing ke '{action}' dilindungi "
+             "token CSRF; klik korban mengirim form asli beserta token valid "
+             "sehingga token tidak dapat mencegah clickjacking.",
+             "active_clickjacking_token_protected")
+        break
+
+    # ── Lab 03: frame buster script ──
+    if re.search(r"(?:\btop\s*!==?\s*self\b|\bself\s*!==?\s*top\b|"
+                 r"\bparent\s*!==?\s*self\b|\btop\s*!==?\s*parent\b|"
+                 r"(?:top|parent|window\.top|window\.parent)\s*\.\s*location\s*"
+                 r"(?:!|===?|!==)\s*(?:self|window\.self)\s*\.\s*location|"
+                 r"\bframeElement\b|"
+                 r"(?:top|parent)\s*\.\s*location\s*=\s*(?:self|window\.self)\s*\.\s*location)",
+                 js_all, re.I):
+        emit({"clickjacking", "frame_buster"},
+             "Clickjacking dengan skrip frame-buster",
+             framable_evidence + " Skrip frame-buster (perbandingan "
+             "top/parent dengan self atau penetapan top.location) terdeteksi; "
+             "buster dapat dinetralkan penyerang (mis. atribut sandbox) "
+             "sehingga halaman tetap dapat di-frame.",
+             "active_clickjacking_frame_buster")
+
+    # ── Lab 04: clickjacking untuk memicu DOM-based XSS ──
+    sink_re = re.compile(
+        r"(innerHTML|outerHTML|document\.write|document\.writeln|"
+        r"insertAdjacentHTML|\.html\s*\(|eval\s*\(|setTimeout\s*\(\s*['\"]|"
+        r"\$\s*\([^)]*\)\s*\.\s*html)", re.I)
+    source_re = re.compile(
+        r"(location\.(?:search|hash|href)|document\.(?:URL|location|referrer)|"
+        r"URLSearchParams|window\.name|document\.location)", re.I)
+    if sink_re.search(js_all) and source_re.search(js_all):
+        # Sumber harus terhubung ke parameter yang nyata pada halaman ini
+        # (parameter form atau parameter URL konteks) agar bukan FP umum.
+        form_names = {str(i.get("name") or "").strip().lower()
+                      for f in forms for i in (f.get("inputs") or [])}
+        ctx_params = {str(k).lower() for k in (ctx.params or {})}
+        param_hints = set()
+        for m in re.finditer(r"(?:get|getParam|param)\s*\(\s*['\"]([A-Za-z0-9_-]+)['\"]", js_all):
+            param_hints.add(m.group(1).lower())
+        for m in re.finditer(r"location\.search[^;]{0,60}?['\"]([A-Za-z0-9_-]+)['\"]", js_all):
+            param_hints.add(m.group(1).lower())
+        linked = (param_hints & (form_names | ctx_params)) or (form_names & ctx_params)
+        if linked:
+            emit({"clickjacking", "cj_dom_xss"},
+                 "Clickjacking untuk memicu DOM-based XSS",
+                 framable_evidence + " JavaScript halaman memuat sink DOM XSS "
+                 "(innerHTML/document.write/dll.) yang membaca sumber "
+                 "location.search/hash; parameter terkait: "
+                 + ", ".join(sorted(linked)) + ". Halaman yang di-frame "
+                 "dengan URL berpayload dapat memicu XSS saat korban mengklik.",
+                 "active_clickjacking_dom_xss")
+
+    # ── Lab 02 & 05: butuh sesi aktif ──
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA})
+    try:
+        session.get(ctx.url, timeout=ACTIVE_TIMEOUT, allow_redirects=True)
+    except Exception:
         pass
-    return [make_finding(
-        ctx, "clickjacking", tags,
-        type_="Halaman dapat di-frame (clickjacking)",
-        severity="medium",
-        evidence=(f"Tidak ada X-Frame-Options dan tidak ada CSP frame-ancestors pada {ctx.url} "
-                  f"(HTTP {ctx.status}); {len(ctx.forms or [])} form ditemukan"
-                  + ("; skrip frame-buster terdeteksi" if "frame_buster" in tags else "") + "."),
-        risk="Penyerang dapat menempatkan halaman dalam iframe transparan dan menipu klik pengguna.",
-        recommendation="Set X-Frame-Options: DENY/SAMEORIGIN atau CSP frame-ancestors 'self'.",
-        verification="active_clickjacking_frame_headers")]
+
+    # ── Lab 02: input form terisi awal dari parameter URL ──
+    tried = 0
+    for form in forms:
+        if _scan_deadline_exceeded():
+            break
+        for inp in (form.get("inputs") or []):
+            if tried >= 8 or _scan_deadline_exceeded():
+                break
+            name = str(inp.get("name") or "").strip()
+            typ = str(inp.get("type") or "").lower()
+            if not name or _csrf_is_token_field(name):
+                continue
+            if typ not in ("", "text", "email", "search", "url", "tel", "hidden"):
+                continue
+            canary = (f"satria-cj-{os.urandom(3).hex()}@example.com"
+                      if ("email" in name.lower() or typ == "email")
+                      else f"satria-cj-{os.urandom(3).hex()}")
+            try:
+                resp = session.get(_with_param(ctx.url, name, canary),
+                                   timeout=ACTIVE_TIMEOUT, allow_redirects=True)
+            except Exception:
+                continue
+            tried += 1
+            if resp.status_code != 200:
+                continue
+            try:
+                from bs4 import BeautifulSoup as _BS
+                soup = _BS(resp.text or "", "html.parser")
+            except Exception:
+                continue
+            hit = any((el.get("name") or "") == name
+                      and (el.get("value") or "") == canary
+                      for el in soup.find_all("input"))
+            if hit:
+                emit({"clickjacking", "cj_prefilled"},
+                     "Clickjacking: input form terisi awal dari parameter URL",
+                     framable_evidence + f" Parameter URL '{name}' mengisi awal "
+                     f"input form bernama sama (canary {canary} muncul sebagai "
+                     "value input); penyerang dapat mengarahkan korban ke URL "
+                     "berparameter lalu menipu klik submit.",
+                     "active_clickjacking_prefilled_param")
+                break
+        else:
+            continue
+        break
+
+    # ── Lab 05: multistep clickjacking (aksi sensitif dua langkah) ──
+    orig_actions = {(str(f.get("action") or ""), str(f.get("method") or "get").lower())
+                    for f in forms}
+    for form in forms:
+        if _scan_deadline_exceeded():
+            break
+        if str(form.get("method") or "").lower() != "post":
+            continue
+        action = ctx.abs_url(str(form.get("action") or ctx.url))
+        if not _dx_same_origin(ctx, action):
+            continue
+        fields = {}
+        for i in (form.get("inputs") or []):
+            name = str(i.get("name") or "").strip()
+            typ = str(i.get("type") or "").lower()
+            if not name or typ in ("submit", "button", "image", "file", "reset"):
+                continue
+            fields[name] = str(i.get("value") or "")
+        if not fields:
+            continue
+        try:
+            resp = session.post(action, data=fields, timeout=ACTIVE_TIMEOUT,
+                                allow_redirects=True,
+                                headers={"Referer": ctx.url, "Origin": ctx.base})
+        except Exception:
+            continue
+        if resp.status_code not in (200, 201, 302, 303):
+            continue
+        try:
+            from bs4 import BeautifulSoup as _BS
+            soup = _BS(resp.text or "", "html.parser")
+        except Exception:
+            continue
+        new_forms = []
+        for nf in soup.find_all("form"):
+            key = (str(nf.get("action") or ""), str(nf.get("method") or "get").lower())
+            if key not in orig_actions and key[0]:
+                new_forms.append(key)
+        if not new_forms:
+            continue
+        confirm_re = re.search(r"\b(yes|confirm|lanjut|teruskan|hapus|delete|ya)\b",
+                               _csrf_visible_text(resp), re.I)
+        if confirm_re:
+            emit({"clickjacking", "multistep"},
+                 "Multistep clickjacking: aksi sensitif memerlukan langkah konfirmasi",
+                 framable_evidence + f" Mengirim langkah pertama ke '{action}' "
+                 "memunculkan form konfirmasi baru "
+                 f"({', '.join(a for a, _ in new_forms[:2])}) dengan kata "
+                 f"konfirmasi '{confirm_re.group(1)}'; dua klik yang ditipu "
+                 "dapat menyelesaikan penghapusan/aksi sensitif.",
+                 "active_clickjacking_multistep")
+            break
+    return out
 
 
 # ── Cache poisoning / deception ─────────────────────────────────────────────
