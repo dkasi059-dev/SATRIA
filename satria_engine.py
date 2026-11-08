@@ -1726,6 +1726,18 @@ _LAB_TAG_SET_OVERRIDES: dict[str, frozenset] = {
     "xss-21": frozenset({"xss", "reflected", "javascript_context", "template_literal"}),
     # XSS — mencuri cookie vs menangkap password dibedakan (dulu satu tag).
     "xss-23": frozenset({"xss", "password_capture"}),
+    # CSRF — 11 varian dibedakan satu-per-satu agar tidak saling diklaim.
+    "csrf-01": frozenset({"csrf", "no_csrf_defense"}),
+    "csrf-02": frozenset({"csrf", "csrf_method"}),
+    "csrf-03": frozenset({"csrf", "csrf_token_present"}),
+    "csrf-04": frozenset({"csrf", "csrf_not_session_tied"}),
+    "csrf-05": frozenset({"csrf", "csrf_nonsession_cookie"}),
+    "csrf-06": frozenset({"csrf", "csrf_cookie_dup"}),
+    "csrf-07": frozenset({"csrf", "samesite_lax_override"}),
+    "csrf-08": frozenset({"csrf", "samesite_strict_redirect"}),
+    "csrf-09": frozenset({"csrf", "samesite_strict_sibling"}),
+    "csrf-10": frozenset({"csrf", "referer", "referer_presence"}),
+    "csrf-11": frozenset({"csrf", "referer", "referer_broken"}),
 }
 
 
@@ -2512,6 +2524,7 @@ def p_csrf_forms(ctx):
             risk="Form dapat dikirim dari origin lain saat korban terautentikasi.",
             recommendation="Tambahkan token CSRF per-sesi yang divalidasi server-side dan set SameSite=Lax.",
             verification="deterministic_csrf_form_analysis",
+            confidence="candidate",
         ))
     return out
 
@@ -3631,6 +3644,13 @@ def _sqli_send(sess, ctx, point, value):
         return _sqli_http(sess, ctx, point["method"], point["url"], data=data)
     if point["kind"] == "cookie":
         cookies = dict(sess.cookies)
+        if not str(point.get("value") or "").strip():
+            try:
+                _orig = sess.cookies.get(point["name"])
+            except Exception:
+                _orig = None
+            if _orig:
+                point["value"] = _orig
         cookies[point["name"]] = value
         return _sqli_http(sess, ctx, "GET", point["url"], cookies=cookies)
     return None
@@ -3797,6 +3817,11 @@ def _sqli_bool_text_ok(base, resp_true, resp_false) -> bool:
 
 
 def _sqli_boolean_phase(sess, ctx, point, base, out):
+    # Tanpa nilai asli, baseline/TRUE/FALSE tidak sebanding (keduanya "tidak
+    # ada baris") sehingga diferensial tidak bermakna. Lewati agar tidak ada
+    # false positive maupun buang kuota request.
+    if point.get("kind") == "cookie" and not str(point.get("value") or "").strip():
+        return
     for true_payload, false_payload in SQLI_BOOLEAN_PAIRS:
         hits = 0
         len_true = len_false = 0
@@ -4748,6 +4773,18 @@ def a_sqli_deep(ctx):
         pass
 
     points = _sqli_points(ctx)
+    # http_result hanya menyimpan nama+flag cookie, TANPA nilai. Cookie
+    # TrackingId karena itu tadinya diganti "1" sehingga query tidak pernah
+    # mengembalikan baris dan blind conditional tidak pernah terdeteksi.
+    # Ambil nilai asli dari jar sesi yang baru saja di-prime (GET halaman).
+    for _pt in points:
+        if _pt.get("kind") == "cookie" and not str(_pt.get("value") or "").strip():
+            try:
+                _orig = session.cookies.get(_pt["name"])
+            except Exception:
+                _orig = None
+            if _orig:
+                _pt["value"] = _orig
     # Sisakan kuota untuk OOB (dilepas tepat sebelum fase OOB).
     _SQLI_PHASE_RESERVE["n"] = 16
     time_done = _sqli_budget_key(ctx) in _SQLI_TIME_HOSTS or bool(
@@ -5582,6 +5619,10 @@ PROVABLE_TAGS: frozenset = frozenset({
     "conditional_errors", "xml_encoded", "information_schema", "all_tables",
     "oob", "oob_exfil",
     "unkeyed_header", "null_origin", "protocol_confusion", "no_csrf_defense",
+    "csrf_method", "csrf_token_present", "csrf_not_session_tied",
+    "csrf_nonsession_cookie", "csrf_cookie_dup", "samesite_lax_override",
+    "samesite_strict_redirect", "samesite_strict_sibling",
+    "referer", "referer_presence", "referer_broken",
     "java_gadget", "php_object", "ruby_gadget", "serialized_object", "dom_clobbering",
     "open_redirect", "cookie_manipulation", "content_type_bypass", "webshell",
     "graphql_endpoint", "backup_file", "debug_exposure", "jwt_weak_key",
@@ -5761,6 +5802,34 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
 
     root = urlparse(root_ctx.url)
     origin = (root.scheme.lower(), root.netloc.lower())
+    # Sesi persisten: tanpa ini, setiap GET discovery kehilangan cookie sesi
+    # sehingga halaman akun (target utama lab CSRF) selalu redirect ke login
+    # dan tidak pernah masuk ke konteks pemindaian.
+    _disc_session = requests.Session()
+    _disc_session.headers.update({"User-Agent": UA})
+    try:
+        _disc_session.get(root_ctx.url, timeout=min(ACTIVE_TIMEOUT, 8),
+                          allow_redirects=False)
+    except Exception:
+        pass
+    _root_cookie_flags = {str(c.get("name")): c for c in (root_ctx.cookies or [])
+                          if isinstance(c, dict) and c.get("name")}
+
+    def _jar_cookies() -> list[dict]:
+        out = []
+        try:
+            items = list(_disc_session.cookies)
+        except Exception:
+            items = []
+        for c in items:
+            flags = _root_cookie_flags.get(c.name, {}) or {}
+            out.append({"name": c.name, "value": getattr(c, "value", "") or "",
+                        "secure": bool(getattr(c, "secure", False) or flags.get("secure")),
+                        "httponly": bool(getattr(c, "httpOnly", False) or flags.get("httponly")),
+                        "samesite": str(flags.get("samesite") or ""),
+                        "domain": getattr(c, "domain", "") or ""})
+        return out
+
     queue = deque([root_ctx.url])
     seen: set[str] = set()
     # Titik masuk umum diuji SETELAH tautan nyata halaman agar tidak menghabiskan
@@ -5821,9 +5890,10 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
             page_html = root_ctx.html or ""
         else:
             try:
-                response = requests.get(
+                if _scan_deadline_exceeded():
+                    break
+                response = _disc_session.get(
                     current, timeout=min(ACTIVE_TIMEOUT, 8), allow_redirects=False,
-                    headers={"User-Agent": UA},
                 )
                 root_ctx.http_log.append({"method": "GET", "url": current,
                                           "status": response.status_code,
@@ -5840,7 +5910,7 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
                 page_ctx = build_target_context(
                     current, page_html,
                     {"status_code": response.status_code,
-                     "headers": dict(response.headers), "cookies": []},
+                     "headers": dict(response.headers), "cookies": _jar_cookies()},
                     authorized=root_ctx.authorized,
                 )
             except Exception as exc:
@@ -5896,8 +5966,8 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
                     continue
                 scripts_seen.add(script_url)
                 try:
-                    sr = requests.get(script_url, timeout=min(ACTIVE_TIMEOUT, 8),
-                                      allow_redirects=False, headers={"User-Agent": UA})
+                    sr = _disc_session.get(script_url, timeout=min(ACTIVE_TIMEOUT, 8),
+                                           allow_redirects=False)
                     root_ctx.http_log.append({"method": "GET", "url": script_url,
                                               "status": sr.status_code,
                                               "len": len(sr.content), "phase": "script_discovery"})
@@ -5914,6 +5984,11 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
             else:
                 parse_js_for_endpoints(script.string or script.get_text(" ", strip=False), current)
 
+    if not any(str(c.get("value") or "") for c in (root_ctx.cookies or [])
+               if isinstance(c, dict)):
+        _jar = _jar_cookies()
+        if _jar:
+            root_ctx.cookies = _jar
     root_ctx.http_log.append({"phase": "discovery_summary", "pages": len(contexts),
                               "scripts": len(scripts_seen), "queued_pages_limit": max_pages})
     return contexts
@@ -7689,56 +7764,370 @@ def a_upload_deep(ctx):
     return []
 
 # ── CSRF ────────────────────────────────────────────────────────────────────
+# Strategi: untuk SETIAP form POST state-changing, pertama buktikan baseline
+# (POST valid + Referer/Origin same-origin) BERHASIL. Bila baseline gagal,
+# form dilewati total -- tidak ada temuan, tidak ada false positive. Setiap
+# varian serangan lalu diuji terpisah dan menerima tag pembeda sendiri
+# (csrf-01..csrf-11), sehingga satu respons tidak diklaim sebagai banyak lab.
+_CSRF_ERROR_RE = re.compile(
+    r"(invalid|forbidden|denied|csrf|xsrf|bad request|not allowed|"
+    r"access denied|request forgery|referer|origin)", re.I)
+_CSRF_SUCCESS_RE = re.compile(
+    r"(has been (updated|changed|saved|confirmed)|successfully|"
+    r"\bsuccess\b|\bupdated\b|\bsaved\b|\bchanged\b)", re.I)
+_CSRF_SESSION_NAMES = ("session", "sessionid", "sid", "auth", "login", "user")
+_CSRF_BAD_TOKEN = "satria-invalid-token-0000"
+
+
+def _csrf_is_token_field(name: str) -> bool:
+    low = (name or "").lower()
+    return ("csrf" in low or "xsrf" in low or "authenticity_token" in low
+            or low in ("_token", "nonce", "__requestverificationtoken"))
+
+
+def _csrf_success(resp, baseline_plain: str = "") -> bool:
+    """Sukses = status sukses, bukan redirect login, tanpa kata error, dan ada
+    penanda sukses ATAU teks respons mirip baseline sukses."""
+    if resp is None:
+        return False
+    if resp.status_code not in (200, 201, 202, 302, 303):
+        return False
+    loc = str(resp.headers.get("Location", "") or "")
+    if "login" in loc.lower():
+        return False
+    text = _dx_text(resp)
+    if _CSRF_ERROR_RE.search(text):
+        return False
+    if _CSRF_SUCCESS_RE.search(text):
+        return True
+    if baseline_plain:
+        import difflib
+        plain = _sqli_plain(resp)
+        if plain and difflib.SequenceMatcher(None, plain, baseline_plain).ratio() >= 0.85:
+            return True
+    return False
+
+
+def _csrf_samesite(ctx, session) -> str:
+    for c in (ctx.cookies or []):
+        if isinstance(c, dict) and (c.get("samesite") or "").lower() in ("lax", "strict"):
+            if any(k in str(c.get("name") or "").lower() for k in _CSRF_SESSION_NAMES):
+                return str(c["samesite"]).lower()
+    try:
+        for c in session.cookies:
+            for attr in ("SameSite", "samesite"):
+                val = c.get_nonstandard_attr(attr) if hasattr(c, "get_nonstandard_attr") else None
+                if val and str(val).lower() in ("lax", "strict"):
+                    if any(k in (c.name or "").lower() for k in _CSRF_SESSION_NAMES):
+                        return str(val).lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _csrf_foreign_token(ctx, session, action: str, token_name: str):
+    """Token dari sesi lain (anonim). Return None bila tidak dapat diambil."""
+    try:
+        other = requests.Session()
+        other.headers.update({"User-Agent": UA})
+        other.get(action, timeout=ACTIVE_TIMEOUT, allow_redirects=True)
+        resp = other.get(action, timeout=ACTIVE_TIMEOUT, allow_redirects=True)
+        body = resp.text or ""
+        m = re.search(r'name=["\']?' + re.escape(token_name) +
+                      r'["\']?[^>]*value=["\']([^"\']+)', body, re.I)
+        if not m:
+            m = re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']?' +
+                          re.escape(token_name), body, re.I)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
 @active("csrf")
 def a_csrf_deep(ctx):
     out: list[dict] = []
     session = requests.Session()
     session.headers.update({"User-Agent": UA})
-    for form in (ctx.forms or [])[:4]:
+    # Prime: dapatkan cookie sesi (lab PortSwigger sudah terautentikasi via
+    # cookie yang ditetapkan server pada respons pertama).
+    try:
+        session.get(ctx.url, timeout=ACTIVE_TIMEOUT, allow_redirects=True)
+    except Exception:
+        pass
+    samesite = _csrf_samesite(ctx, session)
+    host = (urlparse(ctx.url).hostname or "").lower()
+
+    def emit(tags, title, evidence, verification, severity="high"):
+        out.append(make_finding(
+            ctx, "csrf", set(tags) | {"csrf"}, type_=title, severity=severity,
+            evidence=evidence,
+            risk="Aksi state-changing dapat dipicu lintas situs atas nama korban "
+                 "yang sedang login.",
+            recommendation="Gunakan token CSRF anti-forgery yang terikat sesi, "
+                           "divalidasi untuk semua method, dan SameSite=Lax/Strict "
+                           "pada cookie sesi.",
+            verification=verification))
+
+    def post(action, data, headers=None, follow=False):
+        if _scan_deadline_exceeded():
+            return None
+        try:
+            resp = session.post(action, data=data, timeout=ACTIVE_TIMEOUT,
+                                allow_redirects=follow, headers=headers or {})
+            ctx.http_log.append({"method": "POST", "url": action,
+                                 "status": resp.status_code,
+                                 "len": len(resp.content), "phase": "deep_csrf"})
+            return resp
+        except Exception:
+            return None
+
+    def get(action, follow=True, headers=None):
+        if _scan_deadline_exceeded():
+            return None
+        try:
+            resp = session.get(action, timeout=ACTIVE_TIMEOUT,
+                               allow_redirects=follow, headers=headers or {})
+            ctx.http_log.append({"method": "GET", "url": action,
+                                 "status": resp.status_code,
+                                 "len": len(resp.content), "phase": "deep_csrf"})
+            return resp
+        except Exception:
+            return None
+
+    same_ref = {"Referer": ctx.url, "Origin": ctx.base}
+    evil_ref = {"Referer": "https://evil.invalid/attack", "Origin": "https://evil.invalid"}
+
+    for form in (ctx.forms or [])[:3]:
+        if _scan_deadline_exceeded():
+            break
         if str(form.get("method") or "").lower() != "post":
             continue
         action = ctx.abs_url(str(form.get("action") or ctx.url))
-        if not _dx_same_origin(ctx, action) or BUSINESS_SKIP_RE.search(urlparse(action).path or ""):
+        if not _dx_same_origin(ctx, action):
             continue
-        fields = {str(i.get("name")): str(i.get("value") or "")
-                  for i in (form.get("inputs") or [])
-                  if i.get("name") and str(i.get("type") or "").lower() not in
-                  ("submit", "button", "image", "file", "reset", "checkbox", "radio")}
+        if BUSINESS_SKIP_RE.search(urlparse(action).path or ""):
+            continue
+        # Form login adalah permukaan CSRF-login yang berbeda; lewati agar
+        # tidak mengganggu sesi yang sedang diuji.
+        if any(str(i.get("type") or "").lower() == "password"
+               for i in (form.get("inputs") or [])):
+            continue
+        fields = {}
+        for i in (form.get("inputs") or []):
+            name = str(i.get("name") or "").strip()
+            typ = str(i.get("type") or "").lower()
+            if not name or typ in ("submit", "button", "image", "file",
+                                   "reset", "checkbox", "radio"):
+                continue
+            fields[name] = str(i.get("value") or "")
         if not fields:
             continue
-        has_token = any(tag in name.lower() for name in fields for tag in CSRF_TOKEN_NAMES)
-        try:
-            with_ref = session.post(action, data=fields, timeout=ACTIVE_TIMEOUT,
-                                    allow_redirects=False,
-                                    headers={"Referer": ctx.url, "Origin": ctx.base})
-            ctx.http_log.append({"method": "POST", "url": action, "status": with_ref.status_code,
-                                 "len": len(with_ref.content), "phase": "deep_csrf"})
-            without_ref = session.post(action, data=fields, timeout=ACTIVE_TIMEOUT,
-                                       allow_redirects=False,
-                                       headers={"Origin": ctx.base})
-            ctx.http_log.append({"method": "POST", "url": action,
-                                 "status": without_ref.status_code,
-                                 "len": len(without_ref.content), "phase": "deep_csrf"})
-        except Exception:
-            continue
-        error_words = re.compile(r"(invalid|missing|required|forbidden|denied|referer|token)", re.I)
-        same_ok = (with_ref.status_code == without_ref.status_code
-                   and abs(len(with_ref.content) - len(without_ref.content)) <= 24
-                   and not error_words.search(_dx_text(without_ref)))
-        if same_ok and without_ref.status_code in (200, 201, 202, 302, 303):
-            tags = {"csrf", "referer"}
-            out.append(make_finding(
-                ctx, "csrf", tags,
-                type_=f"Validasi Referer tidak wajib pada form '{urlparse(action).path or '/'}'",
-                severity="medium",
-                evidence=("POST dengan token valid tetapi tanpa header Referer dijawab sama "
-                          f"seperti kiriman normal (HTTP {without_ref.status_code}, "
-                          f"{len(without_ref.content)} byte)."),
-                risk="Form dapat dikirim dari origin mana pun yang menahan header Referer "
-                     "(meta referrer no-referrer, redirect, atau HTTPS→HTTP).",
-                recommendation="Validasi Origin/Referer di server dan gunakan token CSRF per sesi.",
-                verification="active_csrf_referer_absent"))
-        break
+        token_names = [n for n in fields if _csrf_is_token_field(n)]
+        has_token = bool(token_names)
+        label = urlparse(action).path or "/"
+
+        # ── Baseline: POST valid sama-origin HARUS berhasil ──
+        baseline = post(action, dict(fields), headers=same_ref)
+        baseline_plain = _sqli_plain(baseline) if baseline is not None else ""
+        if not _csrf_success(baseline, baseline_plain):
+            continue  # sesi belum auth / form tidak state-changing: diam total
+
+        def succeeded(resp):
+            return _csrf_success(resp, baseline_plain)
+
+        # ── Varian: tanpa token, tanpa Referer, Origin asing (cross-site) ──
+        bare = {k: v for k, v in fields.items() if k not in token_names}
+        # Tanpa header Referer/Origin SAMA SEKALI (lab referer_presence)
+        absent = post(action, dict(fields), headers={})
+        absent_ok = succeeded(absent)
+        no_ref = post(action, dict(bare), headers=evil_ref)
+        no_ref_ok = succeeded(no_ref)
+        wrong_ref = post(action, dict(fields), headers=evil_ref)
+        wrong_ref_ok = succeeded(wrong_ref)
+        # Referer "jahat tapi memuat hostname target" (pola substring/starts-with)
+        tricky_ref = post(action, dict(fields), headers={
+            "Referer": f"https://evil.invalid/{host}/", "Origin": "https://evil.invalid"})
+        tricky_ok = succeeded(tricky_ref)
+
+        if not has_token and no_ref_ok:
+            emit({"no_csrf_defense"},
+                 f"CSRF tanpa pertahanan pada form '{label}'",
+                 f"POST lintas-situs (tanpa token, Referer/Origin asing) diterima "
+                 f"seperti kiriman normal (HTTP {no_ref.status_code}).",
+                 "active_csrf_no_defense")
+        # Matriks Referer (hanya bila token tidak menjelaskan hasilnya):
+        if absent_ok and not wrong_ref_ok:
+            emit({"referer", "referer_presence"},
+                 f"Validasi Referer hanya bila header ada pada '{label}'",
+                 "POST tanpa header Referer berhasil, tetapi POST dengan Referer "
+                 "asing ditolak: penyerang cukup menahan header Referer "
+                 "(meta no-referrer / redirect / HTTPS→HTTP).",
+                 "active_csrf_referer_presence")
+        # POST bertoken-valid yang berhasil tanpa memandang Referer adalah
+        # perilaku NORMAL (token adalah pertahanannya) -- bukan referer_broken.
+        # referer_broken hanya terbukti bila Referer asing total DITOLAK tetapi
+        # Referer yang memuat hostname target DITERIMA (validasi substring).
+        elif tricky_ok and not wrong_ref_ok and has_token:
+            emit({"referer", "referer_broken"},
+                 f"Validasi Referer rusak (substring host) pada '{label}'",
+                 f"Referer asing total ditolak, tetapi "
+                 f"https://evil.invalid/{host}/ diterima: validasi hanya "
+                 "memeriksa substring hostname target.",
+                 "active_csrf_referer_broken")
+        elif tricky_ok and not wrong_ref_ok and not has_token:
+            emit({"referer", "referer_broken"},
+                 f"Validasi Referer rusak (substring host) pada '{label}'",
+                 f"Referer asing total ditolak, tetapi "
+                 f"https://evil.invalid/{host}/ diterima: validasi hanya "
+                 "memeriksa substring hostname target.",
+                 "active_csrf_referer_broken")
+
+        if has_token:
+            # ── Token asal ada (nilai salah pun diterima) ──
+            bad = dict(fields)
+            for n in token_names:
+                bad[n] = _CSRF_BAD_TOKEN
+            if succeeded(post(action, bad, headers=same_ref)):
+                emit({"csrf_token_present"},
+                     f"Token CSRF hanya diperiksa keberadaannya pada '{label}'",
+                     f"POST dengan token bernilai salah ({_CSRF_BAD_TOKEN!r}) "
+                     "diterima; server hanya memeriksa field token terisi.",
+                     "active_csrf_token_presence_only")
+            # ── Token tidak terikat sesi ──
+            foreign = _csrf_foreign_token(ctx, session, action, token_names[0])
+            if foreign is not None:
+                ft = dict(fields)
+                ft[token_names[0]] = foreign
+                if succeeded(post(action, ft, headers=same_ref)):
+                    emit({"csrf_not_session_tied"},
+                         f"Token CSRF tidak terikat sesi pengguna pada '{label}'",
+                         "Token yang diperoleh dari sesi/anonim lain diterima "
+                         "pada sesi korban; token statis atau tidak terikat sesi.",
+                         "active_csrf_token_not_session_tied")
+            # ── Token terikat cookie yang bisa ditulis penyerang (cookie tossing) ──
+            for c in list(session.cookies):
+                cname = (c.name or "").strip()
+                if not cname:
+                    continue
+                if any(k in cname.lower() for k in _CSRF_SESSION_NAMES):
+                    continue  # cookie sesi: bukan permukaan cookie tossing
+                known = "satria-known-value-1"
+                saved = c.value
+                try:
+                    session.cookies.set(cname, known,
+                                        domain=getattr(c, "domain", "") or "",
+                                        path=getattr(c, "path", "/") or "/")
+                except Exception:
+                    continue
+                tossed = dict(fields)
+                for n in token_names:
+                    tossed[n] = known
+                ok = succeeded(post(action, tossed, headers=same_ref))
+                try:
+                    session.cookies.set(cname, saved,
+                                        domain=getattr(c, "domain", "") or "",
+                                        path=getattr(c, "path", "/") or "/")
+                except Exception:
+                    pass
+                if not ok:
+                    continue
+                if "csrf" in cname.lower() or "xsrf" in cname.lower() or "token" in cname.lower():
+                    emit({"csrf_cookie_dup"},
+                         f"Token CSRF diduplikasi pada cookie '{cname}'",
+                         f"Menulis ulang cookie '{cname}' ke nilai yang diketahui "
+                         "penyerang, lalu mengirim nilai yang sama sebagai token, "
+                         "diterima server.",
+                         "active_csrf_cookie_duplicated")
+                elif samesite == "strict":
+                    emit({"samesite_strict_sibling"},
+                         f"SameSite Strict dapat ditembus via cookie subdomain "
+                         f"bersaudara pada '{label}'",
+                         f"Cookie sesi SameSite=Strict, tetapi token terikat pada "
+                         f"cookie non-sesi '{cname}' yang dapat ditulis dari "
+                         "subdomain bersaudara (cookie tossing).",
+                         "active_csrf_samesite_strict_sibling")
+                else:
+                    emit({"csrf_nonsession_cookie"},
+                         f"Token CSRF terikat cookie non-sesi '{cname}'",
+                         f"Token divalidasi terhadap cookie non-sesi '{cname}': "
+                         "menulis cookie itu ke nilai yang diketahui penyerang "
+                         "membuat POST diterima.",
+                         "active_csrf_token_nonsession_cookie")
+                break
+
+        # ── Validasi token hanya untuk POST: GET tanpa token berhasil ──
+        get_url = action + ("&" if urlparse(action).query else "?") + \
+            urlencode(bare, doseq=True)
+        method_ok = succeeded(get(get_url))
+        if method_ok:
+            emit({"csrf_method"},
+                 f"Validasi CSRF hanya untuk method POST pada '{label}'",
+                 "GET tanpa token ke endpoint state-changing diterima; "
+                 "pemeriksaan token dilewati untuk method GET.",
+                 "active_csrf_method_bypass")
+
+        # ── SameSite=Lax + method override pada GET ──
+        if samesite == "lax":
+            ov = dict(bare)
+            ov["_method"] = "POST"
+            ov_url = action + ("&" if urlparse(action).query else "?") + \
+                urlencode(ov, doseq=True)
+            if succeeded(get(ov_url)):
+                emit({"samesite_lax_override"},
+                     f"SameSite=Lax ditembus via method override pada '{label}'",
+                     "GET top-level (cookie Lax tetap terkirim) dengan "
+                     "_method=POST diterima sebagai aksi state-changing.",
+                     "active_csrf_samesite_lax_override")
+
+        # ── SameSite=Strict + redirector same-origin ──
+        if samesite == "strict":
+            # Gadget client-side redirect: JS menetapkan document.location dari
+            # parameter URL (mis. postId pada halaman konfirmasi). Browser
+            # mengeksekusinya sebagai navigasi same-site baru sehingga cookie
+            # Strict ikut terkirim -- bukti statis + endpoint menerima GET.
+            gadget_js = (ctx.js_text or "") + "\n" + (ctx.html or "")
+            gadget_param = None
+            if re.search(r"(?:document\.location|window\.location|location\.href)\s*=",
+                         gadget_js, re.I):
+                for n in ctx.all_param_names():
+                    if re.search(rf"\b{re.escape(n)}\b", gadget_js):
+                        gadget_param = n
+                        break
+            if gadget_param and method_ok:
+                emit({"samesite_strict_redirect"},
+                     f"SameSite=Strict ditembus via gadget client-side redirect "
+                     f"pada '{label}'",
+                     f"Halaman memuat gadget client-side redirect "
+                     f"(document.location dibangun dari parameter "
+                     f"'{gadget_param}') dan endpoint menerima GET; navigasi "
+                     "same-site hasil redirect membawa cookie Strict.",
+                     "active_csrf_samesite_strict_gadget")
+            redir_names = [n for n in ctx.all_param_names()
+                           if n.lower() in ("url", "uri", "next", "redirect",
+                                            "returnurl", "return", "dest", "destination",
+                                            "postid", "id", "page", "post", "commentid",
+                                            "path", "target")]
+            if redir_names:
+                inner = urlparse(action).path or "/"
+                inner_q = urlencode(bare, doseq=True)
+                target_path = inner + ("?" + inner_q if inner_q else "")
+                chain = ctx.base + "/?".replace("/", "/", 1)
+                done_chain = False
+                for rn in redir_names[:2]:
+                    redir_url = _with_param(ctx.url, rn, target_path)
+                    resp = get(redir_url, follow=True)
+                    if succeeded(resp):
+                        emit({"samesite_strict_redirect"},
+                             f"SameSite=Strict ditembus via redirect same-origin "
+                             f"pada '{label}'",
+                             f"Parameter redirect '{rn}' mengikuti rantai "
+                             "same-origin ke endpoint state-changing dan aksi "
+                             "diterima (cookie Strict terkirim pada rantai "
+                             "redirect same-site).",
+                             "active_csrf_samesite_strict_redirect")
+                        done_chain = True
+                        break
+                _ = (chain, done_chain)
     return out
 
 
