@@ -153,6 +153,60 @@ SLEEP_BETWEEN_NVD = 3.0
 CENSYS_RATE_SLEEP = 1.0
 REQUEST_TIMEOUT = 20
 
+# ── Batas waktu scan global + progress per kerentanan ────────────────────────
+# Dulu tidak ada deadline: discovery (≤80 halaman × ≤24 script) × semua probe
+# aktif di SETIAP halaman (SQLi saja ≤240 request) berjalan sekuensial tanpa
+# progress per-probe, sehingga terlihat "terhenti" puluhan menit. Deadline ini
+# membuat scan selalu berhenti dan tetap menghasilkan laporan parsial.
+SCAN_DEADLINE_SECONDS = float(os.getenv("SATRIA_SCAN_DEADLINE_SECONDS", "600") or 600)
+_scan_deadline: Optional[float] = None
+_scan_progress_cb = None
+_scan_deadline_reported = False
+
+
+def set_scan_progress_callback(cb) -> None:
+    """Callback opsional (done, total, label) untuk UI selain stdout."""
+    global _scan_progress_cb
+    _scan_progress_cb = cb
+
+
+def _scan_begin() -> None:
+    global _scan_deadline, _scan_deadline_reported
+    # Idempoten dalam satu run: _run_pipeline_impl memanggil ini, lalu
+    # run_lab_scan memanggilnya lagi -- jangan reset deadline-nya.
+    if _scan_deadline is not None and not _scan_deadline_exceeded():
+        return
+    _scan_deadline_reported = False
+    limit = float(SCAN_DEADLINE_SECONDS or 0)
+    _scan_deadline = (time.monotonic() + limit) if limit > 0 else None
+
+
+def _scan_deadline_exceeded() -> bool:
+    return _scan_deadline is not None and time.monotonic() >= _scan_deadline
+
+
+def _emit_progress(done: int, total: int, label: str) -> None:
+    """Satu baris progress per kerentanan/probe (dibaca app.py + callback)."""
+    total = max(1, int(total)); done = max(0, min(int(done), total))
+    print(f"[PROGRESS {done}/{total}] {label}", flush=True)
+    if _scan_progress_cb is not None:
+        try:
+            _scan_progress_cb(done, total, label)
+        except Exception:
+            pass
+
+
+def _scan_stop(label: str) -> bool:
+    """True bila deadline habis; cetak pemberitahuan sekali saja."""
+    global _scan_deadline_reported
+    if not _scan_deadline_exceeded():
+        return False
+    if not _scan_deadline_reported:
+        _scan_deadline_reported = True
+        print(f"[!] Batas waktu scan {SCAN_DEADLINE_SECONDS:.0f} detik tercapai "
+              f"pada {label}; scan dihentikan agar laporan tetap dapat dibuat.", flush=True)
+    return True
+
 ENABLE_LLM = os.getenv("SATRIA_ENABLE_LLM", "0").strip() in {"1", "true", "yes"}
 RUN_CENSYS = os.getenv("SATRIA_RUN_CENSYS", "0").strip() in {"1", "true", "yes"}
 RUN_NVD = os.getenv("SATRIA_RUN_NVD", "0").strip() in {"1", "true", "yes"}
@@ -864,7 +918,9 @@ def search_nvd_verified(technology_name: str, version: str) -> list[dict]:
     items: list[dict] = []
     start_index, page_size, total_results = 0, 2000, None
     try:
-        while start_index < 10000:
+        while start_index < 10000 and audit["nvd_pages"] < 5:  # ≤5 halaman × 2000
+            if _scan_deadline_exceeded():
+                break
             params = {"keywordSearch": query, "resultsPerPage": page_size, "startIndex": start_index}
             headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
             response = requests.get(NVD_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -1661,10 +1717,15 @@ _LAB_TAG_SET_OVERRIDES: dict[str, frozenset] = {
     "sql_injection-12": frozenset({"sql_injection", "blind", "conditional_errors"}),
     "sql_injection-13": frozenset({"sql_injection", "error_based"}),
     "sql_injection-14": frozenset({"sql_injection", "blind", "time_based"}),
-    "sql_injection-15": frozenset({"sql_injection", "blind", "time_based"}),
+    "sql_injection-15": frozenset({"sql_injection", "blind", "time_based", "time_retrieval"}),
     "sql_injection-16": frozenset({"sql_injection", "oob"}),
     "sql_injection-17": frozenset({"sql_injection", "oob", "oob_exfil"}),
     "sql_injection-18": frozenset({"sql_injection", "xml_encoded"}),
+    # XSS — varian JavaScript string: template literal (backtick) dibedakan
+    # dari string kutip biasa (lab 18/19 tetap berkelompok, jujur digabung).
+    "xss-21": frozenset({"xss", "reflected", "javascript_context", "template_literal"}),
+    # XSS — mencuri cookie vs menangkap password dibedakan (dulu satu tag).
+    "xss-23": frozenset({"xss", "password_capture"}),
 }
 
 
@@ -2344,9 +2405,12 @@ def p_dom_sinks_v2(ctx):
     doc_write = re.search(r"document\.write\s*\([^;]{0,240}location\.(search|hash)", js, re.I)
     if doc_write:
         tags = {"xss", "dom_sink", "doc_write"}
-        if re.search(r"<select", html, re.I) and re.search(
-                r"document\.write\s*\([^;]{0,300}location\.(search|hash)[^;]{0,200}<select",
-                js, re.I | re.S):
+        # Lab "document.write ... inside a select element": sink DOM + elemen
+        # <select> pada halaman yang sama. Regex lama menuntut "<select" di
+        # dalam string JS, yang tidak pernah terjadi pada lab aslinya.
+        # Ini indikasi pasif -> confidence candidate (butuh browser untuk
+        # membuktikan eksekusi), bukan temuan terkonfirmasi.
+        if re.search(r"<select\b", html, re.I):
             tags.add("select_element")
         out.append(make_finding(
             ctx, "xss", tags,
@@ -2355,7 +2419,8 @@ def p_dom_sinks_v2(ctx):
             evidence=f"Sink document.write dengan sumber URL: \"{_snip(js, 'document.write')}\"",
             risk="Data URL ditulis sebagai HTML dan mengeksekusi handler penyerang.",
             recommendation="Bangun DOM dengan createElement/textContent, bukan document.write.",
-            verification="deterministic_dom_doc_write"))
+            verification="deterministic_dom_doc_write",
+            confidence=("candidate" if "select_element" in tags else "confirmed")))
     inner = re.search(r"\.innerHTML\s*=\s*[^;]{0,240}location\.(search|hash)", js, re.I)
     if inner:
         out.append(make_finding(
@@ -3838,6 +3903,42 @@ def _sqli_time_phase(sess, ctx, point, base, out):
         return
 
 
+# ── 4b. time-based dengan pengambilan informasi (lab 15) ───────────────────
+# Lab 14 hanya membuktikan delay; lab 15 menuntut data dibaca lewat delay.
+# Uji terbatas: tebak karakter pertama versi DBMS dengan sleep kondisional.
+# Hanya satu karakter, ≤12 request, dan hanya diterbitkan bila timing
+# konsisten -- bukan ekstraksi penuh.
+def _sqli_time_retrieval_phase(sess, ctx, point, base, out):
+    for dbms, template in (
+        ("mysql", "' AND IF(SUBSTRING(@@version,1,1)='{c}',SLEEP({d}),0)-- -"),
+        ("postgresql", "' AND (CASE WHEN SUBSTRING(version(),1,1)='{c}' "
+                       "THEN (SELECT pg_sleep({d})) ELSE 0 END)=0-- -"),
+        ("oracle", "' AND (CASE WHEN SUBSTR((SELECT banner FROM v$version "
+                   "WHERE ROWNUM=1),1,1)='{c}' THEN dbms_pipe.receive_message('a',{d}) "
+                   "ELSE 0 END)=0-- -"),
+    ):
+        for guess in "0123456789":
+            if not _sqli_take(ctx):
+                return
+            if _scan_deadline_exceeded():
+                return
+            payload = _sqli_value(point, template.format(c=guess, d=int(max(2, round(SQLI_TIME_DELAY)))))
+            resp = _sqli_send(sess, ctx, point, payload)
+            if resp is None:
+                return
+            if _sqli_elapsed(resp) < max(SQLI_TIME_MARGIN, SQLI_TIME_DELAY * 0.6):
+                continue
+            out.append(_sqli_finding(
+                ctx, {"blind", "time_based", "time_retrieval"},
+                f"Blind SQL injection berbasis waktu dengan pengambilan data ({dbms}) "
+                f"pada {point['label']}", "high",
+                f"Payload kondisional {payload!r} menunda respons "
+                f"{_sqli_elapsed(resp):.1f}s untuk tebakan karakter pertama versi "
+                f"'{guess}': data benar-benar dibaca lewat delay, bukan sekadar delay buta.",
+                "active_sqli_time_retrieval"))
+            return
+
+
 # ── 5. WHERE clause / hidden data ───────────────────────────────────────────
 SQLI_WHERE_PAIRS = [
     ("' OR 1=1-- -", "' OR 1=2-- -"),
@@ -4671,6 +4772,8 @@ def a_sqli_deep(ctx):
                 time_done = bool(any("time_based" in f.get("tags", []) for f in findings))
                 if time_done:
                     _SQLI_TIME_HOSTS.add(_sqli_budget_key(ctx))
+            if time_done and not any("time_retrieval" in f.get("tags", []) for f in findings) and index < 2:
+                _sqli_time_retrieval_phase(session, ctx, point, base, findings)
             # Fase boolean paling mahal (differensial dua putaran), jadi
             # dijalankan terakhir agar tidak menghabiskan kuota fase lain.
             if index < 2 and not any("conditional_responses" in f.get("tags", []) for f in findings):
@@ -5391,17 +5494,32 @@ def _dedupe_findings(findings: list[dict]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # EKSEKUSI PROBE
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_probes(ctx, app: dict[str, tuple[bool, str]]) -> tuple[list[dict], list[dict], dict]:
+def _run_probes(ctx, app: dict[str, tuple[bool, str]], progress_offset: int = 0,
+                progress_total: int = 0) -> tuple[list[dict], list[dict], dict]:
     confirmed: list[dict] = []
     candidates: list[dict] = []
     stats = {"passive_runs": 0, "active_runs": 0, "errors": [], "skipped_probes": []}
-
-    for probe, (ok, reason) in app.items():
+    probe_items = list(app.items())
+    probe_total = sum(len(PASSIVE_PROBES.get(pr, [])) + len(ACTIVE_PROBES.get(pr, []))
+                      for pr, _ in probe_items)
+    probe_done = 0
+    for probe, (ok, reason) in probe_items:
         if not ok:
             stats["skipped_probes"].append({"probe": probe, "reason": reason})
             continue
+        probe_done += 1
+        cat_title = next((c["title"] for c in LAB_DB.values() if c["probe"] == probe), probe)
+        _emit_progress(progress_offset + probe_done,
+                       progress_total or len(probe_items),
+                       f"Scan kerentanan: {probe} ({cat_title}) — {ctx.url}")
+        if _scan_stop(f"probe {probe}"):
+            stats["deadline_exceeded"] = True
+            break
 
         for fn in PASSIVE_PROBES.get(probe, []):
+            if _scan_stop(f"probe pasif {probe}"):
+                stats["deadline_exceeded"] = True
+                break
             try:
                 stats["passive_runs"] += 1
                 for f in fn(ctx) or []:
@@ -5417,6 +5535,9 @@ def _run_probes(ctx, app: dict[str, tuple[bool, str]]) -> tuple[list[dict], list
 
         if ctx.authorized:
             for fn in ACTIVE_PROBES.get(probe, []):
+                if _scan_stop(f"probe aktif {probe}"):
+                    stats["deadline_exceeded"] = True
+                    break
                 try:
                     stats["active_runs"] += 1
                     for f in fn(ctx) or []:
@@ -5469,6 +5590,7 @@ PROVABLE_TAGS: frozenset = frozenset({
     "server_proto", "websocket_hijack", "origin_reflection",
     # XSS lanjutan
     "stored", "filter_blocked", "custom_tags", "svg_allowed", "canonical_tag",
+    "template_literal", "password_capture", "time_retrieval",
     "onclick_context", "csp_bypass", "dangling_markup", "cookie_theft",
     "csrf_defense_bypass", "hashchange", "select_element", "jquery_anchor",
     # XXE / SSRF lanjutan
@@ -5681,7 +5803,10 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
                 enqueue_candidate(raw, base)
 
     while queue and len(seen) < max_pages:
+        if _scan_stop("discovery halaman"):
+            break
         current = urldefrag(queue.popleft()).url
+        _emit_progress(len(seen) + 1, max_pages, f"Discovery halaman: {current[:90]}")
         if current in seen:
             continue
         seen.add(current)
@@ -5795,6 +5920,7 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
 
 
 def run_lab_scan(ctx) -> dict[str, Any]:
+    _scan_begin()
     _SQLI_HOST_BUDGET.clear()
     _SQLI_TIME_HOSTS.clear()
     _SQLI_ERROR_HOSTS.clear()
@@ -5818,7 +5944,12 @@ def run_lab_scan(ctx) -> dict[str, Any]:
              "active_probe_families": sorted(ACTIVE_PROBES),
              "categories_without_detector": categories_without_detector}
 
-    for page_ctx in page_contexts:
+    for page_idx, page_ctx in enumerate(page_contexts, start=1):
+        _emit_progress(page_idx, len(page_contexts),
+                       f"Scan halaman {page_idx}/{len(page_contexts)}: {page_ctx.url}")
+        if _scan_stop(f"halaman {page_ctx.url}"):
+            stats["deadline_exceeded"] = True
+            break
         page_app = applicability(page_ctx)
         for probe, (ok, reason) in page_app.items():
             previous = aggregate_app.get(probe, (False, ""))
@@ -5826,13 +5957,18 @@ def run_lab_scan(ctx) -> dict[str, Any]:
                 aggregate_app[probe] = (True, "")
             elif probe not in aggregate_app:
                 aggregate_app[probe] = (False, reason)
-        confirmed, candidates, page_stats = _run_probes(page_ctx, page_app)
+        confirmed, candidates, page_stats = _run_probes(
+            page_ctx, page_app,
+            progress_offset=(page_idx - 1) * len(page_app),
+            progress_total=len(page_contexts) * len(page_app))
         confirmed_all.extend(confirmed)
         candidates_all.extend(candidates)
         stats["passive_runs"] += page_stats.get("passive_runs", 0)
         stats["active_runs"] += page_stats.get("active_runs", 0)
         stats["errors"].extend(page_stats.get("errors", []))
         stats["skipped_probes"].extend(page_stats.get("skipped_probes", []))
+        if page_stats.get("deadline_exceeded"):
+            stats["deadline_exceeded"] = True
 
     confirmed = _dedupe_findings(confirmed_all)
     candidates = _dedupe_findings(candidates_all)
@@ -5977,10 +6113,12 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
     if authorized is None:
         authorized = active_probe_enabled()
 
-    print(f"\n[*] Target: {target_url}")
-    print(f"[*] Mode  : {'PASIF + AKTIF (diizinkan)' if authorized else 'PASIF saja'}")
+    _scan_begin()
+    print(f"\n[*] Target: {target_url}", flush=True)
+    print(f"[*] Mode  : {'PASIF + AKTIF (diizinkan)' if authorized else 'PASIF saja'}", flush=True)
 
     # ── Section 1: HTTP ──────────────────────────────────────────────────────
+    print("[1/10] Memeriksa keamanan HTTP (header, cookie, CORS, redirect) ...", flush=True)
     if http_result is None:
         try:
             http_result = analyze_http_security(target_url)
@@ -5990,17 +6128,25 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
     http_findings = list(http_result.get("findings") or [])
 
     # ── Section 2: temuan kode deterministik ─────────────────────────────────
+    print("[2/10] Menganalisis temuan kode deterministik (SRI, skrip pihak ketiga) ...", flush=True)
     code_findings = detect_code_findings_deterministic(page_html, target_url)
 
-    # ── Section 3: PortSwigger lab scan ──────────────────────────────────────
+    # ── Section 3: PortSwigger lab scan (48 lab SQLi+XSS di dalamnya) ────────
+    print("[3/10] Memindai katalog kerentanan (termasuk 48 lab SQL injection + XSS) ...", flush=True)
     lab_report = scan_labs(target_url, page_html, http_result, authorized=authorized)
+    print("[4/10] Pemindaian kerentanan selesai; menyusun hasil ...", flush=True)
     lab_findings = lab_report["findings"]
 
     # ── Section 4: teknologi & CVE (opsional) ────────────────────────────────
+    print("[5/10] Mengidentifikasi teknologi dan mencari CVE ...", flush=True)
     technologies = extract_tech_versions_deterministic(page_html)
     cves: list[dict] = []
     if RUN_NVD or RUN_CENSYS:
-        for tech in technologies[:10]:
+        for tech_idx, tech in enumerate(technologies[:10], start=1):
+            _emit_progress(tech_idx, min(10, len(technologies)),
+                           f"Lookup CVE: {tech['name']} {tech['version']}")
+            if _scan_stop(f"CVE {tech['name']}"):
+                break
             try:
                 cves.extend(search_nvd_verified(tech["name"], tech["version"]))
                 cves.extend(search_osv_verified(tech["name"], tech["version"]))
@@ -6008,6 +6154,7 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
                 print(f"      [CVE] dilewati untuk {tech['name']}: {exc}")
 
     # ── Gabung, dedup, ringkas ───────────────────────────────────────────────
+    print("[6/10] Menggabungkan dan deduplikasi temuan ...", flush=True)
     combined = dedup_and_merge_findings(http_findings + code_findings + lab_findings)
     summary = summarize(combined)
 
@@ -6034,14 +6181,16 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
         "errors": lab_report["stats"]["errors"],
     }
 
+    print("[7/10] Menyimpan temuan ...", flush=True)
     try:
         ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
         Path(FINDINGS_PATH).write_text(json.dumps(result, indent=2, ensure_ascii=False),
                                        encoding="utf-8")
-        print(f"[*] Temuan disimpan: {FINDINGS_PATH}")
+        print(f"[*] Temuan disimpan: {FINDINGS_PATH}", flush=True)
     except Exception as exc:
-        print(f"[!] Gagal menyimpan {FINDINGS_PATH}: {exc}")
+        print(f"[!] Gagal menyimpan {FINDINGS_PATH}: {exc}", flush=True)
 
+    print("[8/10] Pemindaian selesai; laporan PDF dibuat setelah fungsi ini ...", flush=True)
     print(f"[*] Selesai: {summary['total']} temuan "
           f"({', '.join(f'{k}={v}' for k, v in summary['by_severity'].items() if v)})")
     return result
@@ -6796,6 +6945,8 @@ def _dx_cookie_header(ctx, override: Optional[dict] = None) -> str:
 
 def _dx_send(ctx, point: dict, value: str, *, session=None, headers=None,
              follow: bool = False):
+    if _scan_deadline_exceeded():
+        return None
     sess = session or requests
     hdrs = {"User-Agent": UA, **(headers or {})}
     method = point.get("method") or "GET"
@@ -8736,6 +8887,7 @@ def a_xss_context_deep(ctx):
         "<x-pswx9q7 tabindex=1 onfocus=alert(1)>x</x-pswx9q7>")
     js_url_raw = "javascript:alert(1)" in send("javascript:alert(1)")
     js_break_raw = "';alert(1);//" in send("';alert(1);//")
+    template_raw = "`;alert(1);//" in send("`;alert(1);//")
     tag_break_raw = "</script><svg/onload=alert(1)>" in send(
         "</script><svg/onload=alert(1)>")
     angular_raw = "constructor.constructor" in send(
@@ -8775,6 +8927,13 @@ def a_xss_context_deep(ctx):
                 "dibuang, sehingga eksekusi masih mungkin dengan sintaks alternatif.",
                 "active_xss_javascript_url_chars_blocked"))
     if where in ("javascript", "onclick"):
+        if template_raw:
+            out.append(_xss_emit(
+                ctx, {"reflected", "javascript_context", "template_literal"},
+                "XSS: template literal JavaScript dapat diputus dengan backtick",
+                "Payload `;alert(1);// muncul mentah pada blok script, sehingga "
+                "template literal (backtick) dapat ditembus meski kutip di-escape.",
+                "active_xss_template_literal_break"))
         if js_break_raw or tag_break_raw or raw_sq:
             out.append(_xss_emit(
                 ctx, {"reflected", "javascript_context",
@@ -8858,6 +9017,13 @@ def a_xss_context_deep(ctx):
     has_password = any(
         any(str(i.get("type") or "").lower() == "password" for i in form.get("inputs") or [])
         for form in ctx.forms or [])
+    if has_password:
+        out.append(_xss_emit(
+            ctx, {"password_capture"},
+            "XSS dapat menangkap kredensial melalui form password",
+            "XSS terbukti pada origin dengan form password; skrip same-origin "
+            "dapat merekam ketikan kredensial sebelum dikirim.",
+            "active_xss_password_capture", severity="critical"))
     if session_cookies or has_password:
         out.append(_xss_emit(
             ctx, {"cookie_theft"},
