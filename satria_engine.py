@@ -2442,9 +2442,17 @@ def p_dom_messages(ctx):
             break
 
     # ── Lab 07: clobbering atribut 'attributes' untuk bypass filter HTML ──
-    if (re.search(r"(?:id|name)\s*=\s*[\"']?attributes[\"']?", html, re.I)
+    # K2a: elemen id/name="attributes" + loop .attributes.length.
+    # K2b: sanitizer (HTMLJanitor/sanitize/filter) yang mengiterasi
+    #      .attributes dengan .length -- elemen penimpa adalah payload
+    #      penyerang, jadi pada halaman segar cukup pola JS-nya.
+    sanitizer_attrs = (re.search(r"\.attributes\b", js)
+                       and re.search(r"\.attributes[^\n]{0,80}length|length[^\n]{0,80}\.attributes|for\s*\([^)]*\.attributes", js)
+                       and re.search(r"(htmljanitor|sanitize|sanitise|filter|allowed|strip)", js, re.I))
+    if ((re.search(r"(?:id|name)\s*=\s*[\"']?attributes[\"']?", html, re.I)
             and re.search(r"\.attributes\b", js)
-            and re.search(r"\.attributes[^\n]{0,80}length|length[^\n]{0,80}\.attributes", js)):
+            and re.search(r"\.attributes[^\n]{0,80}length|length[^\n]{0,80}\.attributes", js))
+            or sanitizer_attrs):
         out.append(make_finding(
             ctx, "dom", {"dom", "dom_clobbering", "attribute_context"},
             type_="DOM clobbering atribut untuk bypass filter HTML",
@@ -5233,48 +5241,74 @@ def a_business_rules(ctx):
 # ══════════════════════════════════════════════════════════════════════════════
 @active("cors")
 def a_cors(ctx):
+    """Uji CORS pada URL halaman DAN endpoint API same-origin yang dirujuk
+    JS/HTML (lab CORS rentan ada di endpoint JSON, bukan halaman HTML).
+    Bukti: ACAO merefleksikan Origin penyerang secara persis + ACAC:true."""
     out = []
     evil = "https://evil.pswx9.example"
-    r = _request(ctx, ctx.url, headers={"Origin": evil})
-    if r is not None:
-        acao = r.headers.get("Access-Control-Allow-Origin", "")
-        acac = r.headers.get("Access-Control-Allow-Credentials", "").lower()
-        if acao == evil:
-            tags = {"cors", "origin_reflection"}
+
+    candidates: list[str] = [ctx.url]
+    js_all = (ctx.js_text or "") + "\n" + (ctx.html or "")
+    for m in re.finditer(r"""['"](/[A-Za-z0-9_\-./?=&%]+)['"]""", js_all):
+        path = m.group(1)
+        if re.search(r"(api|account|details|user|profile|data|json)", path, re.I):
+            candidates.append(ctx.abs_url(path))
+    for path in ("/account-details", "/api/account-details", "/api/account",
+                 "/api/user", "/account", "/details"):
+        candidates.append(ctx.abs_url(path))
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for c in candidates:
+        if c not in seen and _dx_same_origin(ctx, c):
+            seen.add(c)
+            uniq.append(c)
+    candidates = uniq[:8]
+
+    p = urlparse(ctx.url)
+    insecure = f"http://{p.hostname}" if p.scheme == "https" else None
+
+    def cred_ok(resp) -> bool:
+        return (resp is not None and resp.status_code in (200, 201, 202)
+                and str(resp.headers.get("Access-Control-Allow-Credentials", "")).lower() == "true")
+
+    for url in candidates:
+        if _scan_deadline_exceeded():
+            break
+        r = _request(ctx, url, headers={"Origin": evil})
+        if cred_ok(r) and r.headers.get("Access-Control-Allow-Origin", "") == evil:
             out.append(make_finding(
-                ctx, "cors", tags,
+                ctx, "cors", {"cors", "origin_reflection"},
                 type_="CORS origin reflection terkonfirmasi",
-                severity="high" if acac == "true" else "medium",
-                evidence=f"Origin {evil} direfleksikan (ACAO={acao}, ACAC={acac or '-'}).",
+                severity="high",
+                evidence=f"Origin {evil} direfleksikan pada {url} "
+                         f"(ACAO={evil}, ACAC=true).",
                 risk="Situs penyerang dapat membaca respons berautentikasi.",
                 recommendation="Validasi Origin terhadap allowlist ketat.",
                 verification="active_cors_origin_reflection",
             ))
-    r_null = _request(ctx, ctx.url, headers={"Origin": "null"})
-    if r_null is not None and r_null.headers.get("Access-Control-Allow-Origin", "") == "null":
-        out.append(make_finding(
-            ctx, "cors", {"cors", "null_origin"},
-            type_="CORS mempercayai origin 'null'",
-            severity="high",
-            evidence="Header ACAO bernilai 'null' untuk Origin: null.",
-            risk="Iframe sandbox/data URI dapat membaca data berautentikasi.",
-            recommendation="Jangan izinkan origin null.",
-            verification="active_cors_null_origin",
-        ))
-    p = urlparse(ctx.url)
-    if p.scheme == "https":
-        insecure = f"http://{p.hostname}"
-        r_http = _request(ctx, ctx.url, headers={"Origin": insecure})
-        if r_http is not None and r_http.headers.get("Access-Control-Allow-Origin", "") == insecure:
+        r_null = _request(ctx, url, headers={"Origin": "null"})
+        if cred_ok(r_null) and r_null.headers.get("Access-Control-Allow-Origin", "") == "null":
             out.append(make_finding(
-                ctx, "cors", {"cors", "protocol_confusion"},
-                type_="CORS mempercayai skema HTTP tidak aman",
+                ctx, "cors", {"cors", "null_origin"},
+                type_="CORS mempercayai origin 'null'",
                 severity="high",
-                evidence=f"Origin {insecure} diterima sebagai ACAO.",
-                risk="MITM pada HTTP dapat membaca data HTTPS.",
-                recommendation="Hanya izinkan origin https yang eksplisit.",
-                verification="active_cors_insecure_scheme",
+                evidence=f"Header ACAO bernilai 'null' untuk Origin: null pada {url}.",
+                risk="Iframe sandbox/data URI dapat membaca data berautentikasi.",
+                recommendation="Jangan izinkan origin null.",
+                verification="active_cors_null_origin",
             ))
+        if insecure:
+            r_http = _request(ctx, url, headers={"Origin": insecure})
+            if cred_ok(r_http) and r_http.headers.get("Access-Control-Allow-Origin", "") == insecure:
+                out.append(make_finding(
+                    ctx, "cors", {"cors", "protocol_confusion"},
+                    type_="CORS mempercayai skema HTTP tidak aman",
+                    severity="high",
+                    evidence=f"Origin {insecure} diterima sebagai ACAO pada {url}.",
+                    risk="MITM pada HTTP dapat membaca data HTTPS.",
+                    recommendation="Hanya izinkan origin https yang eksplisit.",
+                    verification="active_cors_insecure_scheme",
+                ))
     return out
 
 
@@ -8430,50 +8464,97 @@ def a_clickjack_deep(ctx):
         pass
 
     # ── Lab 02: input form terisi awal dari parameter URL ──
-    tried = 0
-    for form in forms:
-        if _scan_deadline_exceeded():
-            break
-        for inp in (form.get("inputs") or []):
-            if tried >= 8 or _scan_deadline_exceeded():
+    # Uji aktif (server-side prefill): canary acak sebagai parameter URL
+    # harus muncul sebagai value input bernama sama pada respons.
+    def prefill_try(page_url, page_forms, budget):
+        for form in page_forms:
+            if budget[0] >= 8 or _scan_deadline_exceeded():
+                return False
+            for inp in (form.get("inputs") or []):
+                if budget[0] >= 8 or _scan_deadline_exceeded():
+                    return False
+                name = str(inp.get("name") or "").strip()
+                typ = str(inp.get("type") or "").lower()
+                if not name or _csrf_is_token_field(name):
+                    continue
+                if typ not in ("", "text", "email", "search", "url", "tel", "hidden"):
+                    continue
+                canary = (f"satria-cj-{os.urandom(3).hex()}@example.com"
+                          if ("email" in name.lower() or typ == "email")
+                          else f"satria-cj-{os.urandom(3).hex()}")
+                try:
+                    resp = session.get(_with_param(page_url, name, canary),
+                                       timeout=ACTIVE_TIMEOUT, allow_redirects=True)
+                except Exception:
+                    continue
+                budget[0] += 1
+                if resp.status_code != 200:
+                    continue
+                try:
+                    from bs4 import BeautifulSoup as _BS
+                    soup = _BS(resp.text or "", "html.parser")
+                except Exception:
+                    continue
+                hit = any((el.get("name") or "") == name
+                          and (el.get("value") or "") == canary
+                          for el in soup.find_all("input"))
+                if hit:
+                    emit({"clickjacking", "cj_prefilled"},
+                         "Clickjacking: input form terisi awal dari parameter URL",
+                         framable_evidence + f" Parameter URL '{name}' mengisi awal "
+                         f"input form bernama sama (canary {canary} muncul sebagai "
+                         "value input); penyerang dapat mengarahkan korban ke URL "
+                         "berparameter lalu menipu klik submit.",
+                         "active_clickjacking_prefilled_param")
+                    return True
+        return False
+
+    _prefill_budget = [0]
+    _prefilled = prefill_try(ctx.url, forms, _prefill_budget)
+
+    if not _prefilled:
+        # Uji statis (client-side prefill): JS membaca parameter URL lalu
+        # menetapkan .value pada input form bernama sama.
+        js_prefill_params = set(re.findall(
+            r"(?:get|getParam|param)\s*\(\s*['\"]([A-Za-z0-9_\-]+)['\"]", js_all))
+        form_input_names = {str(i.get("name") or "").strip()
+                            for f in forms for i in (f.get("inputs") or [])}
+        linked = (js_prefill_params & form_input_names)
+        if (linked and re.search(r"\.value\s*=", js_all)
+                and re.search(r"(location\.search|location\.hash|URLSearchParams|document\.URL)",
+                              js_all, re.I)):
+            emit({"clickjacking", "cj_prefilled"},
+                 "Clickjacking: input form terisi awal dari parameter URL (client-side)",
+                 framable_evidence + " JavaScript membaca parameter URL "
+                 f"({', '.join(sorted(linked))}) dan mengisi awal input form "
+                 "bernama sama; penyerang dapat mengarahkan korban ke URL "
+                 "berparameter lalu menipu klik submit.",
+                 "active_clickjacking_prefilled_param")
+            _prefilled = True
+
+    if not _prefilled and ctx.url.rstrip("/") == ctx.base:
+        # Halaman root: halaman akun sering tidak ter-discover; coba path
+        # akun umum same-origin untuk uji prefill yang sama.
+        for cand_path in ("/my-account", "/account", "/profile",
+                          "/myaccount", "/user/account"):
+            if _scan_deadline_exceeded() or _prefilled:
                 break
-            name = str(inp.get("name") or "").strip()
-            typ = str(inp.get("type") or "").lower()
-            if not name or _csrf_is_token_field(name):
-                continue
-            if typ not in ("", "text", "email", "search", "url", "tel", "hidden"):
-                continue
-            canary = (f"satria-cj-{os.urandom(3).hex()}@example.com"
-                      if ("email" in name.lower() or typ == "email")
-                      else f"satria-cj-{os.urandom(3).hex()}")
+            cand = ctx.abs_url(cand_path)
             try:
-                resp = session.get(_with_param(ctx.url, name, canary),
-                                   timeout=ACTIVE_TIMEOUT, allow_redirects=True)
+                resp = session.get(cand, timeout=ACTIVE_TIMEOUT, allow_redirects=True)
             except Exception:
                 continue
-            tried += 1
             if resp.status_code != 200:
                 continue
             try:
-                from bs4 import BeautifulSoup as _BS
-                soup = _BS(resp.text or "", "html.parser")
+                cand_ctx = build_target_context(
+                    cand, resp.text or "",
+                    {"status_code": 200, "headers": dict(resp.headers),
+                     "cookies": []}, authorized=True)
             except Exception:
                 continue
-            hit = any((el.get("name") or "") == name
-                      and (el.get("value") or "") == canary
-                      for el in soup.find_all("input"))
-            if hit:
-                emit({"clickjacking", "cj_prefilled"},
-                     "Clickjacking: input form terisi awal dari parameter URL",
-                     framable_evidence + f" Parameter URL '{name}' mengisi awal "
-                     f"input form bernama sama (canary {canary} muncul sebagai "
-                     "value input); penyerang dapat mengarahkan korban ke URL "
-                     "berparameter lalu menipu klik submit.",
-                     "active_clickjacking_prefilled_param")
-                break
-        else:
-            continue
-        break
+            _prefill_budget[0] = 0
+            _prefilled = prefill_try(cand, cand_ctx.forms, _prefill_budget)
 
     # ── Lab 05: multistep clickjacking (aksi sensitif dua langkah) ──
     orig_actions = {(str(f.get("action") or ""), str(f.get("method") or "get").lower())
