@@ -256,6 +256,10 @@ def scrape_target(url: str, geekflare_key: str) -> tuple[dict[str, Any], str]:
 # -----------------------------------------------------------------------------
 class StreamlitLogCapture(io.TextIOBase):
     STEP_RE = re.compile(r"\[(\d+)/10\]")
+    # Progress per kerentanan/probe dari engine: "[PROGRESS i/n] label".
+    # Dulu hanya [x/10] yang dibaca, padahal engine tidak pernah mencetaknya
+    # untuk probe -- progress tampak terhenti pada satu angka selama scan.
+    PROGRESS_RE = re.compile(r"\[PROGRESS\s+(\d+)/(\d+)\]\s*(.*)")
 
     def __init__(self, progress_bar, status_box, log_box):
         self.progress_bar = progress_bar
@@ -276,13 +280,25 @@ class StreamlitLogCapture(io.TextIOBase):
                 continue
             self.lines.append(line)
             self.lines = self.lines[-70:]
+            progress_match = self.PROGRESS_RE.search(line)
+            if progress_match:
+                done, total = int(progress_match.group(1)), int(progress_match.group(2))
+                label = progress_match.group(3).strip() or line.strip()
+                frac = (done / total) if total else 0.0
+                self.last_progress = min(0.94, 0.20 + frac * 0.72)
+                self.progress_bar.progress(self.last_progress)
+                # Tampilkan kerentanan yang SEDANG dipindai, bukan angka diam.
+                self.status_box.info(f"[{done}/{total}] {label[:220]}")
+                self.log_box.code("\n".join(self.lines[-55:]), language="text")
+                continue
             match = self.STEP_RE.search(line)
             if match:
                 step = int(match.group(1))
                 self.last_progress = min(0.94, 0.20 + (step / 10.0) * 0.72)
                 self.progress_bar.progress(self.last_progress)
                 self.status_box.info(line.strip())
-            elif line.startswith(("      [", "[", "      ✓", "✓")):
+                self.log_box.code("\n".join(self.lines[-55:]), language="text")
+            elif line.startswith(("      [", "[", "      ✓", "✓", "[!]")):
                 # Increment gently for sub-steps without pretending that every request is progress.
                 self.last_progress = min(0.94, self.last_progress + 0.003)
                 self.progress_bar.progress(self.last_progress)
@@ -409,7 +425,9 @@ if submitted:
         work_dir = tempfile.mkdtemp(prefix="satria_job_")
 
         try:
-            status_box.info("Memvalidasi target publik dan menyiapkan scraper ...")
+            status_box.info(
+                f"Memvalidasi target publik dan menyiapkan scraper ... "
+                f"(batas scan: {float(os.getenv('SATRIA_SCAN_DEADLINE_SECONDS', '600') or 600):.0f} detik)")
             progress_bar.progress(0.08)
             scrape_data, source_mode = scrape_target(target_url, geekflare_key)
             st.session_state["satria_source_mode"] = source_mode
@@ -437,6 +455,13 @@ if submitted:
             engine.ENABLE_LLM = True
             engine.ALLOW_PARTIAL_TOOLS = True
             engine.ACTIVE_SCAN_AUTHORIZED = True
+            # Batas waktu scan global (detik). 0 = tanpa batas (tidak disarankan:
+            # scan bisa berjalan puluhan menit tanpa progres yang terlihat).
+            try:
+                engine.SCAN_DEADLINE_SECONDS = float(
+                    os.getenv("SATRIA_SCAN_DEADLINE_SECONDS", "600") or 600)
+            except ValueError:
+                engine.SCAN_DEADLINE_SECONDS = 600.0
             engine._load_kiosapi_api_key = lambda: kiosapi_key
 
             # Retain source-fidelity metadata when the static direct-fetch fallback is used.
