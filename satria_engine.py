@@ -3538,6 +3538,11 @@ _SQLI_HOST_BUDGET: dict[str, int] = {}
 _SQLI_TIME_HOSTS: set[str] = set()
 _SQLI_ERROR_HOSTS: set[str] = set()
 _SQLI_OAST_HOSTS: set[str] = set()
+# Fase SQLi yang sudah terbukti pada host ini. Tanpa ini, setiap halaman
+# mengulang fase mahal (error/union/where/boolean) hingga anggaran 240
+# request habis SEBELUM halaman lab (mis. /product?productId=...) dipindai,
+# sehingga lab-lab tersebut gagal total pada pemindaian nyata.
+_SQLI_PROVEN: set[tuple[str, str]] = set()
 # Kuota yang disisihkan agar fase OOB selalu sempat berjalan meski fase lain
 # (boolean/time) sudah menghabiskan sebagian besar anggaran.
 _SQLI_PHASE_RESERVE: dict[str, int] = {"n": 0}
@@ -3546,6 +3551,14 @@ _SQLI_PHASE_RESERVE: dict[str, int] = {"n": 0}
 def _sqli_budget_key(ctx) -> str:
     parsed = urlparse(ctx.url)
     return (parsed.netloc or ctx.host).lower()
+
+
+def _sqli_proven(ctx, phase: str) -> bool:
+    return (_sqli_budget_key(ctx), phase) in _SQLI_PROVEN
+
+
+def _sqli_mark_proven(ctx, phase: str) -> None:
+    _SQLI_PROVEN.add((_sqli_budget_key(ctx), phase))
 
 
 def _sqli_take(ctx, n: int = 1) -> bool:
@@ -3723,7 +3736,6 @@ def _sqli_send(sess, ctx, point, value):
         data[point["name"]] = value
         return _sqli_http(sess, ctx, point["method"], point["url"], data=data)
     if point["kind"] == "cookie":
-        cookies = dict(sess.cookies)
         if not str(point.get("value") or "").strip():
             try:
                 _orig = sess.cookies.get(point["name"])
@@ -3731,9 +3743,43 @@ def _sqli_send(sess, ctx, point, value):
                 _orig = None
             if _orig:
                 point["value"] = _orig
-        cookies[point["name"]] = value
-        return _sqli_http(sess, ctx, "GET", point["url"], cookies=cookies)
+        # Tulis nilai injeksi MENIMPA cookie di jar sesi. Mengirim nilai
+        # asli (jar) dan nilai injeksi sekaligus menghasilkan header
+        # "Cookie: TrackingId=asli; TrackingId=injeksi"; server umumnya
+        # membaca kemunculan PERTAMA sehingga payload SQLi tidak pernah
+        # sampai -> lab Oracle/MySQL versi + enumerasi tabel selalu gagal.
+        try:
+            _host = (urlparse(point["url"]).hostname or "")
+            sess.cookies.set(point["name"], str(value), domain=_host, path="/")
+        except Exception:
+            pass
+        return _sqli_http(sess, ctx, "GET", point["url"])
     return None
+
+
+def _sqli_point_engages(sess, ctx, point, base) -> bool:
+    """True bila input point benar-benar mengubah respons (masuk ke query).
+
+    Tiga probe ringan dibanding baseline; teks dinormalisasi dari token
+    volatil (lihat _sqli_plain). Bila semuanya identik, titik injeksi tidak
+    mengeksekusi query (mis. halaman statis) sehingga fase mahalnya dapat
+    dilewati dan anggaran host tidak habis sebelum halaman lab dipindai.
+    Bila ragu (error jaringan/dll.), default True agar fase tetap jalan.
+    """
+    try:
+        from difflib import SequenceMatcher
+        base_plain = _sqli_plain(base)
+        for suffix in ("'", "1'", "'-- -"):
+            resp = _sqli_send(sess, ctx, point, _sqli_value(point, suffix))
+            if resp is None:
+                return True
+            if resp.status_code != base.status_code:
+                return True
+            if SequenceMatcher(None, _sqli_plain(resp), base_plain).ratio() < 0.99:
+                return True
+        return False
+    except Exception:
+        return True
 
 
 # ── 1. error-based ───────────────────────────────────────────────────────────
@@ -3756,6 +3802,7 @@ def _sqli_error_phase(sess, ctx, point, base, out):
             f"Payload {payload!r} memicu error {dbms.upper()} (frasa \"{sig}\") pada HTTP "
             f"{resp.status_code}: \"{_snip(_sqli_body(resp), sig)}\"",
             "active_sqli_error_signature"))
+        _sqli_mark_proven(ctx, "error_based")
         return
 
 
@@ -3926,6 +3973,7 @@ def _sqli_boolean_phase(sess, ctx, point, base, out):
                 + (" Perbedaan isi teks (bukan hanya ukuran) terdeteksi pada kondisi TRUE."
                    if text_signal else ""),
                 "active_sqli_boolean_differential"))
+            _sqli_mark_proven(ctx, "conditional_responses")
             return
 
 
@@ -3959,6 +4007,7 @@ def _sqli_cond_error_phase(sess, ctx, point, base, out):
                 f"(error), payload FALSE {false_payload!r} menghasilkan HTTP "
                 f"{resp_false.status_code} seperti baseline.",
                 "active_sqli_conditional_error"))
+            _sqli_mark_proven(ctx, "conditional_errors")
             return
 
 
@@ -4078,6 +4127,7 @@ def _sqli_where_phase(sess, ctx, point, base, out):
             f"({base_len} → {_sqli_len(resp_true)}), sedangkan kontrol {false_payload!r} "
             f"hanya {growth_false:+d} byte: filter WHERE berhasil dilewati.",
             "active_sqli_where_hidden_data"))
+        _sqli_mark_proven(ctx, "where")
         return
 
 
@@ -4119,6 +4169,7 @@ def _sqli_union_phase(sess, ctx, point, base, out):
         f"ORDER BY 1..{columns} valid dan ORDER BY {columns + 1} memicu error SQL; "
         f"query mengembalikan {columns} kolom sehingga UNION SELECT dapat disusun.",
         "active_sqli_union_column_count"))
+    _sqli_mark_proven(ctx, "union")
 
     # Kolom yang dapat memuat teks (canary harus muncul di respons).
     text_index = -1
@@ -4342,6 +4393,22 @@ def _sqli_login_phase(sess, ctx, out):
         baseline = _sqli_http(sess, ctx, "POST", action, data=data)
         if baseline is None or _sqli_login_success(baseline):
             continue
+        # Keberhasilan dinilai diferensial terhadap baseline kredensial-salah:
+        # penanda "sudah login" yang juga muncul pada halaman anonim
+        # (mis. tautan "My account" di navigasi) tidak memicu/memblokir.
+        baseline_body = (_sqli_body(baseline) or "").lower()
+
+        def attempt_success(resp) -> bool:
+            if resp is None:
+                return False
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = str(resp.headers.get("Location", "")).lower()
+                return bool(location) and "login" not in location and "error" not in location
+            body = (_sqli_body(resp) or "").lower()
+            if not body:
+                return False
+            return any(m in body and m not in baseline_body for m in SQLI_LOGIN_SUCCESS)
+
         for payload in SQLI_LOGIN_PAYLOADS:
             if not _sqli_take(ctx):
                 return
@@ -4350,7 +4417,7 @@ def _sqli_login_phase(sess, ctx, out):
             resp = _sqli_http(sess, ctx, "POST", action, data=attempt)
             if resp is None:
                 return
-            if _sqli_login_success(resp):
+            if attempt_success(resp):
                 out.append(_sqli_finding(
                     ctx, {"login_bypass"},
                     f"SQL injection — login bypass pada form '{user_field}' ({action})", "critical",
@@ -4358,6 +4425,7 @@ def _sqli_login_phase(sess, ctx, out):
                     f"{resp.status_code} dengan sesi terautentikasi "
                     f"(Location={resp.headers.get('Location', '-')!r}).",
                     "active_sqli_login_bypass"))
+                _sqli_mark_proven(ctx, "login_bypass")
                 return
 
 
@@ -4848,7 +4916,8 @@ def a_sqli_deep(ctx):
         pass
 
     try:
-        _sqli_login_phase(session, ctx, findings)
+        if not _sqli_proven(ctx, "login_bypass"):
+            _sqli_login_phase(session, ctx, findings)
     except Exception:
         pass
 
@@ -4869,18 +4938,26 @@ def a_sqli_deep(ctx):
     _SQLI_PHASE_RESERVE["n"] = 16
     time_done = _sqli_budget_key(ctx) in _SQLI_TIME_HOSTS or bool(
         any("time_based" in f.get("tags", []) for f in findings))
-    union_done = False
+    union_done = _sqli_proven(ctx, "union")
     for index, point in enumerate(points):
         if not _sqli_take(ctx):
             break
         base = _sqli_send(session, ctx, point, point["value"])
         if base is None or base.status_code >= 500:
             continue
+        # Titik yang tidak mengeksekusi query tidak dapat menghasilkan bukti;
+        # lewati fase mahal agar anggaran (240/host bersama) tidak habis pada
+        # halaman-halaman awal sebelum lab yang relevan dipindai.
+        if not _sqli_point_engages(session, ctx, point, base):
+            continue
         try:
-            _sqli_error_phase(session, ctx, point, base, findings)
+            if not _sqli_proven(ctx, "error_based"):
+                _sqli_error_phase(session, ctx, point, base, findings)
             _sqli_cast_phase(session, ctx, point, base, findings)
-            _sqli_cond_error_phase(session, ctx, point, base, findings)
-            _sqli_where_phase(session, ctx, point, base, findings)
+            if not _sqli_proven(ctx, "conditional_errors"):
+                _sqli_cond_error_phase(session, ctx, point, base, findings)
+            if not _sqli_proven(ctx, "where"):
+                _sqli_where_phase(session, ctx, point, base, findings)
             if not union_done and index < 3:
                 _sqli_union_phase(session, ctx, point, base, findings)
                 union_done = bool(any("union" in f.get("tags", []) for f in findings))
@@ -4893,7 +4970,7 @@ def a_sqli_deep(ctx):
                 _sqli_time_retrieval_phase(session, ctx, point, base, findings)
             # Fase boolean paling mahal (differensial dua putaran), jadi
             # dijalankan terakhir agar tidak menghabiskan kuota fase lain.
-            if index < 2 and not any("conditional_responses" in f.get("tags", []) for f in findings):
+            if index < 2 and not _sqli_proven(ctx, "conditional_responses") and not any("conditional_responses" in f.get("tags", []) for f in findings):
                 _sqli_boolean_phase(session, ctx, point, base, findings)
         except Exception as exc:
             ctx.http_log.append({"phase": "sqli", "error": f"{type(exc).__name__}: {exc}"[:200]})
@@ -6108,6 +6185,7 @@ def run_lab_scan(ctx) -> dict[str, Any]:
     _SQLI_TIME_HOSTS.clear()
     _SQLI_ERROR_HOSTS.clear()
     _SQLI_OAST_HOSTS.clear()
+    _SQLI_PROVEN.clear()
     # Cakupan bukan hanya halaman awal: jelajahi tautan, halaman, dan form GET
     # pada origin yang sama, lalu jalankan keluarga probe pada setiap konteks.
     page_contexts = _discover_same_origin_contexts(ctx)
