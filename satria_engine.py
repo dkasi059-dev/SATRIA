@@ -471,14 +471,58 @@ def run_pipeline(
         except Exception as e:
             print(f"[XSS] Scan error: {e}")
 
+    # Build findings with severity for app.py compatibility
+    confirmed_count = 0
+    all_findings: List[dict[str, Any]] = []
+    for r in (results or []):
+        sev = "info"
+        if r.status == "CONFIRMED":
+            confirmed_count += 1
+            sev = "high"  # XSS findings are typically high severity
+            findings.append({
+                "type": "xss",
+                "vector": r.vector,
+                "status": r.status,
+                "detail": r.detail,
+                "severity": sev,
+                "evidence": f"Payload confirmed for vector: {r.vector}",
+                "risk": "Cross-site scripting may allow script execution in victim browsers.",
+                "recommendation": "Validate/encode output contextually; apply CSP; sanitize inputs.",
+            })
+        all_findings.append({
+            "type": "xss",
+            "vector": r.vector,
+            "status": r.status,
+            "detail": r.detail,
+            "severity": sev if r.status == "CONFIRMED" else "info",
+        })
+
+    by_severity = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for fnd in all_findings:
+        s = str(fnd.get("severity", "info")).lower()
+        if s in by_severity:
+            by_severity[s] += 1
+        else:
+            by_severity["info"] += 1
+
+    summary = {
+        "total": len(all_findings),
+        "by_severity": dict(by_severity),
+        "triage_by_severity": dict(by_severity),
+        "confirmed_manual": 0,
+        "candidates_total": confirmed_count,
+        "observations_total": max(0, len(all_findings) - confirmed_count),
+    }
+
     # Generate a minimal report artifact
     report = {
         "scanner": "satria_XSS",
         "target": target,
         "total_vectors": len(PAYLOADS),
-        "confirmed": sum(1 for r in results if r.status == "CONFIRMED") if results else 0,
+        "confirmed": confirmed_count,
         "findings": findings,
         "results": [r._asdict() for r in results] if results else [],
+        "summary": summary,
     }
 
     report_path = out_dir / "xss_report.json"
@@ -613,9 +657,11 @@ def run_pipeline(
     return {
         "status": "completed",
         "target": target,
-        "confirmed": report["confirmed"],
-        "total": report["total_vectors"],
+        "confirmed": confirmed_count,
+        "total": len(PAYLOADS),
         "findings": findings,
+        "summary": summary,
+        "sections": {"http": [], "code": [], "portswigger": []},
         "report_path": str(report_path),
         "pdf_path": str(pdf_path),
     }
