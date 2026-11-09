@@ -345,3 +345,30 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+# ---------------------------------------------------------------------------
+# Runtime configuration (for integration with app.py / engine)
+# ---------------------------------------------------------------------------
+
+
+def configure_runtime(work_dir, **overrides: Any) -> dict[str, Any]:
+    """Terapkan konfigurasi runtime untuk XSS scanner.
+
+    Menerima work_dir sebagai argumen pertama, serta keyword overrides lainnya.
+    Nilai disimpan di _RUNTIME untuk digunakan oleh scanner.
+
+    Contoh:
+        configure_runtime(work_dir, authorized=True, allow_private=True)
+        configure_runtime('/tmp/scans', authorized=False)
+    """
+    _RUNTIME["work_dir"] = work_dir
+    for key, value in overrides.items():
+        if value is not None:
+            _RUNTIME[key] = value
+    return dict(_RUNTIME)
+
+
+# Module-level runtime state
+_RUNTIME: dict[str, Any] = {}
