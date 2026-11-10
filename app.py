@@ -322,11 +322,11 @@ st.markdown(
     <div class="satria-hero">
       <div class="satria-eyebrow">CYBERSECURITY INTELLIGENCE PLATFORM</div>
       <div class="satria-title">S A T R I A</div>
-      <p class="satria-subtitle">Sistem Agen Terpadu Reconnaissance, Intelijen, dan Analisis Ancaman</p>
-      <span class="satria-tag">PASSIVE RECON</span>
-      <span class="satria-tag">ACTIVE RECON</span>
+      <p class="satria-subtitle">Sistem Agen Terpadu Reconnaissance, Intelijen, dan Asesmen</p>
+      <span class="satria-tag">ACTIVE & PASSIVE RECON</span>
       <span class="satria-tag">TECHNOLOGY FINGERPRINTING</span>
       <span class="satria-tag">CVE INTELLIGENCE</span>
+      <span class="satria-tag">ASESMEN KERENTANAN</span>
     </div>
     """,
     unsafe_allow_html=True,
