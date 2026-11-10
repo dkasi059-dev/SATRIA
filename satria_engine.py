@@ -1884,7 +1884,7 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _frameable(headers: dict[str, str] | None) -> tuple[bool, str]:
-        h = Scanner._headers_lower(headers)
+        h = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
         xfo = h.get("x-frame-options", "").lower()
         csp = h.get("content-security-policy", "")
         # XFO
