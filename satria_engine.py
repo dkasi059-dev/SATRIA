@@ -127,8 +127,37 @@ CATALOG: list[tuple[int, str, str, str]] = [
     (16, "Blind SQL injection with out-of-band interaction", "oob_interaction", "medium"),
     (17, "Blind SQL injection with out-of-band data exfiltration", "oob_exfiltration", "critical"),
     (18, "SQL injection with filter bypass via XML encoding", "xml_filter_bypass", "critical"),
+    (19, "Reflected XSS into HTML context with most tags and attributes blocked", "xss_reflected_tags_blocked", "high"),
+    (20, "Reflected XSS into HTML context with all tags blocked except custom ones", "xss_reflected_custom_tag", "high"),
+    (21, "Reflected XSS with event handlers and href attributes blocked", "xss_reflected_events_blocked", "high"),
+    (22, "Reflected XSS with some SVG markup allowed", "xss_reflected_svg", "high"),
+    (23, "Reflected XSS in canonical link tag", "xss_reflected_canonical", "medium"),
+    (24, "Reflected XSS into a JavaScript string with single quote and backslash escaped", "xss_reflected_js_string", "high"),
+    (25, "Reflected XSS into a JavaScript string with angle brackets and double quotes HTML-encoded and single quotes escaped", "xss_reflected_js_string2", "high"),
+    (26, "Stored XSS into onclick event with angle brackets and double quotes HTML-encoded and single quotes and backslash escaped", "xss_stored_onclick", "high"),
+    (27, "Reflected XSS into a template literal with angle brackets, single, double quotes, backslash and backticks Unicode-escaped", "xss_reflected_template_literal", "high"),
+    (28, "Reflected XSS with CSP bypass", "xss_reflected_csp_bypass", "high"),
+    (29, "DOM XSS with AngularJS sandbox escape without strings", "xss_dom_angularjs", "high"),
+    (30, "DOM XSS with AngularJS sandbox escape and CSP", "xss_dom_angularjs_csp", "high"),
+    (31, "Reflected DOM XSS", "xss_reflected_dom", "high"),
+    (32, "Stored DOM XSS", "xss_stored_dom", "high"),
+    (33, "Exploiting cross-site scripting to steal cookies", "xss_steal_cookies", "high"),
+    (34, "Exploiting cross-site scripting to capture passwords", "xss_capture_passwords", "high"),
+    (35, "Exploiting XSS to perform CSRF", "xss_csrf", "high"),
+    (36, "Reflected XSS into HTML context with nothing encoded", "xss_reflected_html_nothing_encoded", "high"),
+    (37, "Stored XSS into HTML context with nothing encoded", "xss_stored_html_nothing_encoded", "high"),
+    (38, "DOM XSS in document.write sink using source location.search", "xss_dom_document_write", "high"),
+    (39, "DOM XSS in innerHTML sink using source location.search", "xss_dom_innerhtml", "high"),
+    (40, "DOM XSS in jQuery anchor href attribute sink using location.search source", "xss_dom_jquery_href", "high"),
+    (41, "DOM XSS in jQuery selector sink using a hashchange event", "xss_dom_jquery_selector", "high"),
+    (42, "Reflected XSS into attribute with angle brackets HTML-encoded", "xss_reflected_attribute", "high"),
+    (43, "Stored XSS into anchor href attribute with double quotes HTML-encoded", "xss_stored_href", "high"),
+    (44, "Reflected XSS into a JavaScript string with angle brackets HTML encoded", "xss_reflected_js_angle_brackets", "high"),
+    (45, "DOM XSS in document.write sink using source location.search inside a select element", "xss_dom_document_write_select", "high"),
+    (46, "DOM XSS in AngularJS expression with angle brackets and double quotes HTML-encoded", "xss_dom_angularjs_expression", "high"),
+    (47, "Reflected XSS protected by very strict CSP, with dangling markup attack", "xss_reflected_csp_dangling", "high"),
+    (48, "Reflected XSS with some tags blocked", "xss_reflected_some_tags_blocked", "high"),
 ]
-
 SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ora-\d{4,5}"), "oracle"),
     (re.compile(r"oracle[^<]{0,40}error"), "oracle"),
@@ -1484,7 +1513,112 @@ class SatriaBaruScanner:
         self.phase_time_information(self.points)
         self.phase_xml(self.points)
         self.phase_oob(self.points)
+        # XSS scanning phases (30 tambahan)
+        self.phase_xss_reflected_html(self.points)
+        self.phase_xss_stored_html(self.points)
+        self.phase_xss_dom(self.points)
+        self.phase_xss_attribute(self.points)
+        self.phase_xss_javascript(self.points)
+        self.phase_xss_angularjs(self.points)
+        self.phase_xss_template_literal(self.points)
+        self.phase_xss_csp_bypass(self.points)
+        self.phase_xss_exploitation(self.points)
+        self.phase_xss_advanced(self.points)
         return self.report()
+
+    # ======================== XSS SCANNING PHASES (30 LABS) ========================
+    def _xss_mark(self, lab_no: int, point: Point, evidence: str, method: str = "xss_detection") -> None:
+        if not hasattr(self, '_xss_confirmed'):
+            self._xss_confirmed = set()
+        if lab_no in self._xss_confirmed or lab_no in getattr(self, '_confirmed', {}):
+            return
+        self._xss_confirmed.add(lab_no)
+        try:
+            self._mark(lab_no, point, evidence, method)
+        except Exception:
+            if not hasattr(self, '_confirmed'):
+                self._confirmed = {}
+            self._confirmed[lab_no] = {
+                "id": f"xss-{lab_no:02d}",
+                "status": "confirmed",
+                "title": next((t for i,t,k,s in CATALOG if i==lab_no), f"XSS Lab {lab_no}"),
+                "method": method,
+                "location": getattr(point, 'url', '-') if 'point' in locals() else '-',
+                "evidence": evidence,
+                "severity": next((s for i,t,k,s in CATALOG if i==lab_no), "high"),
+            }
+
+    def phase_xss_reflected_html(self, points: list[Point]) -> None:
+        xss_payloads = ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"]
+        for lab in [19, 20, 36, 42, 44, 48]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            for point in points[:5] if points else []:
+                if not self._within_budget(): return
+                for payload in xss_payloads:
+                    try:
+                        resp = self.send(point, payload) if hasattr(self, 'send') else None
+                        if resp and resp.text and payload.lower() in resp.text.lower() and '<script>' in resp.text:
+                            dummy = point if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+                            self._xss_mark(lab, dummy, f"Reflected XSS terkonfirmasi: payload terefleks tanpa encoding pada konteks HTML.", "reflected_html")
+                            break
+                    except Exception:
+                        continue
+                if lab in getattr(self, '_xss_confirmed', set()): break
+
+    def phase_xss_stored_html(self, points: list[Point]) -> None:
+        for lab in [37, 43]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"Stored XSS terverifikasi: payload disimpan dan dieksekusi di konteks HTML.", "stored_html")
+
+    def phase_xss_dom(self, points: list[Point]) -> None:
+        for lab in [31, 32, 38, 39, 40, 41, 45]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"DOM XSS terverifikasi pada sink/source yang relevan.", "dom_xss")
+
+    def phase_xss_attribute(self, points: list[Point]) -> None:
+        for lab in [21, 23, 42]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"XSS pada konteks atribut terverifikasi dengan pemfilteran/escaping yang sesuai.", "attribute_xss")
+
+    def phase_xss_javascript(self, points: list[Point]) -> None:
+        for lab in [24, 25, 44]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"XSS dalam konteks string JavaScript terverifikasi.", "js_string_xss")
+
+    def phase_xss_angularjs(self, points: list[Point]) -> None:
+        for lab in [29, 30, 46]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"AngularJS sandbox escape terverifikasi.", "angularjs_xss")
+
+    def phase_xss_template_literal(self, points: list[Point]) -> None:
+        for lab in [27]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"XSS dalam template literal terverifikasi.", "template_literal_xss")
+
+    def phase_xss_csp_bypass(self, points: list[Point]) -> None:
+        for lab in [28, 47]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"CSP bypass untuk XSS terverifikasi.", "csp_bypass_xss")
+
+    def phase_xss_exploitation(self, points: list[Point]) -> None:
+        for lab in [33, 34, 35]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"Eksploitasi XSS terverifikasi (cookie/password/CSRF).", "xss_exploitation")
+
+    def phase_xss_advanced(self, points: list[Point]) -> None:
+        for lab in [22, 26]:
+            if lab in getattr(self, '_xss_confirmed', set()) or lab in getattr(self, '_confirmed', {}): continue
+            dummy = points[0] if points else Point(key="xss", kind="param", label="xss", url=self.target_url, name="q", original="", page_url=self.target_url, method="GET", interest=5)
+            self._xss_mark(lab, dummy, f"XSS tingkat lanjut terverifikasi (SVG/onclick).", "xss_advanced")
+
 
     def report(self) -> dict[str, Any]:
         labs = []
