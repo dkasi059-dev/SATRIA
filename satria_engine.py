@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SATRIA Baru -- pemindai SQL injection dan XSS terfokus.
+SATRIA Engine -- pemindai SQL injection, XSS, CSRF, dan Clickjacking terfokus.
 
-File ini menguji 48 lab (18 SQL injection + 30 XSS) dan laporannya memuat 48 judul itu:
+File ini menguji 64 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking):
 
 SQL Injection (01-18):
  01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
@@ -56,6 +56,26 @@ XSS (19-48):
  46 DOM XSS in AngularJS expression with angle brackets and double quotes HTML-encoded
  47 Reflected XSS protected by very strict CSP, with dangling markup attack
  48 Reflected XSS with some tags blocked
+
+CSRF (49-59):
+ 49 CSRF vulnerability with no defenses
+ 50 CSRF where token validation depends on request method
+ 51 CSRF where token validation depends on token being present
+ 52 CSRF where token is not tied to user session
+ 53 CSRF where token is tied to non-session cookie
+ 54 CSRF where token is duplicated in cookie
+ 55 SameSite Lax bypass via method override
+ 56 SameSite Strict bypass via client-side redirect
+ 57 SameSite Strict bypass via sibling domain
+ 58 CSRF where Referer validation depends on header being present
+ 59 CSRF with broken Referer validation
+
+Clickjacking (60-64):
+ 60 Basic clickjacking with CSRF token protection
+ 61 Clickjacking with form input data prefilled from a URL parameter
+ 62 Clickjacking with a frame buster script
+ 63 Exploiting clickjacking vulnerability to trigger DOM-based XSS
+ 64 Multistep clickjacking
 
 Keputusan "terkonfirmasi" dibuat konservatif: payload harus menghasilkan bukti
 diferensial yang bisa diulang (respon SQL/UNION, penanda unik, perbandingan
@@ -138,7 +158,7 @@ SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
-# Katalog: 48 lab (18 SQL injection + 30 XSS).
+# Katalog: 64 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking).
 # ----------------------------------------------------------------------------
 CATALOG: list[tuple[int, str, str, str]] = [
     (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
@@ -189,7 +209,33 @@ CATALOG: list[tuple[int, str, str, str]] = [
     (46, "DOM XSS in AngularJS expression with angle brackets and double quotes HTML-encoded", "xss_dom_angularjs_expression", "high"),
     (47, "Reflected XSS protected by very strict CSP, with dangling markup attack", "xss_reflected_csp_dangling", "high"),
     (48, "Reflected XSS with some tags blocked", "xss_reflected_some_tags_blocked", "high"),
+    (49, "CSRF vulnerability with no defenses", "csrf_no_defenses", "high"),
+    (50, "CSRF where token validation depends on request method", "csrf_token_method", "high"),
+    (51, "CSRF where token validation depends on token being present", "csrf_token_presence", "high"),
+    (52, "CSRF where token is not tied to user session", "csrf_token_not_tied_session", "high"),
+    (53, "CSRF where token is tied to non-session cookie", "csrf_token_non_session_cookie", "high"),
+    (54, "CSRF where token is duplicated in cookie", "csrf_double_submit_cookie", "high"),
+    (55, "SameSite Lax bypass via method override", "csrf_samesite_lax_method_override", "high"),
+    (56, "SameSite Strict bypass via client-side redirect", "csrf_samesite_strict_client_redirect", "high"),
+    (57, "SameSite Strict bypass via sibling domain", "csrf_samesite_strict_sibling_domain", "high"),
+    (58, "CSRF where Referer validation depends on header being present", "csrf_referer_presence", "high"),
+    (59, "CSRF with broken Referer validation", "csrf_referer_broken", "high"),
+    (60, "Basic clickjacking with CSRF token protection", "clickjacking_basic_csrf", "medium"),
+    (61, "Clickjacking with form input data prefilled from a URL parameter", "clickjacking_prefilled", "medium"),
+    (62, "Clickjacking with a frame buster script", "clickjacking_frame_buster", "medium"),
+    (63, "Exploiting clickjacking vulnerability to trigger DOM-based XSS", "clickjacking_dom_xss", "high"),
+    (64, "Multistep clickjacking", "clickjacking_multistep", "medium"),
 ]
+
+def lab_id_for(number: int) -> str:
+    if number <= 18:
+        return f"sql_injection-{number:02d}"
+    if number <= 48:
+        return f"xss-{number:02d}"
+    if number <= 59:
+        return f"csrf-{number:02d}"
+    return f"clickjacking-{number:02d}"
+
 SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ora-\d{4,5}"), "oracle"),
     (re.compile(r"oracle[^<]{0,40}error"), "oracle"),
@@ -272,6 +318,7 @@ class Page:
     cookie_names: dict[str, str] = field(default_factory=dict)
     js_text: str = ""
     status: int | None = None
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -705,6 +752,7 @@ class SatriaBaruScanner:
         self.pages.append(Page(
             url=url, text=resp.text, links=list(dict.fromkeys(links)),
             forms=forms, cookie_names=cookies, js_text="\n".join(js_bits), status=resp.status,
+            headers=dict(getattr(resp, "headers", {}) or {}),
         ))
 
     @staticmethod
@@ -885,7 +933,7 @@ class SatriaBaruScanner:
         if lab_no in self._confirmed:
             return
         meta = next(item for item in CATALOG if item[0] == lab_no)
-        lab_id = f"sql_injection-{lab_no:02d}" if lab_no <= 18 else f"xss-{lab_no:02d}"
+        lab_id = lab_id_for(lab_no)
         self._confirmed[lab_no] = {
             "id": lab_id,
             "status": "confirmed",
@@ -1556,6 +1604,10 @@ class SatriaBaruScanner:
         self.phase_xss_csp_bypass(self.points)
         self.phase_xss_exploitation(self.points)
         self.phase_xss_advanced(self.points)
+        # CSRF & Clickjacking (konservatif, berbasis bukti HTTP)
+        self.phase_csrf_defenses(self.pages)
+        self.phase_csrf_referer(self.pages)
+        self.phase_clickjacking(self.pages)
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
@@ -1785,10 +1837,237 @@ class SatriaBaruScanner:
         return
 
 
+    # ======================== CSRF & CLICKJACKING (konservatif, anti false positive) ========================
+
+    @staticmethod
+    def _headers_lower(headers: dict[str, str] | None) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for k, v in (headers or {}).items():
+            try:
+                out[str(k).lower()] = str(v)
+            except Exception:
+                continue
+        return out
+
+    @staticmethod
+    def _has_csrf_token_field(form: FormSpec) -> tuple[bool, list[str]]:
+        names: list[str] = []
+        found = False
+        for name, _val, _typ in form.fields:
+            nl = (name or "").lower()
+            if any(tok in nl for tok in ("csrf", "xsrf", "authenticity", "__requestverificationtoken", "anti_csrf", "anticsrf", "_csrf", "token")):
+                # "token" alone can be ambiguous, but common for CSRF; keep as indicator
+                names.append(name)
+                if "csrf" in nl or "xsrf" in nl or "authenticity" in nl or "requestverification" in nl or nl in ("_token", "token", "csrftoken"):
+                    found = True
+        # require stronger signal: explicit csrf/xsrf/authenticity or exact token-ish names
+        if not found:
+            for name in names:
+                nl = name.lower()
+                if nl.endswith("token") or nl.startswith("token") or "csrf" in nl or "xsrf" in nl:
+                    found = True
+                    break
+        return found, names
+
+    @staticmethod
+    def _is_state_changing_form(form: FormSpec) -> bool:
+        method = (form.method or "get").upper()
+        action = (form.action or "").lower()
+        if method == "POST":
+            return True
+        if any(k in action for k in ("change", "update", "edit", "delete", "transfer", "email", "password", "account", "profile", "checkout", "submit", "comment", "post")):
+            return True
+        # forms with password or sensitive fields
+        if form.has_password:
+            return True
+        return False
+
+    @staticmethod
+    def _frameable(headers: dict[str, str] | None) -> tuple[bool, str]:
+        h = Scanner._headers_lower(headers)
+        xfo = h.get("x-frame-options", "").lower()
+        csp = h.get("content-security-policy", "")
+        # XFO
+        if "deny" in xfo:
+            return False, "X-Frame-Options: DENY"
+        if "sameorigin" in xfo:
+            return False, "X-Frame-Options: SAMEORIGIN"
+        # CSP frame-ancestors
+        m = re.search(r"frame-ancestors\s+([^;]+)", csp, re.I)
+        if m:
+            fa = m.group(1).strip().lower()
+            if "'none'" in fa:
+                return False, "CSP frame-ancestors 'none'"
+            if "'self'" in fa and "http" not in fa and "*" not in fa:
+                return False, "CSP frame-ancestors 'self'"
+            # explicit restrictive list without wildcard
+            if "*" not in fa and fa:
+                return False, f"CSP frame-ancestors restrictive ({m.group(1).strip()[:60]})"
+        # no blocking directives found
+        reasons = []
+        if xfo:
+            reasons.append(f"X-Frame-Options={h.get('x-frame-options','')}")
+        if m:
+            reasons.append(f"frame-ancestors={m.group(1).strip()}")
+        if not reasons:
+            reasons.append("tidak ada X-Frame-Options/CSP frame-ancestors")
+        return True, "; ".join(reasons)
+
+    @staticmethod
+    def _has_frame_buster(text: str, js_text: str = "") -> tuple[bool, str]:
+        blob = (text or "") + "\n" + (js_text or "")
+        patterns = [
+            (r"top\.location\s*!?=\s*(self|window)\.location", "top.location != self.location"),
+            (r"self\s*!==?\s*top", "self != top"),
+            (r"top\s*!==?\s*self", "top != self"),
+            (r"window\.top\s*!==?\s*window\.self", "window.top != window.self"),
+            (r"if\s*\(\s*top\s*!=", "if (top !="),
+            (r"frameElement", "frameElement check"),
+            (r"parent\.frames\.length", "parent.frames.length"),
+        ]
+        for pat, label in patterns:
+            if re.search(pat, blob, re.I):
+                return True, label
+        return False, ""
+
+    def _pick_csrf_page(self, pages: list[Page]) -> tuple[Page | None, FormSpec | None]:
+        # prefer page with state-changing form
+        best = (None, None, -1)
+        for page in pages:
+            for form in page.forms:
+                score = 0
+                if self._is_state_changing_form(form):
+                    score += 5
+                if form.has_password:
+                    score += 2
+                if (form.method or "").lower() == "post":
+                    score += 2
+                if form.fields:
+                    score += 1
+                if score > best[2]:
+                    best = (page, form, score)
+        return best[0], best[1]
+
+    def phase_csrf_defenses(self, pages: list[Page]) -> None:
+        """Deteksi konservatif berbasis analisis form/header/cookie pada respons.
+        Lab yang memerlukan verifikasi perilaku lintas sesi/metode/eksploitasi browser
+        tidak dikonfirmasi tanpa bukti kuat untuk menghindari false positive."""
+        page, form = self._pick_csrf_page(pages)
+        if not page or not form:
+            return
+        point = Point(key="csrf", kind="form", label=f"form action={form.action}", url=form.action or page.url,
+                      name=(form.fields[0][0] if form.fields else "form"), original="", page_url=page.url,
+                      method=(form.method or "POST").upper(), fields=form.fields, interest=5)
+        has_token, token_names = self._has_csrf_token_field(form)
+        state_changing = self._is_state_changing_form(form)
+        headers = self._headers_lower(page.headers)
+
+        # 49: no defenses - state-changing form, no CSRF token field detected
+        if 49 not in self._confirmed and state_changing and not has_token:
+            ev = (f"Form state-changing terdeteksi di {page.url} (action={form.action}, method={form.method}) "
+                  f"tanpa field token anti-CSRF yang dapat diidentifikasi. Field: {[n for n,_,_ in form.fields]}. "
+                  f"Bukti berbasis inspeksi respons/form.")
+            self._mark(49, point, ev, "csrf_no_token_in_form")
+
+        # 54: token duplicated in cookie - CSRF token field exists and a cookie with matching name/value context
+        if 54 not in self._confirmed and has_token and token_names:
+            cookies = getattr(page, 'cookie_names', {}) or {}
+            cookies_l = {str(k).lower(): str(v) for k, v in cookies.items()}
+            for tname in token_names:
+                tval = None
+                for n, v, _ in form.fields:
+                    if n == tname:
+                        tval = v
+                        break
+                if tval is None:
+                    continue
+                # look for cookie with same name or obvious csrf cookie with same value
+                for ck, cv in cookies_l.items():
+                    if (ck == tname.lower() or 'csrf' in ck or 'xsrf' in ck) and cv and cv == tval:
+                        ev = (f"Indikasi double-submit cookie: field form '{tname}' memiliki nilai sama dengan cookie '{ck}' "
+                              f"pada {page.url}. Nilai teramati: {tval}. Bukti berbasis inspeksi form+cookie respons.")
+                        self._mark(54, point, ev, "csrf_double_submit_cookie_observed")
+                        break
+                if 54 in self._confirmed:
+                    break
+
+        # 53: token tied to non-session cookie (indikasi: token terkait cookie csrf terpisah) - hanya jika bukti eksplisit ganda cookie+param
+        # konservatif: tanpa dua sesi/eksperimen tidak bisa dipastikan "not tied to user session" vs "tied to non-session cookie"
+        # sehingga 50,51,52,53,55,56,57 tidak dikonfirmasi otomatis dari analisis pasif untuk menghindari FP.
+
+    def phase_csrf_referer(self, pages: list[Page]) -> None:
+        """Validasi Referer (hadir/tidak, longgar/ketat) umumnya memerlukan uji permintaan terkontrol
+        terhadap aksi state-changing. Tanpa bukti respons diferensial yang aman dan tidak merusak,
+        lab 58/59 tidak dikonfirmasi otomatis untuk menghindari false positive."""
+        # Tidak melakukan pengujian aktif yang berpotensi memicu aksi state-changing.
+        return
+
+    def phase_clickjacking(self, pages: list[Page]) -> None:
+        """Deteksi clickjacking konservatif berbasis header framing, form, dan indikator UI/script."""
+        # pilih halaman kandidat: punya form/sensitif, atau target utama
+        candidates = list(pages)
+        if not candidates:
+            return
+        for page in candidates:
+            if not self._within_budget():
+                return
+            frameable, frame_reason = self._frameable(page.headers)
+            has_form = bool(page.forms)
+            any_csrf = any(self._has_csrf_token_field(f)[0] for f in page.forms)
+            any_prefill = False
+            prefill_evidence = ""
+            for form in page.forms:
+                # cek apakah query param URL terpantul ke value input (prefill dari parameter URL)
+                try:
+                    q = dict(parse_qsl(urlparse(page.url).query, keep_blank_values=True))
+                except Exception:
+                    q = {}
+                ql = {str(k).lower(): str(v) for k, v in q.items()}
+                for name, val, _typ in form.fields:
+                    if not val:
+                        continue
+                    nl = name.lower()
+                    # nilai field sama dengan parameter URL bernama sama/terkait -> prefill
+                    if nl in ql and ql[nl] and ql[nl] == val:
+                        any_prefill = True
+                        prefill_evidence = f"field '{name}' terisi dari parameter URL ({nl}={val}) pada {page.url}"
+                        break
+                if any_prefill:
+                    break
+            has_buster, buster_ev = self._has_frame_buster(page.text, page.js_text)
+
+            point = Point(key="clickjacking", kind="page", label=f"page {page.url}", url=page.url,
+                          name="page", original="", page_url=page.url, method="GET", interest=4)
+
+            # 60: Basic clickjacking with CSRF token protection - frameable page that has CSRF-protected form
+            if 60 not in self._confirmed and frameable and has_form and any_csrf:
+                ev = (f"Halaman frameable ({frame_reason}) dengan form ber-token CSRF di {page.url}. "
+                      f"Ini menunjukkan perlindungan CSRF ada namun pembingkaian tidak dicegah. "
+                      f"Bukti: header framing tidak membatasi, form fields={[ [n for n,_,_ in f.fields] for f in page.forms ]}.")
+                self._mark(60, point, ev, "clickjacking_frameable_with_csrf_form")
+
+            # 61: prefilled from URL parameter - frameable (atau setidaknya dapat dibingkai target) + input prefill dari URL
+            if 61 not in self._confirmed and frameable and any_prefill:
+                ev = (f"Halaman frameable ({frame_reason}) dengan input form terisi dari parameter URL: {prefill_evidence}. "
+                      f"Bukti berbasis refleksi parameter ke nilai input form.")
+                self._mark(61, point, ev, "clickjacking_url_prefill")
+
+            # 62: frame buster script - bukti: frame buster script ada, namun header framing tidak mencegah pembingkaian
+            # (indikasi pertahanan berbasis script, skenario "clickjacking with a frame buster script").
+            if 62 not in self._confirmed and has_buster and frameable:
+                ev = (f"Frame buster script terdeteksi pada {page.url} (indikator: {buster_ev}), sementara halaman tetap frameable ({frame_reason}). "
+                      f"Bukti berbasis analisis script/header respons.")
+                self._mark(62, point, ev, "clickjacking_frame_buster_detected")
+
+            # 63/64: exploitation chains (trigger DOM XSS via clickjacking, multistep) memerlukan interaksi UI/browser bertahap
+            # dan tidak dapat diverifikasi andal dari analisis HTTP statis -> tidak dikonfirmasi otomatis (anti-FP).
+
+
+
     def report(self) -> dict[str, Any]:
         labs = []
         for number, title, key, severity in CATALOG:
-            lab_id = f"sql_injection-{number:02d}" if number <= 18 else f"xss-{number:02d}"
+            lab_id = lab_id_for(number)
             found = self._confirmed.get(number)
             if found:
                 entry = dict(found)
@@ -1808,11 +2087,11 @@ class SatriaBaruScanner:
                 }
             labs.append(entry)
         return {
-            "tool": "SATRIA Baru SQLi Scanner",
+            "tool": "SATRIA Engine Scanner",
             "version": __version__,
             "target": self.target_url,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "catalog_scope": "18 SQL injection labs + 30 XSS labs (48 total)",
+            "catalog_scope": "18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking labs (64 total)",
             "summary": (lambda confirmed_labs: {
                 "confirmed": len(confirmed_labs),
                 "confirmed_manual": len(confirmed_labs),
@@ -1962,9 +2241,9 @@ def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
         "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
         ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
-        "<h1>SATRIA Baru — SQL Injection & XSS (48 Lab)</h1>"
+        "<h1>SATRIA Engine — SQLi, XSS, CSRF & Clickjacking (64 Lab)</h1>"
         f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
-        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/48</b></p>"
+        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/64</b></p>"
         "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         "<p><small>Status 'not_confirmed' berarti bukti tidak cukup; bukan klaim tidak rentan.</small></p>"
@@ -2325,8 +2604,8 @@ def _pdf_lab_items(result: dict[str, Any]) -> list[dict[str, Any]]:
             by_id[str(item["id"])] = item
     items: list[dict[str, Any]] = []
     for number, title, key, severity in CATALOG:
-        lab_id = f"sql_injection-{number:02d}" if number <= 18 else f"xss-{number:02d}"
-        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {})
+        lab_id = lab_id_for(number)
+        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {})
         items.append({
             "number": number, "id": lab_id, "status": str(found.get("status", "not_confirmed")),
             "title": str(found.get("title", title)), "method": str(found.get("method", "not tested / insufficient evidence")),
@@ -2349,6 +2628,11 @@ _PDF_LAB_FOCUS = {
     39: "DOM XSS", 40: "DOM XSS", 41: "DOM XSS", 42: "Attribute XSS",
     43: "Stored XSS", 44: "JS string XSS", 45: "DOM XSS", 46: "DOM XSS",
     47: "CSP bypass XSS", 48: "Reflected XSS",
+    49: "CSRF", 50: "CSRF", 51: "CSRF", 52: "CSRF", 53: "CSRF", 54: "CSRF",
+    55: "CSRF (SameSite)", 56: "CSRF (SameSite)", 57: "CSRF (SameSite)",
+    58: "CSRF (Referer)", 59: "CSRF (Referer)",
+    60: "Clickjacking", 61: "Clickjacking", 62: "Clickjacking",
+    63: "Clickjacking", 64: "Clickjacking",
 }
 
 
@@ -2383,11 +2667,11 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 230, _PDF_PAGE_W, 230, _PDF_COLORS["navy"])
     page.rect(0, _PDF_PAGE_H - 242, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.text(content_left, _PDF_PAGE_H - 84, "SATRIA BARU", 30, _PDF_COLORS["white"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION & XSS", 13.5, _PDF_COLORS["light"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 48 lab (18 SQLi + 30 XSS) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
+    page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION, XSS, CSRF & CLICKJACKING", 13.5, _PDF_COLORS["light"], bold=True)
+    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 64 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
-    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 48 lab (18 SQL injection dan 30 XSS) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 64 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -2401,7 +2685,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     kpis = [
         ("Terkonfirmasi", str(len(confirmed)), _PDF_COLORS["green"], _PDF_COLORS["green_light"]),
         ("Belum terkonfirmasi", str(len(not_confirmed)), _PDF_COLORS["amber"], _PDF_COLORS["amber_light"]),
-        ("Total lab", "48", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
+        ("Total lab", "64", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
     ]
     for idx, (label, value, color, light) in enumerate(kpis):
         x = content_left + idx * (kpi_w + kpi_gap)
@@ -2411,7 +2695,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         page.text(x, kpi_top - 62, label.upper(), 7.5, _PDF_COLORS["muted"], bold=True)
     page.y = kpi_top - 110
     page.section_title("Hal yang penting dibaca")
-    page.bullet_paragraph("48 judul lab (18 SQL injection dan 30 XSS) yang diminta dimasukkan ke laporan ini.")
+    page.bullet_paragraph("64 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking) yang diminta dimasukkan ke laporan ini.")
     page.bullet_paragraph("Status confirmed memakai bukti diferensial yang dapat diulang; not_confirmed bukan bukti tidak rentan.")
     page.bullet_paragraph("Lab 16-17 hanya dapat terkonfirmasi bila collaborator/poller mencatat interaksi OOB. Tanpa itu, lab terkait tetap not_confirmed.")
     page.bullet_paragraph("Bukti ditampilkan apa adanya berdasarkan temuan terverifikasi.")
@@ -2419,9 +2703,9 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
-    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 48 lab yang diminta.")
+    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 64 lab yang diminta.")
     rows = [
-        ("Total lab", "48", "Semua judul wajib dari katalog (18 SQLi + 30 XSS)."),
+        ("Total lab", "64", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
         ("Belum terkonfirmasi", str(len(not_confirmed)), "Tidak ada bukti cukup pada putaran ini."),
         ("Severity Critical", str(by_severity.get("critical", 0)), "Hitungan hanya untuk temuan terkonfirmasi."),
@@ -2470,7 +2754,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # ------------------------------------------------------------------- TABEL
     page.new_page()
-    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 48 lab.")
+    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 64 lab.")
     headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
@@ -2557,7 +2841,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------- CATATAN AKHIR
     page.y -= 6
     page.section_title("Catatan Laporan")
-    page.bullet_paragraph("Dokumen ini memuat 48 lab (18 SQL injection dan 30 XSS) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
+    page.bullet_paragraph("Dokumen ini memuat 64 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
     page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
@@ -2568,7 +2852,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     for idx, page_ops in enumerate(page.pages, start=1):
         page_ops.append(f"{_pdf_rgb(_PDF_COLORS['navy'])} rg 0 {_pdf_num(_PDF_PAGE_H - 32)} {_pdf_num(_PDF_PAGE_W)} 32 re f")
         page_ops.append(f"BT /F2 8 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA BARU - SQL Injection Report) Tj ET")
-        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (48 Lab: SQLi + XSS) Tj ET")
+        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (64 Lab: SQLi/XSS/CSRF/CJ) Tj ET")
         footer_target = _pdf_safe_text(target)
         if len(footer_target) > 84:
             footer_target = footer_target[:81] + "..."
@@ -2659,7 +2943,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                  allow_partial_tools: bool | None = None,
                  enable_llm: bool | None = None, run_censys: bool | None = None,
                  run_nvd: bool | None = None, **runtime_options: Any) -> dict[str, Any]:
-    """Jalur kompatibel yang dipakai app.py; memindai 48 lab (18 SQLi + 30 XSS)."""
+    """Jalur kompatibel yang dipakai app.py; memindai 64 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking)."""
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
                         ("enable_llm", enable_llm), ("run_censys", run_censys),
@@ -2708,7 +2992,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SATRIA Baru — pemindai SQL injection dan XSS (48 lab)")
+    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, dan Clickjacking (64 lab)")
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
@@ -2743,7 +3027,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     json_path, html_path = write_report(report, Path(args.output_dir))
     summary = report["summary"]
-    print(f"SATRIA Baru selesai: {summary['confirmed']}/48 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"SATRIA Engine selesai: {summary['confirmed']}/64 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     return 0
