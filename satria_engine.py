@@ -59,6 +59,59 @@ except Exception:  # pragma: no cover
 __version__ = "2.0.0"
 USER_AGENT = "SATRIA-XSS/" + __version__ + " (+authorized XSS assessment)"
 
+
+# --- Ketahanan HTTP PortSwigger (504/502/503/timeout) ---
+_SATRIA_PS_RETRY = {408, 425, 429, 500, 502, 503, 504}
+_SATRIA_PS_HOST = ".web-security-academy.net"
+
+def _satria_is_ps(url) -> bool:
+    try:
+        host = (urlparse(str(url)).hostname or "").lower().rstrip(".")
+        return host == "web-security-academy.net" or host.endswith(_SATRIA_PS_HOST)
+    except Exception:
+        return False
+
+def _satria_retry_wrap(orig, session, method, url, kwargs):
+    mu = str(method or "GET").upper()
+    if mu not in {"GET", "HEAD", "OPTIONS"} or not _satria_is_ps(url):
+        return orig(session, method, url, **kwargs)
+    attempts = 4
+    last = None
+    for i in range(attempts):
+        try:
+            resp = orig(session, method, url, **kwargs)
+            st = int(getattr(resp, "status_code", 0) or 0)
+            if st not in _SATRIA_PS_RETRY or i >= attempts - 1:
+                return resp
+            try:
+                resp.close()
+            except Exception:
+                pass
+            ra = None
+            try:
+                ra = int(float((getattr(resp, "headers", {}) or {}).get("Retry-After", "")))
+            except Exception:
+                ra = None
+            time.sleep(max(0.5, min(float(ra if ra is not None else min(8.0, 1.5 * (2 ** i))), 12.0)))
+        except Exception as exc:
+            last = exc
+            if i >= attempts - 1:
+                raise
+            time.sleep(min(8.0, 1.5 * (2 ** i)))
+    if last:
+        raise last
+    raise RuntimeError("PortSwigger request failed")
+
+if requests is not None:
+    _orig_req = requests.sessions.Session.request
+    if not getattr(_orig_req, "_satria_ps_retry", False):
+        def _patched(self, method, url, **kwargs):
+            return _satria_retry_wrap(_orig_req, self, method, url, kwargs)
+        _patched._satria_ps_retry = True
+        _patched._satria_original = _orig_req
+        requests.sessions.Session.request = _patched
+
+
 # ---------------------------------------------------------------------------
 # Runtime globals (kompatibel app.py / pola satria_baru.py)
 # ---------------------------------------------------------------------------
@@ -579,28 +632,47 @@ class SatriaXSSScanner:
         self.stats["requests"] = self.request_count
         if self.time_delay > 0:
             time.sleep(self.time_delay)
+        attempts = 4 if _satria_is_ps(url) and method.upper() in {"GET", "HEAD", "OPTIONS"} else 1
         started = time.monotonic()
-        try:
-            raw = self.session.request(method.upper(), url, params=params, data=data,
-                                       timeout=self.timeout, allow_redirects=allow_redirects, verify=True)
-            elapsed = time.monotonic() - started
-            headers = {str(k): str(v) for k, v in (raw.headers or {}).items()}
-            text = raw.text or ""
-            if len(text) > 900000:
-                text = text[:900000]
-            for key, value in headers.items():
-                lk = key.lower()
-                if lk == "content-security-policy" and not self._csp_header:
-                    self._csp_header = value
-                if lk == "set-cookie":
-                    self._set_cookies.append(value)
-            return Response(raw.status_code, str(raw.url), text, headers, elapsed)
-        except Exception as exc:
-            elapsed = time.monotonic() - started
-            msg = type(exc).__name__ + ": " + str(exc)
-            if len(self.stats["errors"]) < 60:
-                self.stats["errors"].append(msg[:220])
-            return Response(None, url, "", {}, elapsed, msg)
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                raw = self.session.request(method.upper(), url, params=params, data=data,
+                                           timeout=self.timeout, allow_redirects=allow_redirects, verify=True)
+                st = int(getattr(raw, "status_code", 0) or 0)
+                if attempts > 1 and st in _SATRIA_PS_RETRY and attempt < attempts - 1:
+                    try:
+                        raw.close()
+                    except Exception:
+                        pass
+                    time.sleep(min(8.0, 1.2 * (2 ** attempt)))
+                    continue
+                elapsed = time.monotonic() - started
+                headers = {str(k): str(v) for k, v in (raw.headers or {}).items()}
+                text = raw.text or ""
+                if len(text) > 900000:
+                    text = text[:900000]
+                for key, value in headers.items():
+                    lk = key.lower()
+                    if lk == "content-security-policy" and not self._csp_header:
+                        self._csp_header = value
+                    if lk == "set-cookie":
+                        self._set_cookies.append(value)
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+                return Response(st, str(getattr(raw, "url", url)), text, headers, elapsed)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts - 1:
+                    time.sleep(min(8.0, 1.2 * (2 ** attempt)))
+                    continue
+        elapsed = time.monotonic() - started
+        msg = type(last_exc).__name__ + ": " + str(last_exc) if last_exc else "request_failed"
+        if len(self.stats["errors"]) < 60:
+            self.stats["errors"].append(msg[:220])
+        return Response(None, url, "", {}, elapsed, msg)
 
     def _get(self, url: str, params=None) -> Response:
         return self._request("GET", url, params=params)
