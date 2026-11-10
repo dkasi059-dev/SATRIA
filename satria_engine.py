@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SATRIA Engine -- pemindai SQL injection, XSS, CSRF, dan Clickjacking terfokus.
+SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, dan DOM-based vulnerabilities terfokus.
 
-File ini menguji 64 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking):
+File ini menguji 71 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based vulnerabilities):
 
 SQL Injection (01-18):
  01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
@@ -158,7 +158,7 @@ SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
-# Katalog: 64 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking).
+# Katalog: 71 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based).
 # ----------------------------------------------------------------------------
 CATALOG: list[tuple[int, str, str, str]] = [
     (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
@@ -225,6 +225,14 @@ CATALOG: list[tuple[int, str, str, str]] = [
     (62, "Clickjacking with a frame buster script", "clickjacking_frame_buster", "medium"),
     (63, "Exploiting clickjacking vulnerability to trigger DOM-based XSS", "clickjacking_dom_xss", "high"),
     (64, "Multistep clickjacking", "clickjacking_multistep", "medium"),
+    # DOM-based vulnerabilities (65-71)
+    (65, "DOM XSS using web messages", "dom_xss_web_messages", "high"),
+    (66, "DOM XSS using web messages and a JavaScript URL", "dom_xss_web_messages_js_url", "high"),
+    (67, "DOM XSS using web messages and JSON.parse", "dom_xss_web_messages_json_parse", "high"),
+    (68, "DOM-based open redirection", "dom_open_redirection", "medium"),
+    (69, "DOM-based cookie manipulation", "dom_cookie_manipulation", "medium"),
+    (70, "Exploiting DOM clobbering to enable XSS", "dom_clobbering_xss", "high"),
+    (71, "Clobbering DOM attributes to bypass HTML filters", "dom_clobbering_attributes_bypass", "high"),
 ]
 
 def lab_id_for(number: int) -> str:
@@ -234,7 +242,9 @@ def lab_id_for(number: int) -> str:
         return f"xss-{number:02d}"
     if number <= 59:
         return f"csrf-{number:02d}"
-    return f"clickjacking-{number:02d}"
+    if number <= 64:
+        return f"clickjacking-{number:02d}"
+    return f"dom-{number:02d}"
 
 SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ora-\d{4,5}"), "oracle"),
@@ -1608,6 +1618,8 @@ class SatriaBaruScanner:
         self.phase_csrf_defenses(self.pages)
         self.phase_csrf_referer(self.pages)
         self.phase_clickjacking(self.pages)
+        # DOM-based vulnerabilities (konservatif, analisis statis JS/HTML; tanpa eksekusi browser)
+        self.phase_dom_based(self.pages)
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
@@ -2064,6 +2076,139 @@ class SatriaBaruScanner:
 
 
 
+    # ======================== DOM-BASED VULNERABILITIES (konservatif, analisis statis) ========================
+
+    @staticmethod
+    def _script_blocks(page: Page) -> list[str]:
+        blocks: list[str] = []
+        src = page.text or ""
+        for m in re.finditer(r"<script\b[^>]*>(.*?)</script>", src, re.I | re.S):
+            blocks.append(m.group(1) or "")
+        if page.js_text:
+            blocks.append(page.js_text)
+        return [b for b in blocks if b and b.strip()]
+
+    @staticmethod
+    def _has_message_listener(js: str) -> bool:
+        return bool(re.search(r"addEventListener\s*\(\s*['\"]message['\"]", js, re.I) or
+                    re.search(r"\bonmessage\s*=", js, re.I) or
+                    re.search(r"window\s*\.\s*onmessage\b", js, re.I))
+
+    @staticmethod
+    def _msg_data_used(js: str) -> bool:
+        # event.data / e.data / msg.data / message.data referenced
+        return bool(re.search(r"\b(?:event|e|msg|message|evt)\s*\.\s*data\b", js))
+
+    @staticmethod
+    def _dangerous_html_sink(js: str) -> bool:
+        return bool(re.search(r"\.\s*(?:innerHTML|outerHTML)\s*[+=]", js) or
+                    re.search(r"\.\s*insertAdjacentHTML\s*\(", js) or
+                    re.search(r"\bdocument\s*\.\s*(?:write|writeln)\s*\(", js) or
+                    re.search(r"\$\s*\([^\)]*\)\s*\.\s*(?:html|append|prepend)\s*\(", js))
+
+    @staticmethod
+    def _dangerous_js_sink(js: str) -> bool:
+        return bool(re.search(r"\beval\s*\(", js) or
+                    re.search(r"\b(?:setTimeout|setInterval)\s*\(\s*[^\),'\"]+\s*,", js) or
+                    re.search(r"\bnew\s+Function\s*\(", js))
+
+    @staticmethod
+    def _location_sink(js: str) -> bool:
+        return bool(re.search(r"\b(?:location|window\.location|document\.location)\s*(?:\.href|\.pathname|\.search|\.hash)?\s*=(?!=)", js) or
+                    re.search(r"\blocation\s*\.\s*(?:replace|assign)\s*\(", js) or
+                    re.search(r"\bwindow\.open\s*\(", js) or
+                    re.search(r"\.\s*(?:href|src)\s*=(?!=)", js))
+
+    @staticmethod
+    def _controllable_source(js: str) -> bool:
+        return bool(re.search(r"location\.(?:hash|search|href)\b", js) or
+                    re.search(r"document\.(?:URL|documentURI|baseURI|referrer)\b", js) or
+                    re.search(r"window\.name\b", js) or
+                    re.search(r"URLSearchParams\s*\(", js) or
+                    re.search(r"location\s*\.\s*search\b", js))
+
+    def phase_dom_based(self, pages: list[Page]) -> None:
+        """Deteksi konservatif DOM-based vulnerabilities dari analisis statis JS/HTML yang disajikan.
+        Tanpa eksekusi browser/runtime, konfirmasi hanya diberikan jika pola source->sink/indikator
+        clobbering tampak eksplisit dan kuat pada konten respons untuk menghindari false positive."""
+        for page in pages:
+            if not self._within_budget():
+                return
+            blocks = self._script_blocks(page)
+            if not blocks and not page.text:
+                continue
+            blob_js = "\n".join(blocks)
+            html = page.text or ""
+            point = Point(key="dom", kind="page", label=f"page {page.url}", url=page.url,
+                          name="page", original="", page_url=page.url, method="GET", interest=4)
+
+            # 65: DOM XSS using web messages (message listener + data to dangerous sink)
+            if 65 not in self._confirmed and self._has_message_listener(blob_js) and self._msg_data_used(blob_js):
+                if self._dangerous_html_sink(blob_js) or self._dangerous_js_sink(blob_js):
+                    ev = (f"Terdeteksi event listener 'message' yang menggunakan event.data dan terdapat sink berbahaya "
+                          f"(innerHTML/document.write/eval/setTimeout-string/dll) pada script di {page.url}. "
+                          f"Bukti berbasis analisis statis JS respons.")
+                    self._mark(65, point, ev, "dom_xss_web_messages_source_sink")
+
+            # 66: DOM XSS using web messages and a JavaScript URL (message data -> location/href/src sink)
+            if 66 not in self._confirmed and self._has_message_listener(blob_js) and self._msg_data_used(blob_js):
+                if self._location_sink(blob_js):
+                    ev = (f"Terdeteksi event listener 'message' yang menggunakan event.data dan mengalir ke sink navigasi/URL "
+                          f"(location/location.href/src/href/window.open) pada script di {page.url}. "
+                          f"Bukti berbasis analisis statis JS respons (potensi javascript: URL).")
+                    self._mark(66, point, ev, "dom_xss_web_messages_js_url_sink")
+
+            # 67: DOM XSS using web messages and JSON.parse (message + JSON.parse + sink)
+            if 67 not in self._confirmed and self._has_message_listener(blob_js) and re.search(r"JSON\.parse\s*\(", blob_js):
+                if self._msg_data_used(blob_js) and (self._dangerous_html_sink(blob_js) or self._dangerous_js_sink(blob_js) or self._location_sink(blob_js)):
+                    ev = (f"Terdeteksi event listener 'message' dengan JSON.parse atas data pesan dan penggunaan hasil ke sink "
+                          f"berbahaya/navigasi pada script di {page.url}. Bukti berbasis analisis statis JS respons.")
+                    self._mark(67, point, ev, "dom_xss_web_messages_json_parse_sink")
+
+            # 68: DOM-based open redirection (controllable source -> navigation sink)
+            if 68 not in self._confirmed and self._controllable_source(blob_js) and self._location_sink(blob_js):
+                # require navigation-specific sink (not just any href/src attribute assignment in isolation)
+                if re.search(r"\b(?:location|window\.location|document\.location)\s*(?:\.href)?\s*=(?!=)", blob_js) or \
+                   re.search(r"\blocation\s*\.\s*(?:replace|assign)\s*\(", blob_js) or re.search(r"\bwindow\.open\s*\(", blob_js):
+                    ev = (f"Terdeteksi sumber terkontrol (location.hash/search/URL/window.name) yang mengalir ke sink navigasi "
+                          f"(location/location.href/replace/assign/window.open) pada script di {page.url}. "
+                          f"Bukti berbasis analisis statis JS respons.")
+                    self._mark(68, point, ev, "dom_open_redirection_source_sink")
+
+            # 69: DOM-based cookie manipulation (controllable source -> document.cookie)
+            if 69 not in self._confirmed and self._controllable_source(blob_js) and re.search(r"\bdocument\.cookie\s*=(?!=)", blob_js):
+                ev = (f"Terdeteksi sumber terkontrol (location.hash/search/URL/window.name) yang digunakan dalam penulisan "
+                      f"document.cookie pada script di {page.url}. Bukti berbasis analisis statis JS respons.")
+                self._mark(69, point, ev, "dom_cookie_manipulation_source_sink")
+
+            # 70: Exploiting DOM clobbering to enable XSS
+            # Bukti kuat: pola clobbering elemen bernama/id (mis. koleksi anchor dengan id & name sama) dan script
+            # yang memakai properti clobberable sebagai sumber nilai (mis. defaultAvatar.avatar) menuju sink/atribut.
+            if 70 not in self._confirmed:
+                clobber_html = bool(re.search(r"<a\s+[^>]*\bid\s*=\s*['\"]?defaultAvatar['\"]?[^>]*\bname\s*=", html, re.I) or
+                                    re.search(r"<a\s+[^>]*\bname\s*=\s*['\"]?avatar['\"]?[^>]*\bid\s*=\s*['\"]?defaultAvatar['\"]?", html, re.I) or
+                                    (re.search(r"\bid\s*=\s*['\"]defaultAvatar['\"]", html, re.I) and re.search(r"\bname\s*=\s*['\"]avatar['\"]", html, re.I)))
+                clobber_js = bool(re.search(r"window\.defaultAvatar\s*\|\|", blob_js) or re.search(r"defaultAvatar\.avatar\b", blob_js))
+                if clobber_html and clobber_js:
+                    ev = (f"Terdeteksi pola DOM clobbering (elemen anchor/id-name 'defaultAvatar'/'avatar') pada HTML dan penggunaan "
+                          f"properti clobberable (defaultAvatar.avatar/window.defaultAvatar) pada script di {page.url}. "
+                          f"Bukti berbasis analisis statis HTML+JS respons.")
+                    self._mark(70, point, ev, "dom_clobbering_xss_pattern")
+
+            # 71: Clobbering DOM attributes to bypass HTML filters
+            # Bukti kuat: markup clobbering atribut/properti (mis. input/form dengan id/name 'attributes' atau 'getAttribute')
+            # yang umum digunakan untuk mem-bypass filter berbasis atribut DOM.
+            if 71 not in self._confirmed:
+                clobber_attr = bool(re.search(r"\b(?:id|name)\s*=\s*['\"]attributes['\"]", html, re.I) or
+                                    re.search(r"\bname\s*=\s*['\"]getAttribute['\"]", html, re.I) or
+                                    re.search(r"<form[^>]*\bid\s*=\s*['\"][^'\"]+['\"][^>]*>.*?\bname\s*=\s*['\"]attributes['\"]", html, re.I | re.S))
+                if clobber_attr:
+                    ev = (f"Terdeteksi markup DOM clobbering pada atribut/properti (id/name 'attributes' atau 'getAttribute') "
+                          f"di {page.url}, pola yang dapat mem-bypass filter HTML berbasis atribut DOM. "
+                          f"Bukti berbasis analisis statis HTML respons.")
+                    self._mark(71, point, ev, "dom_clobbering_attributes_markup")
+
+
     def report(self) -> dict[str, Any]:
         labs = []
         for number, title, key, severity in CATALOG:
@@ -2241,7 +2386,7 @@ def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
         "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
         ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
-        "<h1>SATRIA Engine — SQLi, XSS, CSRF & Clickjacking (64 Lab)</h1>"
+        "<h1>SATRIA Engine — SQLi, XSS, CSRF & Clickjacking (71 Lab)</h1>"
         f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
         f"Terkonfirmasi: <b>{report['summary']['confirmed']}/64</b></p>"
         "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
@@ -2605,7 +2750,7 @@ def _pdf_lab_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for number, title, key, severity in CATALOG:
         lab_id = lab_id_for(number)
-        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {})
+        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {})
         items.append({
             "number": number, "id": lab_id, "status": str(found.get("status", "not_confirmed")),
             "title": str(found.get("title", title)), "method": str(found.get("method", "not tested / insufficient evidence")),
@@ -2633,6 +2778,9 @@ _PDF_LAB_FOCUS = {
     58: "CSRF (Referer)", 59: "CSRF (Referer)",
     60: "Clickjacking", 61: "Clickjacking", 62: "Clickjacking",
     63: "Clickjacking", 64: "Clickjacking",
+    65: "DOM XSS (Web messages)", 66: "DOM XSS (Web messages)", 67: "DOM XSS (Web messages)",
+    68: "DOM-based open redirection", 69: "DOM-based cookie manipulation",
+    70: "DOM clobbering", 71: "DOM clobbering",
 }
 
 
@@ -2668,10 +2816,10 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 242, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.text(content_left, _PDF_PAGE_H - 84, "SATRIA BARU", 30, _PDF_COLORS["white"], bold=True)
     page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION, XSS, CSRF & CLICKJACKING", 13.5, _PDF_COLORS["light"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 64 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
+    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 71 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
-    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 64 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 71 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -2685,7 +2833,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     kpis = [
         ("Terkonfirmasi", str(len(confirmed)), _PDF_COLORS["green"], _PDF_COLORS["green_light"]),
         ("Belum terkonfirmasi", str(len(not_confirmed)), _PDF_COLORS["amber"], _PDF_COLORS["amber_light"]),
-        ("Total lab", "64", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
+        ("Total lab", "71", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
     ]
     for idx, (label, value, color, light) in enumerate(kpis):
         x = content_left + idx * (kpi_w + kpi_gap)
@@ -2703,9 +2851,9 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
-    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 64 lab yang diminta.")
+    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 71 lab yang diminta.")
     rows = [
-        ("Total lab", "64", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking)."),
+        ("Total lab", "71", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
         ("Belum terkonfirmasi", str(len(not_confirmed)), "Tidak ada bukti cukup pada putaran ini."),
         ("Severity Critical", str(by_severity.get("critical", 0)), "Hitungan hanya untuk temuan terkonfirmasi."),
@@ -2754,7 +2902,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # ------------------------------------------------------------------- TABEL
     page.new_page()
-    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 64 lab.")
+    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 71 lab.")
     headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
@@ -2841,7 +2989,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------- CATATAN AKHIR
     page.y -= 6
     page.section_title("Catatan Laporan")
-    page.bullet_paragraph("Dokumen ini memuat 64 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
+    page.bullet_paragraph("Dokumen ini memuat 71 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
     page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
@@ -2852,7 +3000,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     for idx, page_ops in enumerate(page.pages, start=1):
         page_ops.append(f"{_pdf_rgb(_PDF_COLORS['navy'])} rg 0 {_pdf_num(_PDF_PAGE_H - 32)} {_pdf_num(_PDF_PAGE_W)} 32 re f")
         page_ops.append(f"BT /F2 8 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA BARU - SQL Injection Report) Tj ET")
-        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (64 Lab: SQLi/XSS/CSRF/CJ) Tj ET")
+        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (71 Lab: SQLi/XSS/CSRF/CJ/DOM) Tj ET")
         footer_target = _pdf_safe_text(target)
         if len(footer_target) > 84:
             footer_target = footer_target[:81] + "..."
@@ -2943,7 +3091,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                  allow_partial_tools: bool | None = None,
                  enable_llm: bool | None = None, run_censys: bool | None = None,
                  run_nvd: bool | None = None, **runtime_options: Any) -> dict[str, Any]:
-    """Jalur kompatibel yang dipakai app.py; memindai 64 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking)."""
+    """Jalur kompatibel yang dipakai app.py; memindai 71 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based)."""
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
                         ("enable_llm", enable_llm), ("run_censys", run_censys),
@@ -2992,7 +3140,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, dan Clickjacking (64 lab)")
+    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, dan Clickjacking & DOM-based (71 lab)")
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
@@ -3027,7 +3175,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     json_path, html_path = write_report(report, Path(args.output_dir))
     summary = report["summary"]
-    print(f"SATRIA Engine selesai: {summary['confirmed']}/64 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"SATRIA Engine selesai: {summary['confirmed']}/71 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     return 0
