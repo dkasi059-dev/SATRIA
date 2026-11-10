@@ -625,7 +625,8 @@ class SatriaXSSScanner:
         return _same_origin(url, self.target_url)
 
     def _log(self, lab_id, phase, point, payload_kind, observed, ok=False):
-        t = self._track.setdefault(lab_id, [])
+        if not hasattr(self, "_track"): self._track = {i: [] for i in range(1,31)}
+        t = getattr(self, "_track", {}).setdefault(lab_id, [])
         if len(t) < 160:
             t.append({"phase": phase, "point": str(point), "payload": payload_kind, "observed": (observed or "")[:180], "ok": ok})
 
@@ -1534,7 +1535,7 @@ class SatriaXSSScanner:
             result = self._results.get(lab_id, {"confirmed": False, "evidence": "", "details": {}})
             confirmed = bool(result.get("confirmed"))
             if confirmed: confirmed_count += 1
-            det = dict(result.get("details") or {}); det["track"] = self._track.get(lab_id, [])[-30:]; det["rechecked"] = bool(result.get("rechecked"))
+            det = dict(result.get("details") or {}); det["track"] = getattr(self, "_track", {}).get(lab_id, [])[-30:]; det["rechecked"] = bool(result.get("rechecked"))
             labs.append({"id": lab_id, "title": title, "key": key, "severity": severity,
                          "status": "confirmed" if confirmed else "not_confirmed",
                          "evidence": result.get("evidence",""), "details": det,
