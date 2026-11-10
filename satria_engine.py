@@ -2092,8 +2092,44 @@ class SatriaBaruScanner:
                       f"Bukti berbasis analisis script/header respons.")
                 self._mark(62, point, ev, "clickjacking_frame_buster_detected")
 
-            # 63/64: exploitation chains (trigger DOM XSS via clickjacking, multistep) memerlukan interaksi UI/browser bertahap
-            # dan tidak dapat diverifikasi andal dari analisis HTTP statis -> tidak dikonfirmasi otomatis (anti-FP).
+            # 63: clickjacking to trigger DOM-based XSS - halaman frameable + bukti DOM XSS source->sink
+            if 63 not in self._confirmed and frameable:
+                try:
+                    blob_js = "\n".join(self._script_blocks(page))
+                except Exception:
+                    blob_js = (page.js_text or "")
+                dom_source = bool(re.search(r"location\.(?:hash|search|href)\b", blob_js) or
+                                  re.search(r"document\.(?:URL|documentURI|baseURI|referrer)\b", blob_js) or
+                                  re.search(r"URLSearchParams\s*\(", blob_js) or
+                                  re.search(r"location\s*\.\s*search\b", blob_js) or
+                                  re.search(r"window\.name\b", blob_js))
+                dom_sink = bool(re.search(r"\.\s*(?:innerHTML|outerHTML)\s*[+=]?", blob_js) or
+                                re.search(r"\.\s*insertAdjacentHTML\s*\(", blob_js) or
+                                re.search(r"\bdocument\s*\.\s*(?:write|writeln)\s*\(", blob_js) or
+                                re.search(r"\$\s*\([^)]*\)\s*\.\s*(?:html|append|prepend)\s*\(", blob_js))
+                prefillable_ctx = any_prefill or bool(page.forms) or bool(re.search(r"<(input|textarea|form)\b", page.text or "", re.I))
+                if dom_source and dom_sink and prefillable_ctx:
+                    ev = (f"Halaman frameable ({frame_reason}) di {page.url} memuat pola DOM XSS (sumber terkontrol seperti "
+                          f"location/search/URL parameter dan sink HTML berbahaya seperti innerHTML/document.write) "
+                          f"pada konteks halaman/form yang dapat dipicu; kombinasi framing + DOM XSS terindikasi. "
+                          f"Bukti berbasis analisis header, HTML, dan script respons.")
+                    self._mark(63, point, ev, "clickjacking_triggers_dom_xss")
+
+            # 64: multistep clickjacking - aksi sensitif berlapis/konfirmasi pada halaman frameable
+            if 64 not in self._confirmed and frameable:
+                text_low = (page.text or "").lower()
+                has_delete = bool(re.search(r"\b(delete|remove)\b", text_low))
+                has_account = bool(re.search(r"\b(account|profile|user)\b", text_low))
+                confirm_words = bool(re.search(r"\b(confirm|are you sure|yes[, ]|continue|proceed)\b", text_low))
+                # indikator multi-step: beberapa form/submit/button sensitif atau alur konfirmasi eksplisit
+                form_count = len(page.forms)
+                submit_like = len(re.findall(r"<button\b|type=['\"]?submit['\"]?|<input[^>]+type=['\"]?(submit|button)['\"]?", page.text or "", re.I))
+                multistep = (has_delete and has_account and (confirm_words or form_count >= 1 or submit_like >= 2))
+                if multistep:
+                    ev = (f"Halaman frameable ({frame_reason}) di {page.url} memuat aksi sensitif berlapis/memerlukan konfirmasi "
+                          f"(indikator: aksi hapus/akun dengan elemen konfirmasi/langkah, form={form_count}, kontrol submit/button={submit_like}). "
+                          f"Kombinasi framing pada alur multistep terindikasi. Bukti berbasis analisis header dan konten respons.")
+                    self._mark(64, point, ev, "clickjacking_multistep_sensitive_action")
 
 
 
@@ -2235,11 +2271,20 @@ class SatriaBaruScanner:
 
     def _cors_candidate_urls(self, pages: list[Page]) -> list[str]:
         urls = [self.target_url]
-        for page in pages[:12]:
+        base = self.target_url.rstrip("/")
+        for suffix in ("/accountDetails", "/account", "/account/details", "/my-account",
+                       "/my-account?id=1", "/api/key", "/api/account", "/user", "/user/details",
+                       "/api/user", "/profile", "/me", "/accountDetails/"):
+            urls.append(base + suffix)
+            urls.append(urljoin(self.target_url, suffix.lstrip("/")))
+        for page in pages[:20]:
             urls.append(page.url)
-            for form in page.forms[:4]:
+            for form in page.forms[:6]:
                 if form.action:
                     urls.append(form.action)
+            for link in getattr(page, "links", [])[:20]:
+                if re.search(r"(account|user|profile|detail|api|key)", str(link), re.I):
+                    urls.append(link)
         out: list[str] = []
         seen = set()
         for u in urls:
@@ -2251,7 +2296,16 @@ class SatriaBaruScanner:
                 continue
             seen.add(cu)
             out.append(cu)
-        return out[:12]
+
+        def score(u: str) -> int:
+            ul = u.lower()
+            s = 0
+            for kw in ("accountdetail", "account", "detail", "api", "key", "user", "profile", "me"):
+                if kw in ul:
+                    s += 4
+            return -s
+        out.sort(key=score)
+        return out[:24]
 
     @staticmethod
     def _resp_header(headers: dict[str, str] | None, name: str) -> str | None:
@@ -2264,14 +2318,33 @@ class SatriaBaruScanner:
         return None
 
     def phase_cors(self, pages: list[Page]) -> None:
-        """Deteksi konservatif CORS misconfiguration dengan probe Origin eksplisit.
+        """Deteksi konservatif CORS misconfiguration dengan probe Origin terkontrol.
         Konfirmasi hanya jika header CORS merespons dengan refleksi origin yang diminta
         sesuai skenario lab (bukti header jelas), untuk menghindari false positive."""
         urls = self._cors_candidate_urls(pages)
         if not urls:
             return
+        target_host = (urlparse(self.target_url).hostname or "").strip()
         evil_https = "https://evil-example.test"
-        evil_http = "http://evil-example.test"
+        # probe origin untuk 74 (trusted insecure protocols): origin http yang dipercaya secara tidak aman
+        http_origins = ["http://evil-example.test"]
+        if target_host:
+            http_origins.extend([
+                f"http://{target_host}",
+                f"http://insecure.{target_host}",
+                f"http://stock.{target_host}",
+            ])
+            parts = target_host.split(".")
+            if len(parts) >= 3:
+                http_origins.append(f"http://insecure.{'.'.join(parts[1:])}")
+        # unikkan sambil jaga urutan
+        seen_o = set()
+        http_origin_list = []
+        for o in http_origins:
+            if o not in seen_o:
+                seen_o.add(o)
+                http_origin_list.append(o)
+
         for url in urls:
             if not self._within_budget():
                 return
@@ -2299,15 +2372,19 @@ class SatriaBaruScanner:
                     self._mark(73, point, ev, "cors_trusted_null_origin")
             # 74: trusted insecure protocols (http origin reflected)
             if 74 not in self._confirmed and self._within_budget():
-                resp = self._request("GET", url, headers={"Origin": evil_http}, allow_redirects=False)
-                acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
-                acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
-                if acao and acao.strip() == evil_http and acao.strip().lower().startswith("http://"):
-                    ev = (f"Origin probe dengan skema http tidak aman ({evil_http}) ke {url} direfleksikan: "
-                          f"Access-Control-Allow-Origin={acao!r}"
-                          + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                          + ". Bukti berbasis header respons CORS.")
-                    self._mark(74, point, ev, "cors_trusted_insecure_protocols")
+                for evil_http in http_origin_list:
+                    if 74 in self._confirmed or not self._within_budget():
+                        break
+                    resp = self._request("GET", url, headers={"Origin": evil_http}, allow_redirects=False)
+                    acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
+                    acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
+                    if acao and acao.strip() == evil_http and acao.strip().lower().startswith("http://"):
+                        ev = (f"Origin probe dengan skema http tidak aman ({evil_http}) ke {url} direfleksikan: "
+                              f"Access-Control-Allow-Origin={acao!r}"
+                              + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                              + ". Bukti berbasis header respons CORS (protokol tidak aman dipercaya).")
+                        self._mark(74, point, ev, "cors_trusted_insecure_protocols")
+                        break
 
 
     # ======================== XXE (konservatif, probe terkontrol & bukti kuat) ========================
