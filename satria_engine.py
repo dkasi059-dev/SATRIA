@@ -9185,6 +9185,16 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
     page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 227 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning, 5 Information disclosure, 7 HTTP Host header attacks, 4 NoSQL injection, 8 JWT, 13 Access control, 6 Race conditions, 8 Web LLM attacks, 5 Web cache deception, 7 File upload vulnerabilities, 10 Prototype pollution, 10 Insecure deserialization, 14 Authentication) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.y -= 10
+    page.section_title("Kemampuan Tambahan dari satria_engine.py", "Seluruh kemampuan pemindaian dari satria_engine.py digabungkan tanpa duplikasi.")
+    page.bullet_paragraph("Analisis keamanan HTTP (header, cookie, CORS, redirect) via analyze_http_security.")
+    page.bullet_paragraph("Temuan kode deterministik (SRI, skrip pihak ketiga) via detect_code_findings_deterministic.")
+    page.bullet_paragraph("Pemindaian konteks lab (48 lab SQLi+XSS) via scan_labs / run_lab_scan / build_target_context.")
+    page.bullet_paragraph("Pencarian CVE terverifikasi NVD & OSV (search_nvd_verified, search_osv_verified).")
+    page.bullet_paragraph("Probe pasif & aktif per kategori: SQLi, XSS, CSRF, CORS, JWT, deserialization, cache, host header, WebSocket, GraphQL, NoSQL, prototype pollution, file upload, API, LLM, business logic, SSRF, XXE, smuggling, race, OAuth, dll.")
+    page.bullet_paragraph("Dedup/merge temuan (dedup_and_merge_findings) dan ringkasan (summarize).")
+    page.bullet_paragraph("Pipeline analitik (run_pipeline, render_lab_report, render_pdf) dan konfigurasi runtime (configure_runtime, get_runtime_config).")
+    page.bullet_paragraph("Utilities: normalisasi URL, TargetContext, scraping artifacts, repair JSON, ekstraksi teknologi/versi.")
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -9198,7 +9208,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     kpis = [
         ("Terkonfirmasi", str(len(confirmed)), _PDF_COLORS["green"], _PDF_COLORS["green_light"]),
         ("Belum terkonfirmasi", str(len(not_confirmed)), _PDF_COLORS["amber"], _PDF_COLORS["amber_light"]),
-        ("Total lab", "90", _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
+        ("Total lab", str(len(labs)), _PDF_COLORS["navy"], _PDF_COLORS["light_blue"]),
     ]
     for idx, (label, value, color, light) in enumerate(kpis):
         x = content_left + idx * (kpi_w + kpi_gap)
@@ -9217,8 +9227,13 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
     page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 227 lab yang diminta.")
+    page.section_title("Kemampuan dari satria_engine.py", "Ringkasan kemampuan tambahan yang digabungkan.")
+    page.bullet_paragraph("Analisis keamanan HTTP; temuan kode deterministik; pemindaian konteks lab (48 lab SQLi+XSS).")
+    page.bullet_paragraph("Pencarian CVE terverifikasi NVD & OSV; probe pasif & aktif per kategori.")
+    page.bullet_paragraph("Dedup/merge temuan; pipeline analitik; konfigurasi runtime; utilities.")
+    page.y -= 8
     rows = [
-        ("Total lab", "90", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF)."),
+        ("Total lab", str(len(labs)), "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + ...)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
         ("Belum terkonfirmasi", str(len(not_confirmed)), "Tidak ada bukti cukup pada putaran ini."),
         ("Severity Critical", str(by_severity.get("critical", 0)), "Hitungan hanya untuk temuan terkonfirmasi."),
@@ -9365,7 +9380,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     for idx, page_ops in enumerate(page.pages, start=1):
         page_ops.append(f"{_pdf_rgb(_PDF_COLORS['navy'])} rg 0 {_pdf_num(_PDF_PAGE_H - 32)} {_pdf_num(_PDF_PAGE_W)} 32 re f")
         page_ops.append(f"BT /F2 8 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA BARU - SQL Injection Report) Tj ET")
-        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (90 Lab: SQLi/XSS/CSRF/CJ/DOM/CORS/XXE/SSRF) Tj ET")
+        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (227 Lab: SQLi/XSS/CSRF/CJ/DOM/CORS/XXE/SSRF) Tj ET")
         footer_target = _pdf_safe_text(target)
         if len(footer_target) > 84:
             footer_target = footer_target[:81] + "..."
