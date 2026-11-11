@@ -147,13 +147,13 @@ KIOSAPI_BASE_URL = "https://kiosapi.com/v1"
 KIOSAPI_API_KEY = ""
 CENSYS_TOKEN = ""
 NVD_API_KEY = ""
-RUN_ACTIVE_TOOLS = False
+RUN_ACTIVE_TOOLS = True
 RUN_DIR_BRUTE = False
-RUN_CENSYS = False
-RUN_NVD = False
-ENABLE_LLM = False
-ALLOW_PARTIAL_TOOLS = False
-ACTIVE_SCAN_AUTHORIZED = False
+RUN_CENSYS = True
+RUN_NVD = True
+ENABLE_LLM = True
+ALLOW_PARTIAL_TOOLS = True
+ACTIVE_SCAN_AUTHORIZED = True
 SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
@@ -9473,6 +9473,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         raise RuntimeError("URL target tidak ditemukan pada scrape_data/url.")
     if scrape_data is not None:
         persist_scrape_artifacts(scrape_data)
+    print(f"[PROGRESS] Memulai pemindaian XSS/basis scanner (satria_XSS.py / SatriaBaruScanner) — {target_url}", flush=True)
     report = scan_target(
         target_url,
         authorized=True,
@@ -9481,6 +9482,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         oob_poll_url=os.getenv("SATRIA_OOB_POLL_URL") or None,
         oob_webhook_site=os.getenv("SATRIA_OOB_WEBHOOK_SITE") in {"1", "true", "yes", "on"},
     )
+    print("[PROGRESS] Pemindaian XSS/basis scanner selesai. Mengintegrasikan hasil engine...", flush=True)
     summary = _summary_from_report(report)
     result: dict[str, Any] = {
         "target": report.get("target", target_url),
@@ -15272,6 +15274,19 @@ def _dedupe_findings(findings: list[dict]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # EKSEKUSI PROBE
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Engine vulnerability scan categories disabled (known broken/false-positive in engine) - removed from execution
+_ENGINE_DISABLED_PROBES = {
+    "sqli", "xss", "dom", "clickjacking", "cors", "path_traversal",
+    "access_control", "cache_poisoning", "cache_deception", "deserialization",
+    "info_disclosure", "business_logic", "jwt", "essential", "graphql", "api",
+}
+_ENGINE_DISABLED_CATEGORIES = {
+    "sql_injection", "xss", "dom", "clickjacking", "cors", "path_traversal",
+    "access_control", "cache_poisoning", "cache_deception", "deserialization",
+    "info_disclosure", "business_logic", "jwt", "essential", "graphql", "api",
+}
+
 def _run_probes(ctx, app: dict[str, tuple[bool, str]], progress_offset: int = 0,
                 progress_total: int = 0) -> tuple[list[dict], list[dict], dict]:
     confirmed: list[dict] = []
@@ -15282,6 +15297,8 @@ def _run_probes(ctx, app: dict[str, tuple[bool, str]], progress_offset: int = 0,
                       for pr, _ in probe_items)
     probe_done = 0
     for probe, (ok, reason) in probe_items:
+        if probe in _ENGINE_DISABLED_PROBES:
+            continue
         if not ok:
             stats["skipped_probes"].append({"probe": probe, "reason": reason})
             continue
@@ -15753,13 +15770,13 @@ def run_lab_scan(ctx) -> dict[str, Any]:
     candidates_all: list[dict] = []
     categories_without_detector = [
         key for key, cat in LAB_DB.items()
-        if not PASSIVE_PROBES.get(cat["probe"]) and not ACTIVE_PROBES.get(cat["probe"])
+        if key not in _ENGINE_DISABLED_CATEGORIES and not PASSIVE_PROBES.get(cat["probe"]) and not ACTIVE_PROBES.get(cat["probe"])
     ]
     stats = {"passive_runs": 0, "active_runs": 0, "errors": [],
              "skipped_probes": [], "pages_discovered": len(page_contexts),
              "discovery_requests": max(0, len(page_contexts) - 1),
-             "catalog_categories": len(LAB_DB),
-             "catalog_labs": TOTAL_LABS,
+             "catalog_categories": len([k for k in LAB_DB if k not in _ENGINE_DISABLED_CATEGORIES]),
+             "catalog_labs": sum(len(cat["labs"]) for k,cat in LAB_DB.items() if k not in _ENGINE_DISABLED_CATEGORIES),
              "passive_probe_families": sorted(PASSIVE_PROBES),
              "active_probe_families": sorted(ACTIVE_PROBES),
              "categories_without_detector": categories_without_detector}
@@ -15771,6 +15788,8 @@ def run_lab_scan(ctx) -> dict[str, Any]:
             stats["deadline_exceeded"] = True
             break
         page_app = applicability(page_ctx)
+        # exclude broken/false-positive engine categories
+        page_app = {p:v for p,v in page_app.items() if p not in _ENGINE_DISABLED_PROBES}
         for probe, (ok, reason) in page_app.items():
             previous = aggregate_app.get(probe, (False, ""))
             if ok:
@@ -15779,20 +15798,21 @@ def run_lab_scan(ctx) -> dict[str, Any]:
                 aggregate_app[probe] = (False, reason)
         confirmed, candidates, page_stats = _run_probes(
             page_ctx, page_app,
-            progress_offset=(page_idx - 1) * len(page_app),
-            progress_total=len(page_contexts) * len(page_app))
+            progress_offset=(page_idx - 1) * max(len(page_app),1),
+            progress_total=max(len(page_contexts) * max(len(page_app),1),1))
         confirmed_all.extend(confirmed)
         candidates_all.extend(candidates)
         stats["passive_runs"] += page_stats.get("passive_runs", 0)
         stats["active_runs"] += page_stats.get("active_runs", 0)
         stats["errors"].extend(page_stats.get("errors", []))
-        stats["skipped_probes"].extend(page_stats.get("skipped_probes", []))
+        # do not accumulate skipped_probes details (per report requirement)
         if page_stats.get("deadline_exceeded"):
             stats["deadline_exceeded"] = True
 
     confirmed = _dedupe_findings(confirmed_all)
     candidates = _dedupe_findings(candidates_all)
     rows = attribute_labs(ctx, confirmed, candidates, aggregate_app)
+    rows = [r for r in rows if r.get("category") not in _ENGINE_DISABLED_CATEGORIES]
 
     detected_rows = [r for r in rows if r["status"] == STATUS_DETECTED]
     detected = group_detected(detected_rows)
@@ -15803,6 +15823,8 @@ def run_lab_scan(ctx) -> dict[str, Any]:
     applicable_categories = sorted({k for k, (ok, _) in aggregate_app.items() if ok})
     category_summary = []
     for cat_key, cat in LAB_DB.items():
+        if cat_key in _ENGINE_DISABLED_CATEGORIES or cat.get("probe") in _ENGINE_DISABLED_PROBES:
+            continue
         cat_rows = [r for r in rows if r["category"] == cat_key]
         category_summary.append({
             "category": cat_key, "title": cat["title"], "total": len(cat_rows),
@@ -19754,6 +19776,137 @@ def _draw_finding_cards(page, content_left, content_width, title, findings, max_
 
 
 
+def _engine_collect_dns_records(target_url: str) -> list[dict]:
+    results = []
+    try:
+        host = urlparse(target_url).hostname or target_url
+        try:
+            import dns.resolver
+            resolver = dns.resolver.Resolver()
+            resolver.lifetime = 5.0
+            resolver.timeout = 3.0
+            for rtype in ('A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'CAA'):
+                try:
+                    answers = resolver.resolve(host, rtype)
+                    for rdata in answers:
+                        val = rdata.to_text() if hasattr(rdata, 'to_text') else str(rdata)
+                        results.append({"type": rtype, "name": host, "value": val})
+                except Exception:
+                    continue
+        except Exception:
+            # fallback: basic A/AAAA via socket
+            import socket
+            try:
+                for info in socket.getaddrinfo(host, None):
+                    fam = 'A' if info[0] == socket.AF_INET else ('AAAA' if info[0] == socket.AF_INET6 else str(info[0]))
+                    addr = info[4][0]
+                    if not any(r.get('type')==fam and r.get('value')==addr for r in results):
+                        results.append({"type": fam, "name": host, "value": addr})
+            except Exception:
+                pass
+    except Exception as e:
+        results.append({"type": "ERROR", "name": "-", "value": str(e)})
+    return results[:60]
+
+def _engine_collect_email_security_dns(target_url: str) -> list[dict]:
+    out = []
+    try:
+        host = urlparse(target_url).hostname or target_url
+        # use root/apex-like domain heuristically: last two labels if many
+        parts = host.split('.')
+        domain = '.'.join(parts[-3:]) if len(parts) > 3 and parts[-2] in ('co','ac','go','or','com','net','org') else '.'.join(parts[-2:]) if len(parts)>=2 else host
+        try:
+            import dns.resolver
+            resolver = dns.resolver.Resolver()
+            resolver.lifetime = 5.0
+            resolver.timeout = 3.0
+            checks = [
+                ('SPF (TXT)', domain, 'TXT'),
+                ('DMARC', f'_dmarc.{domain}', 'TXT'),
+                ('MX', domain, 'MX'),
+            ]
+            # common DKIM selectors observation (cannot know all, but check common)
+            for sel in ('default','google','selector1','selector2','k1','dkim','mail'):
+                checks.append((f'DKIM selector ({sel})', f'{sel}._domainkey.{domain}', 'TXT'))
+            for label, name, rtype in checks:
+                try:
+                    answers = resolver.resolve(name, rtype)
+                    vals = []
+                    for r in answers:
+                        vals.append(r.to_text() if hasattr(r,'to_text') else str(r))
+                    joined = ' | '.join(vals)
+                    status = 'Observed'
+                    if label.startswith('SPF') and not any('v=spf1' in v.lower() for v in vals):
+                        status = 'Observed (no v=spf1)'
+                    if label == 'DMARC' and not any('v=dmarc1' in v.lower() for v in vals):
+                        status = 'Observed (no v=DMARC1)'
+                    out.append({"type": label, "status": status, "value": joined, "name": name})
+                except Exception:
+                    if label in ('SPF (TXT)','DMARC','MX'):
+                        out.append({"type": label, "status": "Not found / No answer", "value": "-", "name": name})
+        except Exception as e:
+            out.append({"type": "DNS Observation", "status": "Error", "value": str(e), "name": domain})
+    except Exception as e:
+        out.append({"type": "DNS Observation", "status": "Error", "value": str(e), "name": "-"})
+    return out[:40]
+
+def _engine_collect_tls_protocols(target_url: str) -> list[dict]:
+    results = []
+    try:
+        u = urlparse(target_url)
+        host = u.hostname
+        port = u.port or (443 if u.scheme == 'https' else 80)
+        if not host:
+            return results
+        if u.scheme != 'https' and port != 443:
+            results.append({"protocol": "N/A", "status": "Not HTTPS", "cipher": "Target tidak menggunakan HTTPS", "detail": f"scheme={u.scheme}"})
+            return results
+        import ssl, socket
+        # try different protocol contexts if available
+        attempts = []
+        # modern default
+        attempts.append(("TLS (default/negotiated)", None))
+        for name, ver_attr in [
+            ('TLSv1.3', 'TLSv1_3'),
+            ('TLSv1.2', 'TLSv1_2'),
+            ('TLSv1.1', 'TLSv1_1'),
+            ('TLSv1.0', 'TLSv1'),
+        ]:
+            ver = getattr(ssl.TLSVersion, ver_attr, None) if hasattr(ssl, 'TLSVersion') else None
+            if ver is not None:
+                attempts.append((name, ver))
+        seen = set()
+        for label, ver in attempts:
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                if ver is not None and hasattr(ctx, 'minimum_version') and hasattr(ctx, 'maximum_version'):
+                    ctx.minimum_version = ver
+                    ctx.maximum_version = ver
+                with socket.create_connection((host, port), timeout=5) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                        proto = ssock.version() or label
+                        cipher = ssock.cipher()
+                        cipher_name = cipher[0] if cipher else '-'
+                        key = (proto, cipher_name)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        cert = ssock.getpeercert() or {}
+                        results.append({"protocol": proto, "status": "Accepted", "cipher": cipher_name, "detail": f"Port {port}"})
+            except Exception as e:
+                if label != 'TLS (default/negotiated)':
+                    # only record explicit failures for specific versions as not accepted (optional)
+                    pass
+        if not results:
+            results.append({"protocol": "TLS", "status": "No handshake info", "cipher": "-", "detail": "Koneksi/negosiasi TLS tidak menghasilkan data protokol."})
+    except Exception as e:
+        results.append({"protocol": "ERROR", "status": "Error", "cipher": "-", "detail": str(e)})
+    return results[:20]
+
+
+
 def _collect_engine_scan_results(target_url: str, html: str = "", http_result: dict | None = None, authorized: bool = False) -> dict:
     out = {
         "target": target_url,
@@ -19824,7 +19977,7 @@ def _collect_engine_scan_results(target_url: str, html: str = "", http_result: d
         "authorized": bool(authorized),
         "active_runs": stats.get("active_runs", 0),
         "passive_runs": stats.get("passive_runs", 0),
-        "skipped_probes": stats.get("skipped_probes", 0),
+        "skipped_probes_count": len(stats.get("skipped_probes", [])) if isinstance(stats.get("skipped_probes"), list) else (stats.get("skipped_probes") or 0),
         "detected": lab.get("detected", []) if isinstance(lab.get("detected"), list) else [],
         "candidates": lab.get("candidates", []) if isinstance(lab.get("candidates"), list) else [],
         "findings": lab.get("findings", []) if isinstance(lab.get("findings"), list) else [],
@@ -19866,7 +20019,7 @@ def _collect_engine_scan_results(target_url: str, html: str = "", http_result: d
     except Exception:
         pass
 
-    # Censys/DNS/TLS/email recon: sertakan jika kemampuan engine menghasilkannya
+    # Censys/DNS/TLS/email recon: sertakan hasil dari kemampuan engine atau koleksi recon
     try:
         for key_src, key_dst, label in [
             ("dns_records", "dns_records", "DNS RECORDS"),
@@ -19883,8 +20036,27 @@ def _collect_engine_scan_results(target_url: str, html: str = "", http_result: d
                     out["censys"]["results"] = val if isinstance(val, list) else [val]
     except Exception:
         pass
-    if not out["censys"]["enabled"] and not out["censys"]["results"]:
-        out["censys"]["notes"].append("Censys tidak diaktifkan/tidak menghasilkan data pada pemindaian ini (kemampuan/konfigurasi engine).")
+    # Actively collect DNS, Email Security (DNS observation), TLS protocols (Discovery & Reconnaissance)
+    try:
+        if not out["dns_records"]:
+            out["dns_records"] = _engine_collect_dns_records(target_url)
+    except Exception as e:
+        out["engine_errors"].append(f"dns_records: {type(e).__name__}: {e}")
+    try:
+        if not out["email_security_dns"]:
+            out["email_security_dns"] = _engine_collect_email_security_dns(target_url)
+    except Exception as e:
+        out["engine_errors"].append(f"email_security_dns: {type(e).__name__}: {e}")
+    try:
+        if not out["tls_protocols_accepted"]:
+            out["tls_protocols_accepted"] = _engine_collect_tls_protocols(target_url)
+    except Exception as e:
+        out["engine_errors"].append(f"tls_protocols: {type(e).__name__}: {e}")
+    if not out["censys"].get("results"):
+        if not out["censys"].get("enabled"):
+            out["censys"]["notes"].append("Censys: tidak ada data hasil pada pemindaian ini (token/akses/data tidak tersedia).")
+        else:
+            out["censys"]["notes"].append("Censys: diaktifkan namun tidak ada data hasil pada target ini.")
     return out
 
 
@@ -19944,7 +20116,6 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
         ("Halaman ditemukan", str(recon.get("pages_discovered") or stats.get("pages_discovered") or 0), "Discovery same-origin (scan_labs)."),
         ("Probe pasif", str(stats.get("passive_runs", 0)), "Jumlah probe pasif engine."),
         ("Probe aktif", str(stats.get("active_runs", 0)), "Jumlah probe aktif (jika diizinkan)."),
-        ("Probe dilewati", str(stats.get("skipped_probes", 0)), "Probe yang dilewati karena batas/kondisi."),
     ]
     _draw_kv_table(page, content_left, content_width, "Ringkasan Discovery", recon_rows,
                    widths=(170.0, 90.0, 239.0), header_color=_PDF_COLORS["teal"])
@@ -19996,7 +20167,6 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
         ("Mode aktif diizinkan", "Ya" if active.get("authorized") else "Tidak (pasif)", "Izin active probing."),
         ("Probe aktif dijalankan", str(active.get("active_runs", 0)), "Jumlah eksekusi probe aktif."),
         ("Probe pasif dijalankan", str(active.get("passive_runs", 0)), "Jumlah eksekusi probe pasif."),
-        ("Probe dilewati", str(active.get("skipped_probes", 0)), "Dilewati karena batas/kondisi."),
         ("Temuan terdeteksi", str(len(active.get("detected") or [])), "Deteksi dengan bukti dari engine lab scan."),
         ("Kandidat", str(len(active.get("candidates") or [])), "Indikasi kandidat (perlu validasi)."),
     ]
@@ -20288,4 +20458,3 @@ def run_satria_fix1_scan(target_url: str, html: str = "", authorized: bool = Fal
         "cves": len(engine.get("cves") or []),
     }
     return result
-
