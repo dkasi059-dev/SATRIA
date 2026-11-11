@@ -9491,6 +9491,16 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         "summary": summary,
         "errors": report.get("scan_stats", {}).get("errors", []),
     }
+    # Integrate engine scan results (satria_engine.py capabilities) into unified report
+    try:
+        engine_scan = _collect_engine_scan_results(target_url, authorized=auth)
+        result["engine_scan"] = engine_scan
+        result["engine_http"] = engine_scan.get("engine_http", {})
+        result["engine_lab_scan"] = engine_scan.get("engine_lab_scan", {})
+        result["engine_code_findings"] = engine_scan.get("engine_code_findings", [])
+    except Exception as _eng_exc:
+        result.setdefault("errors", []).append(f"engine_scan integration: {type(_eng_exc).__name__}: {_eng_exc}")
+        result["engine_scan"] = {"engine_errors": [str(_eng_exc)]}
     try:
         findings_path = Path(globals().get("FINDINGS_PATH") or Path(globals().get("ARTIFACTS_DIR", Path("artifacts"))) / "findings.json").expanduser()
         if not findings_path.is_absolute():
