@@ -1797,65 +1797,71 @@ class SatriaBaruScanner:
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
+    def _progress(self, idx: int, total: int, name: str) -> None:
+        try:
+            print(f"[SCAN {idx}/{total}] {name}", flush=True)
+        except Exception:
+            pass
+
     def scan(self) -> dict[str, Any]:
-        self.crawl()
-        self.phase_visible_error(self.points)
-        self.phase_where_hidden(self.points)
-        self.phase_login_bypass()
-        self.phase_conditional_errors(self.points)
-        self.phase_conditional_responses(self.points)
-        self.phase_union_column_count(self.points)
-        self.phase_union_text_column(self.points)
-        self.phase_db_versions(self.points)
-        self.phase_listings(self.points)
-        self.phase_other_tables(self.points)
-        self.phase_time_delay(self.points)
-        self.phase_time_information(self.points)
-        self.phase_xml(self.points)
-        self.phase_oob(self.points)
-        # XSS scanning phases (30 tambahan)
-        self.phase_xss_reflected_html(self.points)
-        self.phase_xss_stored_html(self.points)
-        self.phase_xss_dom(self.points)
-        self.phase_xss_attribute(self.points)
-        self.phase_xss_javascript(self.points)
-        self.phase_xss_angularjs(self.points)
-        self.phase_xss_template_literal(self.points)
-        self.phase_xss_csp_bypass(self.points)
-        self.phase_xss_exploitation(self.points)
-        self.phase_xss_advanced(self.points)
-        # CSRF & Clickjacking (konservatif, berbasis bukti HTTP)
-        self.phase_csrf_defenses(self.pages)
-        self.phase_csrf_referer(self.pages)
-        self.phase_clickjacking(self.pages)
-        # DOM-based vulnerabilities (konservatif, analisis statis JS/HTML; tanpa eksekusi browser)
-        self.phase_dom_based(self.pages)
-        # CORS & XXE (konservatif, berbasis bukti respons/probe terkontrol; anti false positive)
-        self.phase_cors(self.pages)
-        self.phase_xxe(self.pages, self.points)
-        # HTTP request smuggling (konservatif, bukti diferensial/desync terverifikasi; anti false positive)
-        self.phase_smuggling(self.pages, self.points)
-        # SSRF (konservatif, bukti in-band/OOB terverifikasi; anti false positive)
-        self.phase_ssrf(self.pages, self.points)
-        # OS command injection & Web cache poisoning (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_os_command_injection(self.pages, self.points)
-        self.phase_web_cache_poisoning(self.pages, self.points)
-        # Information disclosure & HTTP Host header attacks (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_information_disclosure(self.pages, self.points)
-        self.phase_http_host_header_attacks(self.pages, self.points)
-        # NoSQL injection & JWT (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_nosql_injection(self.pages, self.points)
-        self.phase_jwt(self.pages, self.points)
-        # Access control vulnerabilities & Race conditions (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_access_control(self.pages, self.points)
-        self.phase_race_conditions(self.pages, self.points)
-        # Web LLM attacks & Web cache deception (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_web_llm_attacks(self.pages, self.points)
-        self.phase_web_cache_deception(self.pages, self.points)
-        self.phase_file_upload_vulnerabilities(self.pages, self.points)
-        self.phase_prototype_pollution(self.pages, self.points)
-        self.phase_insecure_deserialization(self.pages, self.points)
-        self.phase_authentication(self.pages, self.points)
+        steps = [
+            ("Crawl & discovery halaman/input", lambda: self.crawl()),
+            ("SQLi: visible error-based", lambda: self.phase_visible_error(self.points)),
+            ("SQLi: WHERE clause / hidden data", lambda: self.phase_where_hidden(self.points)),
+            ("SQLi: login bypass", lambda: self.phase_login_bypass()),
+            ("SQLi: conditional errors (blind)", lambda: self.phase_conditional_errors(self.points)),
+            ("SQLi: conditional responses (blind)", lambda: self.phase_conditional_responses(self.points)),
+            ("SQLi: UNION column count", lambda: self.phase_union_column_count(self.points)),
+            ("SQLi: UNION text column", lambda: self.phase_union_text_column(self.points)),
+            ("SQLi: database version enumeration", lambda: self.phase_db_versions(self.points)),
+            ("SQLi: table/column listing", lambda: self.phase_listings(self.points)),
+            ("SQLi: other tables data extraction", lambda: self.phase_other_tables(self.points)),
+            ("SQLi: time delay (blind)", lambda: self.phase_time_delay(self.points)),
+            ("SQLi: time-based information extraction", lambda: self.phase_time_information(self.points)),
+            ("SQLi: XML-based injection", lambda: self.phase_xml(self.points)),
+            ("SQLi: out-of-band (OOB) techniques", lambda: self.phase_oob(self.points)),
+            ("XSS: reflected (HTML context)", lambda: self.phase_xss_reflected_html(self.points)),
+            ("XSS: stored (HTML context)", lambda: self.phase_xss_stored_html(self.points)),
+            ("XSS: DOM-based", lambda: self.phase_xss_dom(self.points)),
+            ("XSS: attribute injection/breakout", lambda: self.phase_xss_attribute(self.points)),
+            ("XSS: JavaScript context", lambda: self.phase_xss_javascript(self.points)),
+            ("XSS: AngularJS/template expression", lambda: self.phase_xss_angularjs(self.points)),
+            ("XSS: template literal", lambda: self.phase_xss_template_literal(self.points)),
+            ("XSS: CSP bypass checks", lambda: self.phase_xss_csp_bypass(self.points)),
+            ("XSS: exploitation scenarios", lambda: self.phase_xss_exploitation(self.points)),
+            ("XSS: advanced/reflected markup", lambda: self.phase_xss_advanced(self.points)),
+            ("CSRF: defense & token checks", lambda: self.phase_csrf_defenses(self.pages)),
+            ("CSRF: referer/origin checks", lambda: self.phase_csrf_referer(self.pages)),
+            ("Clickjacking: framing protections", lambda: self.phase_clickjacking(self.pages)),
+            ("DOM-based vulnerabilities (static analysis)", lambda: self.phase_dom_based(self.pages)),
+            ("CORS misconfiguration checks", lambda: self.phase_cors(self.pages)),
+            ("XXE (XML External Entity) checks", lambda: self.phase_xxe(self.pages, self.points)),
+            ("HTTP request smuggling checks", lambda: self.phase_smuggling(self.pages, self.points)),
+            ("SSRF checks", lambda: self.phase_ssrf(self.pages, self.points)),
+            ("OS command injection checks", lambda: self.phase_os_command_injection(self.pages, self.points)),
+            ("Web cache poisoning checks", lambda: self.phase_web_cache_poisoning(self.pages, self.points)),
+            ("Information disclosure checks", lambda: self.phase_information_disclosure(self.pages, self.points)),
+            ("HTTP Host header attack checks", lambda: self.phase_http_host_header_attacks(self.pages, self.points)),
+            ("NoSQL injection checks", lambda: self.phase_nosql_injection(self.pages, self.points)),
+            ("JWT security checks", lambda: self.phase_jwt(self.pages, self.points)),
+            ("Access control checks", lambda: self.phase_access_control(self.pages, self.points)),
+            ("Race condition checks", lambda: self.phase_race_conditions(self.pages, self.points)),
+            ("Web LLM attack checks", lambda: self.phase_web_llm_attacks(self.pages, self.points)),
+            ("Web cache deception checks", lambda: self.phase_web_cache_deception(self.pages, self.points)),
+            ("File upload vulnerability checks", lambda: self.phase_file_upload_vulnerabilities(self.pages, self.points)),
+            ("Prototype pollution checks", lambda: self.phase_prototype_pollution(self.pages, self.points)),
+            ("Insecure deserialization checks", lambda: self.phase_insecure_deserialization(self.pages, self.points)),
+            ("Authentication checks", lambda: self.phase_authentication(self.pages, self.points)),
+        ]
+        total = len(steps)
+        for i, (name, fn) in enumerate(steps, 1):
+            self._progress(i, total, name)
+            try:
+                fn()
+            except Exception:
+                # keep scanning; errors recorded in stats where applicable
+                pass
+        print(f"[SCAN {total}/{total}] Penyusunan laporan hasil pemindaian utama...", flush=True)
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
@@ -8944,13 +8950,25 @@ class _PdfBuilder:
         return self.y
 
     def section_title(self, title: str, subtitle: str | None = None) -> None:
-        self.ensure(52)
-        self.rect(_PDF_MARGIN, self.y - 20, 5, 20, _PDF_COLORS["teal"])
-        self.text(_PDF_MARGIN + 14, self.y - 14, title, 17, _PDF_COLORS["navy"], bold=True)
-        self.y -= 27
-        if subtitle:
-            self.paragraph(_PDF_MARGIN + 14, _PDF_PAGE_W - 2 * _PDF_MARGIN - 14, subtitle, 9.5, _PDF_COLORS["muted"])
-        self.y -= 10
+        title = str(title or "")
+        sub = str(subtitle or "") if subtitle else ""
+        title_lines = _pdf_wrap(title, _PDF_PAGE_W - 2 * _PDF_MARGIN - 20, 16.5)
+        sub_lines = _pdf_wrap(sub, _PDF_PAGE_W - 2 * _PDF_MARGIN - 20, 9.4) if sub else []
+        block_h = 14 + len(title_lines) * 18.5 + (8 + len(sub_lines) * 11.5 if sub_lines else 0) + 14
+        self.ensure(block_h)
+        top = self.y
+        self.rect(_PDF_MARGIN, top - block_h + 4, _PDF_PAGE_W - 2 * _PDF_MARGIN, block_h, _PDF_COLORS["light"])
+        self.rect(_PDF_MARGIN, top - block_h + 4, 4, block_h, _PDF_COLORS["teal"])
+        ty = top - 12
+        for line in title_lines:
+            self.text(_PDF_MARGIN + 14, ty, line, 16.0, _PDF_COLORS["navy"], bold=True)
+            ty -= 18.5
+        if sub_lines:
+            ty -= 1
+            for line in sub_lines:
+                self.text(_PDF_MARGIN + 14, ty, line, 9.2, _PDF_COLORS["muted"])
+                ty -= 11.5
+        self.y = top - block_h - 6
 
     def bullet_paragraph(self, text: Any, size: float = 9.2) -> None:
         self.paragraph(_PDF_MARGIN + 14, _PDF_PAGE_W - 2 * _PDF_MARGIN - 14, f"- {text}", size, _PDF_COLORS["text"])
@@ -9473,7 +9491,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         raise RuntimeError("URL target tidak ditemukan pada scrape_data/url.")
     if scrape_data is not None:
         persist_scrape_artifacts(scrape_data)
-    print(f"[PROGRESS] Memulai pemindaian XSS/basis scanner (satria_XSS.py / SatriaBaruScanner) — {target_url}", flush=True)
+    print(f"[PROGRESS] Memulai pemindaian kerentanan utama (XSS & pemeriksaan basis) — {target_url}", flush=True)
     report = scan_target(
         target_url,
         authorized=True,
@@ -9482,7 +9500,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         oob_poll_url=os.getenv("SATRIA_OOB_POLL_URL") or None,
         oob_webhook_site=os.getenv("SATRIA_OOB_WEBHOOK_SITE") in {"1", "true", "yes", "on"},
     )
-    print("[PROGRESS] Pemindaian XSS/basis scanner selesai. Mengintegrasikan hasil engine...", flush=True)
+    print("[PROGRESS] Pemindaian kerentanan utama selesai. Mengintegrasikan hasil analisis dan reconnaissance...", flush=True)
     summary = _summary_from_report(report)
     result: dict[str, Any] = {
         "target": report.get("target", target_url),
@@ -9493,7 +9511,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         "summary": summary,
         "errors": report.get("scan_stats", {}).get("errors", []),
     }
-    # Integrate engine scan results (satria_engine.py capabilities) into unified report
+    # Integrate engine scan results (mesin analisis capabilities) into unified report
     try:
         engine_scan = _collect_engine_scan_results(target_url, authorized=auth)
         result["engine_scan"] = engine_scan
@@ -9563,7 +9581,7 @@ if __name__ == "__main__":
 
 
 # ======================================================================
-# MERGED CAPABILITIES FROM SATRIA/satria_engine.py
+# MERGED CAPABILITIES FROM SATRIA/mesin analisis
 # All non-overlapping scanning capabilities included below.
 # Overlapping function/class names preserved as engine_<name>.
 # ======================================================================
@@ -15280,11 +15298,13 @@ _ENGINE_DISABLED_PROBES = {
     "sqli", "xss", "dom", "clickjacking", "cors", "path_traversal",
     "access_control", "cache_poisoning", "cache_deception", "deserialization",
     "info_disclosure", "business_logic", "jwt", "essential", "graphql", "api",
+    "xxe", "ssrf", "smuggling", "os_command", "ssti", "file_upload", "race", "llm",
 }
 _ENGINE_DISABLED_CATEGORIES = {
     "sql_injection", "xss", "dom", "clickjacking", "cors", "path_traversal",
     "access_control", "cache_poisoning", "cache_deception", "deserialization",
     "info_disclosure", "business_logic", "jwt", "essential", "graphql", "api",
+    "xxe", "ssrf", "smuggling", "os_command", "ssti", "file_upload", "race", "llm",
 }
 
 def _run_probes(ctx, app: dict[str, tuple[bool, str]], progress_offset: int = 0,
@@ -19701,45 +19721,48 @@ def _severity_color(sev: str):
 def _draw_kv_table(page, content_left, content_width, title, rows, headers=("Item", "Nilai", "Keterangan"),
                    widths=(150.0, 140.0, 209.0), header_color=None):
     if title:
-        page.ensure(26)
-        page.text(content_left, page.y - 12, title, 11.5, _PDF_COLORS["navy"], bold=True)
-        page.y -= 22
+        page.ensure(28)
+        page.text(content_left, page.y - 12, title, 11.3, _PDF_COLORS["navy"], bold=True)
+        page.y -= 24
     header_color = header_color or _PDF_COLORS["navy"]
+    if len(widths) != len(headers):
+        widths = [content_width / max(len(headers),1)] * len(headers)
     x_cols = [content_left]
     for w in widths[:-1]:
         x_cols.append(x_cols[-1] + w)
-    header_h = 18.0
-    page.ensure(header_h + 20)
+    header_h = 20.0
+    page.ensure(header_h + 22)
     page.rect_top(content_left, page.y, content_width, header_h, header_color)
     for i, h in enumerate(headers):
-        page.text(x_cols[i] + 5, page.y - 13, h, 8.0, _PDF_COLORS["white"], bold=True)
+        page.text(x_cols[i] + 6, page.y - 13.5, h, 8.2, _PDF_COLORS["white"], bold=True)
     page.y -= header_h
     if not rows:
-        page.ensure(20)
-        page.rect_top(content_left, page.y, content_width, 18, _PDF_COLORS["light"])
-        page.text(content_left + 5, page.y - 12, "Tidak ada data pada pemindaian ini.", 8.5, _PDF_COLORS["muted"])
-        page.y -= 22
+        page.ensure(22)
+        page.rect_top(content_left, page.y, content_width, 20, _PDF_COLORS["light"])
+        page.text(content_left + 6, page.y - 13, "Tidak ada data pada pemindaian ini.", 8.6, _PDF_COLORS["muted"])
+        page.y -= 26
         return
     for r_idx, row in enumerate(rows):
-        cell_lines = [_pdf_wrap(str(c or "-"), max(widths[i] - 10, 20), 8.5) for i, c in enumerate(row)]
-        row_h = max(1, max(len(lines) for lines in cell_lines)) * 11.2 + 8
+        cell_lines = [_pdf_wrap(str(c or "-"), max(widths[i] - 12, 20), 8.4) for i, c in enumerate(row)]
+        row_h = max(19, max(len(lines) for lines in cell_lines)) * 11.4 + 8
         page.ensure(row_h + 2)
-        if r_idx % 2 == 0:
-            page.rect_top(content_left, page.y, content_width, row_h, _PDF_COLORS["light"])
+        bg = _PDF_COLORS["white"] if r_idx % 2 == 0 else _PDF_COLORS["light"]
+        page.rect_top(content_left, page.y, content_width, row_h, bg)
+        page.line(content_left, page.y - row_h, content_left + content_width, page.y - row_h, _PDF_COLORS["line"], 0.3)
         for i, lines in enumerate(cell_lines):
             for j, line in enumerate(lines):
-                page.text(x_cols[i] + 5, page.y - 10 - j * 11.2, line, 8.5, _PDF_COLORS["text"])
+                page.text(x_cols[i] + 6, page.y - 11 - j * 11.4, line, 8.4, _PDF_COLORS["text"])
         page.y -= row_h
-    page.y -= 8
+    page.y -= 10
 
 def _draw_finding_cards(page, content_left, content_width, title, findings, max_items=40, subtitle=None):
     if title:
-        page.ensure(28)
-        page.text(content_left, page.y - 12, title, 11.5, _PDF_COLORS["navy"], bold=True)
-        page.y -= 20
+        page.ensure(30)
+        page.text(content_left, page.y - 12, title, 11.3, _PDF_COLORS["navy"], bold=True)
+        page.y -= 22
     if subtitle:
         page.paragraph(content_left, content_width, subtitle, 9.0, _PDF_COLORS["muted"])
-        page.y -= 2
+        page.y -= 4
     if not findings:
         page.bullet_paragraph("Tidak ada temuan/hasil pada pemindaian ini.")
         return
@@ -19751,26 +19774,32 @@ def _draw_finding_cards(page, content_left, content_width, title, findings, max_
         evid = str(fnd.get("evidence", fnd.get("detail", fnd.get("description", "-"))))
         risk = str(fnd.get("risk", fnd.get("impact", "")) or "")
         rec = str(fnd.get("recommendation", fnd.get("remediation", "")) or "")
-        lines_main = _pdf_wrap(f"[{sev}] {ftype}", content_width - 24, 9.5)
-        lines_ev = _pdf_wrap(f"Bukti/Detail: {evid}", content_width - 24, 8.3)
-        lines_risk = _pdf_wrap(f"Risiko: {risk}", content_width - 24, 8.3) if risk else []
-        lines_rec = _pdf_wrap(f"Rekomendasi: {rec}", content_width - 24, 8.3) if rec else []
+        lines_main = _pdf_wrap(f"[{sev}] {ftype}", content_width - 28, 9.6)
+        lines_ev = _pdf_wrap(f"Bukti/Detail: {evid}", content_width - 28, 8.4)
+        lines_risk = _pdf_wrap(f"Risiko: {risk}", content_width - 28, 8.4) if risk else []
+        lines_rec = _pdf_wrap(f"Rekomendasi: {rec}", content_width - 28, 8.4) if rec else []
         all_lines = lines_main + lines_ev + lines_risk + lines_rec
-        card_h = max(36, len(all_lines) * 11.5 + 14)
-        page.ensure(card_h + 8)
-        col, bg = _severity_color(sev)
+        card_h = max(38, len(all_lines) * 11.6 + 16)
+        page.ensure(card_h + 10)
+        try:
+            col, bg = _severity_color(sev)
+        except Exception:
+            col, bg = _PDF_COLORS["navy"], _PDF_COLORS["light"]
         page.rect_top(content_left, page.y, content_width, card_h, bg)
-        page.rect_top(content_left, page.y, 5, card_h, col)
+        page.rect_top(content_left, page.y, 4, card_h, col)
+        page.rect_top(content_left + 4, page.y, content_width - 4, card_h, _PDF_COLORS["white"])
+        # subtle inner tint
+        page.rect_top(content_left + 4, page.y, content_width - 4, card_h, bg)
         ytxt = page.y - 14
         for i, line in enumerate(lines_main):
-            page.text(content_left + 12, ytxt, line, 9.5, col, bold=True); ytxt -= 11.5
+            page.text(content_left + 14, ytxt, line, 9.6, col, bold=True); ytxt -= 11.6
         for line in lines_ev:
-            page.text(content_left + 12, ytxt, line, 8.3, _PDF_COLORS["text"]); ytxt -= 11.5
+            page.text(content_left + 14, ytxt, line, 8.4, _PDF_COLORS["text"]); ytxt -= 11.6
         for line in lines_risk:
-            page.text(content_left + 12, ytxt, line, 8.3, _PDF_COLORS["text"]); ytxt -= 11.5
+            page.text(content_left + 14, ytxt, line, 8.4, _PDF_COLORS["text"]); ytxt -= 11.6
         for line in lines_rec:
-            page.text(content_left + 12, ytxt, line, 8.3, _PDF_COLORS["muted"]); ytxt -= 11.5
-        page.y -= (card_h + 8)
+            page.text(content_left + 14, ytxt, line, 8.4, _PDF_COLORS["muted"]); ytxt -= 11.6
+        page.y -= (card_h + 10)
     if len(findings) > max_items:
         page.bullet_paragraph(f"... dan {len(findings)-max_items} item lainnya (diringkas).")
 
@@ -20285,7 +20314,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 260, 18, 260, _PDF_COLORS["teal"])
     page.text(content_left + 10, _PDF_PAGE_H - 78, "SATRIA FIX1", 34, _PDF_COLORS["white"], bold=True)
     page.text(content_left + 10, _PDF_PAGE_H - 108, "LAPORAN PEMINDAIAN KEAMANAN WEB TERPADU", 15, _PDF_COLORS["light"], bold=True)
-    page.text(content_left + 10, _PDF_PAGE_H - 132, "Gabungan penuh satria_XSS.py + seluruh kemampuan scanning satria_engine.py", 10.5, _PDF_COLORS["light"])
+    page.text(content_left + 10, _PDF_PAGE_H - 132, "Laporan terpadu: observasi, analisis, reconnaissance, dan hasil pemindaian", 10.5, _PDF_COLORS["light"])
     page.text(content_left + 10, _PDF_PAGE_H - 150, "Hasil observasi, analisis kode, teknologi, recon/discovery, pemindaian aktif, Censys/NVD/CVE.", 9.5, _PDF_COLORS["light"])
 
     page.y = _PDF_PAGE_H - 310
@@ -20458,3 +20487,4 @@ def run_satria_fix1_scan(target_url: str, html: str = "", authorized: bool = Fal
         "cves": len(engine.get("cves") or []),
     }
     return result
+
