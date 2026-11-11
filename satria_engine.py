@@ -8942,7 +8942,7 @@ class _PdfBuilder:
 
     def paragraph(self, x: float, width: float, text: Any, size: float = 9.0, color=None, bold: bool = False, leading: float | None = None, space_before: float = 0.0) -> float:
         self.y -= space_before
-        leading = leading or size * 1.36
+        leading = leading or size * 1.22
         for line in _pdf_wrap(text, width, size):
             self.ensure(size)
             self.y -= leading
@@ -8952,26 +8952,28 @@ class _PdfBuilder:
     def section_title(self, title: str, subtitle: str | None = None) -> None:
         title = str(title or "")
         sub = str(subtitle or "") if subtitle else ""
-        title_lines = _pdf_wrap(title, _PDF_PAGE_W - 2 * _PDF_MARGIN - 20, 16.5)
-        sub_lines = _pdf_wrap(sub, _PDF_PAGE_W - 2 * _PDF_MARGIN - 20, 9.4) if sub else []
-        block_h = 14 + len(title_lines) * 18.5 + (8 + len(sub_lines) * 11.5 if sub_lines else 0) + 14
-        self.ensure(block_h)
+        title_lines = _pdf_wrap(title, _PDF_PAGE_W - 2 * _PDF_MARGIN - 24, 15.5)
+        sub_lines = _pdf_wrap(sub, _PDF_PAGE_W - 2 * _PDF_MARGIN - 24, 9.0) if sub else []
+        block_h = 16 + len(title_lines) * 17.5 + (6 + len(sub_lines) * 11.0 if sub_lines else 0) + 10
+        self.ensure(block_h + 16)
+        self.y -= 14
         top = self.y
-        self.rect(_PDF_MARGIN, top - block_h + 4, _PDF_PAGE_W - 2 * _PDF_MARGIN, block_h, _PDF_COLORS["light"])
-        self.rect(_PDF_MARGIN, top - block_h + 4, 4, block_h, _PDF_COLORS["teal"])
-        ty = top - 12
+        self.rect(_PDF_MARGIN, top - block_h, _PDF_PAGE_W - 2 * _PDF_MARGIN, block_h, _PDF_COLORS["light"])
+        self.rect(_PDF_MARGIN, top - block_h, 4, block_h, _PDF_COLORS["teal"])
+        ty = top - 20
         for line in title_lines:
-            self.text(_PDF_MARGIN + 14, ty, line, 16.0, _PDF_COLORS["navy"], bold=True)
-            ty -= 18.5
+            self.text(_PDF_MARGIN + 14, ty, line, 15.5, _PDF_COLORS["navy"], bold=True)
+            ty -= 17.5
         if sub_lines:
-            ty -= 1
+            ty -= 3
             for line in sub_lines:
-                self.text(_PDF_MARGIN + 14, ty, line, 9.2, _PDF_COLORS["muted"])
-                ty -= 11.5
-        self.y = top - block_h - 6
+                self.text(_PDF_MARGIN + 14, ty, line, 9.0, _PDF_COLORS["muted"])
+                ty -= 11.0
+        self.y = top - block_h - 10
 
     def bullet_paragraph(self, text: Any, size: float = 9.2) -> None:
         self.paragraph(_PDF_MARGIN + 14, _PDF_PAGE_W - 2 * _PDF_MARGIN - 14, f"- {text}", size, _PDF_COLORS["text"])
+        self.y -= 3
 
     def pill(self, x: float, top: float, label: str, color, light=None, right: float | None = None) -> float:
         label = _pdf_safe_text(label)
@@ -19721,9 +19723,9 @@ def _severity_color(sev: str):
 def _draw_kv_table(page, content_left, content_width, title, rows, headers=("Item", "Nilai", "Keterangan"),
                    widths=(150.0, 140.0, 209.0), header_color=None):
     if title:
-        page.ensure(28)
-        page.text(content_left, page.y - 12, title, 11.3, _PDF_COLORS["navy"], bold=True)
-        page.y -= 24
+        page.ensure(36)
+        page.text(content_left, page.y - 16, title, 11.3, _PDF_COLORS["navy"], bold=True)
+        page.y -= 34
     header_color = header_color or _PDF_COLORS["navy"]
     if len(widths) != len(headers):
         widths = [content_width / max(len(headers),1)] * len(headers)
@@ -19744,16 +19746,16 @@ def _draw_kv_table(page, content_left, content_width, title, rows, headers=("Ite
         return
     for r_idx, row in enumerate(rows):
         cell_lines = [_pdf_wrap(str(c or "-"), max(widths[i] - 12, 20), 8.4) for i, c in enumerate(row)]
-        row_h = max(19, max(len(lines) for lines in cell_lines)) * 11.4 + 8
+        row_h = max(16.0, max(len(lines) for lines in cell_lines) * 10.4 + 7.0)
         page.ensure(row_h + 2)
         bg = _PDF_COLORS["white"] if r_idx % 2 == 0 else _PDF_COLORS["light"]
         page.rect_top(content_left, page.y, content_width, row_h, bg)
         page.line(content_left, page.y - row_h, content_left + content_width, page.y - row_h, _PDF_COLORS["line"], 0.3)
         for i, lines in enumerate(cell_lines):
             for j, line in enumerate(lines):
-                page.text(x_cols[i] + 6, page.y - 11 - j * 11.4, line, 8.4, _PDF_COLORS["text"])
+                page.text(x_cols[i] + 6, page.y - 10.2 - j * 10.4, line, 8.4, _PDF_COLORS["text"])
         page.y -= row_h
-    page.y -= 10
+    page.y -= 8
 
 def _draw_finding_cards(page, content_left, content_width, title, findings, max_items=40, subtitle=None):
     if title:
@@ -19779,8 +19781,8 @@ def _draw_finding_cards(page, content_left, content_width, title, findings, max_
         lines_risk = _pdf_wrap(f"Risiko: {risk}", content_width - 28, 8.4) if risk else []
         lines_rec = _pdf_wrap(f"Rekomendasi: {rec}", content_width - 28, 8.4) if rec else []
         all_lines = lines_main + lines_ev + lines_risk + lines_rec
-        card_h = max(38, len(all_lines) * 11.6 + 16)
-        page.ensure(card_h + 10)
+        card_h = max(32, len(all_lines) * 10.6 + 13)
+        page.ensure(card_h + 8)
         try:
             col, bg = _severity_color(sev)
         except Exception:
@@ -19790,16 +19792,16 @@ def _draw_finding_cards(page, content_left, content_width, title, findings, max_
         page.rect_top(content_left + 4, page.y, content_width - 4, card_h, _PDF_COLORS["white"])
         # subtle inner tint
         page.rect_top(content_left + 4, page.y, content_width - 4, card_h, bg)
-        ytxt = page.y - 14
+        ytxt = page.y - 12
         for i, line in enumerate(lines_main):
-            page.text(content_left + 14, ytxt, line, 9.6, col, bold=True); ytxt -= 11.6
+            page.text(content_left + 14, ytxt, line, 9.4, col, bold=True); ytxt -= 10.6
         for line in lines_ev:
-            page.text(content_left + 14, ytxt, line, 8.4, _PDF_COLORS["text"]); ytxt -= 11.6
+            page.text(content_left + 14, ytxt, line, 8.3, _PDF_COLORS["text"]); ytxt -= 10.6
         for line in lines_risk:
-            page.text(content_left + 14, ytxt, line, 8.4, _PDF_COLORS["text"]); ytxt -= 11.6
+            page.text(content_left + 14, ytxt, line, 8.3, _PDF_COLORS["text"]); ytxt -= 10.6
         for line in lines_rec:
-            page.text(content_left + 14, ytxt, line, 8.4, _PDF_COLORS["muted"]); ytxt -= 11.6
-        page.y -= (card_h + 10)
+            page.text(content_left + 14, ytxt, line, 8.3, _PDF_COLORS["muted"]); ytxt -= 10.6
+        page.y -= (card_h + 8)
     if len(findings) > max_items:
         page.bullet_paragraph(f"... dan {len(findings)-max_items} item lainnya (diringkas).")
 
@@ -20090,6 +20092,102 @@ def _collect_engine_scan_results(target_url: str, html: str = "", http_result: d
 
 
 
+
+_LAB_TYPE_RANGES = [
+    (1, 18, "SQL injection"),
+    (19, 48, "Cross-site scripting (XSS)"),
+    (49, 59, "Cross-site request forgery (CSRF)"),
+    (60, 64, "Clickjacking"),
+    (65, 71, "DOM-based vulnerabilities"),
+    (72, 74, "Cross-origin resource sharing (CORS)"),
+    (75, 83, "XML external entity (XXE) injection"),
+    (84, 90, "Server-side request forgery (SSRF)"),
+    (91, 112, "HTTP request smuggling"),
+    (113, 117, "OS command injection"),
+    (118, 130, "Web cache poisoning"),
+    (131, 135, "Information disclosure"),
+    (136, 142, "HTTP Host header attacks"),
+    (143, 146, "NoSQL injection"),
+    (147, 154, "JWT"),
+    (155, 167, "Access control vulnerabilities"),
+    (168, 173, "Race conditions"),
+    (174, 181, "Web LLM attacks"),
+    (182, 186, "Web cache deception"),
+    (187, 193, "File upload vulnerabilities"),
+    (194, 203, "Prototype pollution"),
+    (204, 213, "Insecure deserialization"),
+    (214, 227, "Authentication"),
+]
+
+
+def _pdf_short_lab_title(title: str) -> str:
+    t = _pdf_safe_text(title)
+    for prefix in (
+        "SQL injection vulnerability in ", "SQL injection vulnerability ", "SQL injection attack, ", "SQL injection with ",
+        "Blind SQL injection with ", "Reflected XSS into ", "Reflected XSS with ",
+        "Reflected XSS in ", "Stored XSS into ", "Stored XSS with ",
+        "Exploiting cross-site scripting to ", "Exploiting XSS to ",
+        "Cross-site request forgery (CSRF) vulnerability in ", "CSRF vulnerability with ",
+        "DOM-based ", "Client-side ", "Server-side ",
+    ):
+        if t.lower().startswith(prefix.lower()):
+            t = t[len(prefix):]
+            break
+    t = t.strip().rstrip(".")
+    return (t[:1].upper() + t[1:]) if t else t
+
+
+def _render_vuln_types_v2(page, content_left, content_width, result):
+    items = _pdf_lab_items(result)
+    if not items:
+        return
+    by_type = []
+    for start, end, label in _LAB_TYPE_RANGES:
+        group = [it for it in items if start <= int(it.get("number", 0)) <= end]
+        if not group:
+            continue
+        confirmed_n = sum(1 for it in group if str(it.get("status", "")).lower() == "confirmed")
+        by_type.append({"label": label, "start": start, "end": end, "items": group,
+                        "total": len(group), "confirmed": confirmed_n})
+    if not by_type:
+        return
+
+    page.ensure(170)
+    page.section_title("Hasil Pemindaian Kerentanan per Jenis",
+                       "Rekapitulasi seluruh 227 kriteria asesmen, dikelompokkan per jenis kerentanan. Rincian kriteria per jenis ditampilkan pada tabel dan daftar cakupan di bawah.")
+    rows = []
+    for g in by_type:
+        rows.append((g["label"], str(g["total"]), str(g["confirmed"]),
+                     str(g["total"] - g["confirmed"]), f"#{g['start']}-#{g['end']}"))
+    total_conf = sum(g["confirmed"] for g in by_type)
+    total_all = sum(g["total"] for g in by_type)
+    rows.append(("TOTAL", str(total_all), str(total_conf), str(total_all - total_conf), "#1-#227"))
+    _draw_kv_table(page, content_left, content_width, "Rekap per Jenis Kerentanan", rows,
+                   headers=("Jenis Kerentanan", "Kriteria", "Terkonfirmasi", "Belum", "Rentang"),
+                   widths=(199.0, 60.0, 85.0, 60.0, 95.0), header_color=_PDF_COLORS["navy"])
+
+    page.ensure(30)
+    page.text(content_left, page.y - 12, "Cakupan 227 Kriteria per Jenis", 11.2, _PDF_COLORS["navy"], bold=True)
+    page.y -= 24
+    for g in by_type:
+        parts = []
+        for it in g["items"]:
+            num = it.get("number", "-")
+            short = _pdf_short_lab_title(str(it.get("title", "-")))
+            mark = " [terkonfirmasi]" if str(it.get("status", "")).lower() == "confirmed" else ""
+            parts.append(f"#{num} {short}{mark}")
+        body = "  |  ".join(parts)
+        body_lines = _pdf_wrap(body, content_width, 8.2)
+        block_h = 16 + len(body_lines) * 10.2
+        # keep each vulnerability type block on one page (no orphan continuation line)
+        page.ensure(min(block_h + 6, 560))
+        page.text(content_left, page.y - 10, f"{g['label']}  ({g['total']} kriteria, {g['confirmed']} terkonfirmasi)",
+                  9.0, _PDF_COLORS["teal"], bold=True)
+        page.y -= 15
+        page.paragraph(content_left, content_width, body, 8.2, _PDF_COLORS["text"])
+        page.y -= 6
+
+
 def _render_engine_sections_v2(page, content_left, content_width, result):
     eng = result.get("engine_scan") or {}
     http = eng.get("engine_http") or result.get("engine_http") or {}
@@ -20108,7 +20206,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
     errors = eng.get("engine_errors") or []
 
     # 1) Teknologi yang digunakan & Analisis HTTP
-    page.new_page()
+    page.ensure(150)
     page.section_title("Teknologi yang Digunakan & Analisis HTTP",
                        "Hasil deteksi teknologi, server banner, header, dan observasi HTTP dari kemampuan engine.")
     server = str(http.get("server") or "-")
@@ -20128,7 +20226,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
     _draw_finding_cards(page, content_left, content_width, "Hasil Observasi HTTP (analyze_http_security)", http_findings, max_items=30)
 
     # 2) Hasil observasi dan analisis kode
-    page.new_page()
+    page.ensure(150)
     page.section_title("Hasil Observasi dan Analisis Kode",
                        "Temuan deterministik dari analisis HTML/JS dan observasi keamanan kode (engine).")
     if code_findings:
@@ -20137,7 +20235,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
         page.bullet_paragraph("Tidak ada temuan kode deterministik dari analisis pada konten yang dipindai.")
 
     # 3) Discovery & Reconnaissance
-    page.new_page()
+    page.ensure(150)
     page.section_title("Discovery & Reconnaissance",
                        "Hasil discovery/reconnaissance dari kemampuan engine, termasuk metrik penemuan halaman, DNS records, email security (DNS observation), dan TLS protocols.")
     stats = lab.get("stats") if isinstance(lab.get("stats"), dict) else {}
@@ -20189,7 +20287,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
                    headers=("Protokol/Versi", "Status", "Detail/Cipher"), widths=(140.0, 110.0, 249.0), header_color=_PDF_COLORS["navy"])
 
     # 4) Hasil pemindaian aktif
-    page.new_page()
+    page.ensure(150)
     page.section_title("Hasil Pemindaian Aktif",
                        "Ringkasan dan temuan dari probe aktif engine (sesuai izin/mode pemindaian).")
     active_rows = [
@@ -20207,7 +20305,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
     _draw_finding_cards(page, content_left, content_width, "Temuan/Kandidat Hasil Pemindaian Aktif & Lab Engine", active_findings, max_items=30)
 
     # 5) Censys, NVD, CVE
-    page.new_page()
+    page.ensure(150)
     page.section_title("Hasil Pemindaian Censys, NVD, dan CVE",
                        "Hasil intelijen/lookup dari kemampuan engine: Censys, NVD/OSV, dan CVE yang ditemukan.")
 
@@ -20222,8 +20320,8 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
         censys_notes = []
         censys_enabled = False
     page.ensure(24)
-    page.text(content_left, page.y - 12, "Hasil Censys", 11.0, _PDF_COLORS["navy"], bold=True)
-    page.y -= 20
+    page.text(content_left, page.y - 16, "Hasil Censys", 11.0, _PDF_COLORS["navy"], bold=True)
+    page.y -= 30
     if censys_results:
         _draw_finding_cards(page, content_left, content_width, None, [r if isinstance(r,dict) else {"evidence": str(r), "severity":"info", "type":"Censys"} for r in censys_results], max_items=20)
     else:
@@ -20232,8 +20330,8 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
 
     # NVD/OSV & CVE
     page.ensure(24)
-    page.text(content_left, page.y - 12, "CVE yang Ditemukan (NVD/OSV)", 11.0, _PDF_COLORS["navy"], bold=True)
-    page.y -= 20
+    page.text(content_left, page.y - 16, "CVE yang Ditemukan (NVD/OSV)", 11.0, _PDF_COLORS["navy"], bold=True)
+    page.y -= 30
     if cves:
         cve_rows = []
         for c in cves[:40]:
@@ -20268,7 +20366,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
                        headers=("Teknologi/Query", "Status", "Matches", "Keterangan/Error"), widths=(150.0, 90.0, 70.0, 189.0))
 
     if errors:
-        page.new_page()
+        page.ensure(150)
         page.section_title("Catatan Eksekusi Engine")
         for e in errors[:20]:
             page.bullet_paragraph(str(e), 8.8)
@@ -20312,13 +20410,18 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 260, _PDF_PAGE_W, 260, _PDF_COLORS["navy"])
     page.rect(0, _PDF_PAGE_H - 272, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.rect(0, _PDF_PAGE_H - 260, 18, 260, _PDF_COLORS["teal"])
-    page.text(content_left + 10, _PDF_PAGE_H - 78, "SATRIA FIX1", 34, _PDF_COLORS["white"], bold=True)
-    page.text(content_left + 10, _PDF_PAGE_H - 108, "LAPORAN PEMINDAIAN KEAMANAN WEB TERPADU", 15, _PDF_COLORS["light"], bold=True)
-    page.text(content_left + 10, _PDF_PAGE_H - 132, "Laporan terpadu: observasi, analisis, reconnaissance, dan hasil pemindaian", 10.5, _PDF_COLORS["light"])
-    page.text(content_left + 10, _PDF_PAGE_H - 150, "Hasil observasi, analisis kode, teknologi, recon/discovery, pemindaian aktif, Censys/NVD/CVE.", 9.5, _PDF_COLORS["light"])
+    page.text(content_left + 10, _PDF_PAGE_H - 58, "CYBERSECURITY INTELLIGENCE PLATFORM", 9.2, _PDF_COLORS["teal"], bold=True)
+    page.text(content_left + 10, _PDF_PAGE_H - 104, "S A T R I A", 38, _PDF_COLORS["white"], bold=True)
+    page.text(content_left + 10, _PDF_PAGE_H - 130, "Sistem Agen Terpadu Reconnaissance, Intelijen, dan Asesmen", 12.5, _PDF_COLORS["light"], bold=True)
+    page.line(content_left + 10, _PDF_PAGE_H - 146, content_left + 150, _PDF_PAGE_H - 146, _PDF_COLORS["teal"], 1.2)
+    page.text(content_left + 10, _PDF_PAGE_H - 196, "ACTIVE & PASSIVE RECON", 8.6, _PDF_COLORS["white"], bold=True)
+    page.text(content_left + 190, _PDF_PAGE_H - 196, "TECHNOLOGY FINGERPRINTING", 8.6, _PDF_COLORS["white"], bold=True)
+    page.text(content_left + 400, _PDF_PAGE_H - 196, "CVE INTELLIGENCE", 8.6, _PDF_COLORS["white"], bold=True)
+    page.text(content_left + 10, _PDF_PAGE_H - 214, "ASESMEN KERENTANAN", 8.6, _PDF_COLORS["white"], bold=True)
+    page.text(content_left + 10, _PDF_PAGE_H - 240, "Laporan asesmen keamanan terpadu: observasi, analisis kode, teknologi, reconnaissance, dan pemindaian aktif.", 8.8, _PDF_COLORS["light"])
 
     page.y = _PDF_PAGE_H - 310
-    page.paragraph(content_left, content_width, "Executive Summary", 22, _PDF_COLORS["navy"], bold=True)
+    page.paragraph(content_left, content_width, "Ringkasan Eksekutif", 20, _PDF_COLORS["navy"], bold=True, space_before=4)
     page.paragraph(content_left, content_width,
                    "Laporan ini menyajikan hasil pemindaian dan analisis keamanan web berdasarkan kemampuan gabungan engine. Seluruh data yang ditampilkan merupakan hasil aktual dari proses pemindaian/analisis yang dijalankan (HTTP, deteksi teknologi, analisis kode, recon/discovery, lab scan aktif/pasif, serta intelijen NVD/OSV/Censys bila tersedia).",
                    10.2, _PDF_COLORS["muted"])
@@ -20365,19 +20468,20 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         ("Observasi/temuan HTTP", str(http_findings_count), "Hasil analyze_http_security (engine)."),
         ("Temuan analisis kode", str(code_findings_count), "Hasil detect_code_findings_deterministic (engine)."),
         ("Total lab engine", str(eng_lab_total or "-"), "Katalog lab engine (scan_labs)."),
-        ("Deteksi engine", str(detected_count), "Deteksi/kandidat terbukti pada engine lab scan."),
-        ("CVE ditemukan", str(len(eng_cves)), "Hasil pencarian/temuan CVE (NVD/OSV/audit)."),
-        ("Temuan XSS terkonfirmasi", str(len(confirmed)), "Dari basis XSS jika tersedia pada hasil."),
-        ("Temuan XSS belum terkonfirmasi", str(len(not_confirmed)), "Dari basis XSS jika tersedia pada hasil."),
+        ("Kriteria terkonfirmasi", str(len(confirmed)), "Dari 227 kriteria asesmen kerentanan."),
+        ("Kriteria belum terkonfirmasi", str(len(not_confirmed)), "Dari 227 kriteria asesmen kerentanan."),
     ]
-    _draw_kv_table(page, content_left, content_width, None, rows, widths=(170.0, 90.0, 239.0), header_color=_PDF_COLORS["navy"])
+    _draw_kv_table(page, content_left, content_width, None, rows, widths=(150.0, 175.0, 174.0), header_color=_PDF_COLORS["navy"])
 
     # Render all requested engine sections (includes DNS/TLS/email/Censys/NVD/CVE/active/discovery/observasi & analisis kode/teknologi)
     _render_engine_sections_v2(page, content_left, content_width, result)
 
+    # Pemindaian kerentanan dikelompokkan per jenis (mencakup seluruh 227 kriteria)
+    _render_vuln_types_v2(page, content_left, content_width, result)
+
     # Optional: show confirmed XSS evidence if present (bukan "Katalog Utama")
     if confirmed:
-        page.new_page()
+        page.ensure(150)
         page.section_title("Bukti Temuan Terkonfirmasi (XSS/Basis Scanner)",
                            "Detail bukti untuk temuan berstatus confirmed dari basis scanner, jika ada.")
         for item in confirmed[:40]:
@@ -20412,8 +20516,8 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     footer_target_short = ft_lines[0] if ft_lines else footer_target[:90]
     for i, ops in enumerate(page.pages, start=1):
         ops.insert(0, f"{_pdf_rgb(_PDF_COLORS['navy'])} rg 0 {_pdf_num(_PDF_PAGE_H - 34)} {_pdf_num(_PDF_PAGE_W)} 34 re f")
-        ops.insert(1, f"BT /F2 8.5 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA FIX1 - Unified Security Report) Tj ET")
-        ops.insert(2, f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(360)} {_pdf_num(_PDF_PAGE_H - 21)} Td (Engine + XSS Integrated) Tj ET")
+        ops.insert(1, f"BT /F2 8.5 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA - Cybersecurity Intelligence Platform) Tj ET")
+        ops.insert(2, f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(360)} {_pdf_num(_PDF_PAGE_H - 21)} Td (Reconnaissance | Intelijen | Asesmen Kerentanan) Tj ET")
         ops.append(f"{_pdf_num(0.5)} w {_pdf_rgb(_PDF_COLORS['line'])} RG {_pdf_num(content_left)} {_pdf_num(38)} {_pdf_num(content_width)} 0 re S")
         # draw footer target as wrapped if needed (single extra line max)
         ops.append(f"BT /F1 7.3 Tf {_pdf_rgb(_PDF_COLORS['muted'])} rg {_pdf_num(content_left)} {_pdf_num(24)} Td ({_pdf_escape_text(footer_target_short)}) Tj ET")
