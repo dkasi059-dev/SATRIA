@@ -1803,64 +1803,116 @@ class SatriaBaruScanner:
         except Exception:
             pass
 
-    def scan(self) -> dict[str, Any]:
-        steps = [
-            ("Crawl & discovery halaman/input", lambda: self.crawl()),
-            ("SQLi: visible error-based", lambda: self.phase_visible_error(self.points)),
-            ("SQLi: WHERE clause / hidden data", lambda: self.phase_where_hidden(self.points)),
-            ("SQLi: login bypass", lambda: self.phase_login_bypass()),
-            ("SQLi: conditional errors (blind)", lambda: self.phase_conditional_errors(self.points)),
-            ("SQLi: conditional responses (blind)", lambda: self.phase_conditional_responses(self.points)),
-            ("SQLi: UNION column count", lambda: self.phase_union_column_count(self.points)),
-            ("SQLi: UNION text column", lambda: self.phase_union_text_column(self.points)),
-            ("SQLi: database version enumeration", lambda: self.phase_db_versions(self.points)),
-            ("SQLi: table/column listing", lambda: self.phase_listings(self.points)),
-            ("SQLi: other tables data extraction", lambda: self.phase_other_tables(self.points)),
-            ("SQLi: time delay (blind)", lambda: self.phase_time_delay(self.points)),
-            ("SQLi: time-based information extraction", lambda: self.phase_time_information(self.points)),
-            ("SQLi: XML-based injection", lambda: self.phase_xml(self.points)),
-            ("SQLi: out-of-band (OOB) techniques", lambda: self.phase_oob(self.points)),
-            ("XSS: reflected (HTML context)", lambda: self.phase_xss_reflected_html(self.points)),
-            ("XSS: stored (HTML context)", lambda: self.phase_xss_stored_html(self.points)),
-            ("XSS: DOM-based", lambda: self.phase_xss_dom(self.points)),
-            ("XSS: attribute injection/breakout", lambda: self.phase_xss_attribute(self.points)),
-            ("XSS: JavaScript context", lambda: self.phase_xss_javascript(self.points)),
-            ("XSS: AngularJS/template expression", lambda: self.phase_xss_angularjs(self.points)),
-            ("XSS: template literal", lambda: self.phase_xss_template_literal(self.points)),
-            ("XSS: CSP bypass checks", lambda: self.phase_xss_csp_bypass(self.points)),
-            ("XSS: exploitation scenarios", lambda: self.phase_xss_exploitation(self.points)),
-            ("XSS: advanced/reflected markup", lambda: self.phase_xss_advanced(self.points)),
-            ("CSRF: defense & token checks", lambda: self.phase_csrf_defenses(self.pages)),
-            ("CSRF: referer/origin checks", lambda: self.phase_csrf_referer(self.pages)),
-            ("Clickjacking: framing protections", lambda: self.phase_clickjacking(self.pages)),
-            ("DOM-based vulnerabilities (static analysis)", lambda: self.phase_dom_based(self.pages)),
-            ("CORS misconfiguration checks", lambda: self.phase_cors(self.pages)),
-            ("XXE (XML External Entity) checks", lambda: self.phase_xxe(self.pages, self.points)),
-            ("HTTP request smuggling checks", lambda: self.phase_smuggling(self.pages, self.points)),
-            ("SSRF checks", lambda: self.phase_ssrf(self.pages, self.points)),
-            ("OS command injection checks", lambda: self.phase_os_command_injection(self.pages, self.points)),
-            ("Web cache poisoning checks", lambda: self.phase_web_cache_poisoning(self.pages, self.points)),
-            ("Information disclosure checks", lambda: self.phase_information_disclosure(self.pages, self.points)),
-            ("HTTP Host header attack checks", lambda: self.phase_http_host_header_attacks(self.pages, self.points)),
-            ("NoSQL injection checks", lambda: self.phase_nosql_injection(self.pages, self.points)),
-            ("JWT security checks", lambda: self.phase_jwt(self.pages, self.points)),
-            ("Access control checks", lambda: self.phase_access_control(self.pages, self.points)),
-            ("Race condition checks", lambda: self.phase_race_conditions(self.pages, self.points)),
-            ("Web LLM attack checks", lambda: self.phase_web_llm_attacks(self.pages, self.points)),
-            ("Web cache deception checks", lambda: self.phase_web_cache_deception(self.pages, self.points)),
-            ("File upload vulnerability checks", lambda: self.phase_file_upload_vulnerabilities(self.pages, self.points)),
-            ("Prototype pollution checks", lambda: self.phase_prototype_pollution(self.pages, self.points)),
-            ("Insecure deserialization checks", lambda: self.phase_insecure_deserialization(self.pages, self.points)),
-            ("Authentication checks", lambda: self.phase_authentication(self.pages, self.points)),
+    def _scan_steps(self) -> list[tuple[str, list]]:
+        """Tahapan pemindaian dikelompokkan per jenis kerentanan (23 jenis, 227 kriteria)."""
+        return [
+            ("Crawl & discovery halaman/input", [
+                self.crawl,
+            ]),
+            ("SQL injection (18 kriteria)", [
+                lambda: self.phase_visible_error(self.points),
+                lambda: self.phase_where_hidden(self.points),
+                self.phase_login_bypass,
+                lambda: self.phase_conditional_errors(self.points),
+                lambda: self.phase_conditional_responses(self.points),
+                lambda: self.phase_union_column_count(self.points),
+                lambda: self.phase_union_text_column(self.points),
+                lambda: self.phase_db_versions(self.points),
+                lambda: self.phase_listings(self.points),
+                lambda: self.phase_other_tables(self.points),
+                lambda: self.phase_time_delay(self.points),
+                lambda: self.phase_time_information(self.points),
+                lambda: self.phase_xml(self.points),
+                lambda: self.phase_oob(self.points),
+            ]),
+            ("Cross-site scripting (XSS) (30 kriteria)", [
+                lambda: self.phase_xss_reflected_html(self.points),
+                lambda: self.phase_xss_stored_html(self.points),
+                lambda: self.phase_xss_dom(self.points),
+                lambda: self.phase_xss_attribute(self.points),
+                lambda: self.phase_xss_javascript(self.points),
+                lambda: self.phase_xss_angularjs(self.points),
+                lambda: self.phase_xss_template_literal(self.points),
+                lambda: self.phase_xss_csp_bypass(self.points),
+                lambda: self.phase_xss_exploitation(self.points),
+                lambda: self.phase_xss_advanced(self.points),
+            ]),
+            ("Cross-site request forgery (CSRF) (11 kriteria)", [
+                lambda: self.phase_csrf_defenses(self.pages),
+                lambda: self.phase_csrf_referer(self.pages),
+            ]),
+            ("Clickjacking (5 kriteria)", [
+                lambda: self.phase_clickjacking(self.pages),
+            ]),
+            ("DOM-based vulnerabilities (7 kriteria)", [
+                lambda: self.phase_dom_based(self.pages),
+            ]),
+            ("Cross-origin resource sharing (CORS) (3 kriteria)", [
+                lambda: self.phase_cors(self.pages),
+            ]),
+            ("XML external entity (XXE) injection (9 kriteria)", [
+                lambda: self.phase_xxe(self.pages, self.points),
+            ]),
+            ("Server-side request forgery (SSRF) (7 kriteria)", [
+                lambda: self.phase_ssrf(self.pages, self.points),
+            ]),
+            ("HTTP request smuggling (22 kriteria)", [
+                lambda: self.phase_smuggling(self.pages, self.points),
+            ]),
+            ("OS command injection (5 kriteria)", [
+                lambda: self.phase_os_command_injection(self.pages, self.points),
+            ]),
+            ("Web cache poisoning (13 kriteria)", [
+                lambda: self.phase_web_cache_poisoning(self.pages, self.points),
+            ]),
+            ("Information disclosure (5 kriteria)", [
+                lambda: self.phase_information_disclosure(self.pages, self.points),
+            ]),
+            ("HTTP Host header attacks (7 kriteria)", [
+                lambda: self.phase_http_host_header_attacks(self.pages, self.points),
+            ]),
+            ("NoSQL injection (4 kriteria)", [
+                lambda: self.phase_nosql_injection(self.pages, self.points),
+            ]),
+            ("JWT (8 kriteria)", [
+                lambda: self.phase_jwt(self.pages, self.points),
+            ]),
+            ("Access control vulnerabilities (13 kriteria)", [
+                lambda: self.phase_access_control(self.pages, self.points),
+            ]),
+            ("Race conditions (6 kriteria)", [
+                lambda: self.phase_race_conditions(self.pages, self.points),
+            ]),
+            ("Web LLM attacks (8 kriteria)", [
+                lambda: self.phase_web_llm_attacks(self.pages, self.points),
+            ]),
+            ("Web cache deception (5 kriteria)", [
+                lambda: self.phase_web_cache_deception(self.pages, self.points),
+            ]),
+            ("File upload vulnerabilities (7 kriteria)", [
+                lambda: self.phase_file_upload_vulnerabilities(self.pages, self.points),
+            ]),
+            ("Prototype pollution (10 kriteria)", [
+                lambda: self.phase_prototype_pollution(self.pages, self.points),
+            ]),
+            ("Insecure deserialization (10 kriteria)", [
+                lambda: self.phase_insecure_deserialization(self.pages, self.points),
+            ]),
+            ("Authentication (14 kriteria)", [
+                lambda: self.phase_authentication(self.pages, self.points),
+            ]),
         ]
+
+    def scan(self) -> dict[str, Any]:
+        steps = self._scan_steps()
         total = len(steps)
-        for i, (name, fn) in enumerate(steps, 1):
+        for i, (name, fns) in enumerate(steps, 1):
             self._progress(i, total, name)
-            try:
-                fn()
-            except Exception:
-                # keep scanning; errors recorded in stats where applicable
-                pass
+            for fn in fns:
+                try:
+                    fn()
+                except Exception:
+                    pass
         print(f"[SCAN {total}/{total}] Penyusunan laporan hasil pemindaian utama...", flush=True)
         return self.report()
 
@@ -9493,7 +9545,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         raise RuntimeError("URL target tidak ditemukan pada scrape_data/url.")
     if scrape_data is not None:
         persist_scrape_artifacts(scrape_data)
-    print(f"[PROGRESS] Memulai pemindaian kerentanan utama (XSS & pemeriksaan basis) — {target_url}", flush=True)
+    print(f"[PROGRESS] Memulai pemindaian kerentanan utama — {target_url}", flush=True)
     report = scan_target(
         target_url,
         authorized=True,
@@ -20154,7 +20206,7 @@ def _render_vuln_types_v2(page, content_left, content_width, result):
 
     page.ensure(170)
     page.section_title("Hasil Pemindaian Kerentanan per Jenis",
-                       "Rekapitulasi seluruh 227 kriteria asesmen, dikelompokkan per jenis kerentanan. Rincian kriteria per jenis ditampilkan pada tabel dan daftar cakupan di bawah.")
+                       "Rekapitulasi seluruh 227 kriteria asesmen, dikelompokkan per jenis kerentanan, beserta jumlah kriteria, status terkonfirmasi, dan rentang nomor kriteria.")
     rows = []
     for g in by_type:
         rows.append((g["label"], str(g["total"]), str(g["confirmed"]),
@@ -20166,26 +20218,6 @@ def _render_vuln_types_v2(page, content_left, content_width, result):
                    headers=("Jenis Kerentanan", "Kriteria", "Terkonfirmasi", "Belum", "Rentang"),
                    widths=(199.0, 60.0, 85.0, 60.0, 95.0), header_color=_PDF_COLORS["navy"])
 
-    page.ensure(30)
-    page.text(content_left, page.y - 12, "Cakupan 227 Kriteria per Jenis", 11.2, _PDF_COLORS["navy"], bold=True)
-    page.y -= 24
-    for g in by_type:
-        parts = []
-        for it in g["items"]:
-            num = it.get("number", "-")
-            short = _pdf_short_lab_title(str(it.get("title", "-")))
-            mark = " [terkonfirmasi]" if str(it.get("status", "")).lower() == "confirmed" else ""
-            parts.append(f"#{num} {short}{mark}")
-        body = "  |  ".join(parts)
-        body_lines = _pdf_wrap(body, content_width, 8.2)
-        block_h = 16 + len(body_lines) * 10.2
-        # keep each vulnerability type block on one page (no orphan continuation line)
-        page.ensure(min(block_h + 6, 560))
-        page.text(content_left, page.y - 10, f"{g['label']}  ({g['total']} kriteria, {g['confirmed']} terkonfirmasi)",
-                  9.0, _PDF_COLORS["teal"], bold=True)
-        page.y -= 15
-        page.paragraph(content_left, content_width, body, 8.2, _PDF_COLORS["text"])
-        page.y -= 6
 
 
 def _render_engine_sections_v2(page, content_left, content_width, result):
@@ -20414,14 +20446,14 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.text(content_left + 10, _PDF_PAGE_H - 104, "S A T R I A", 38, _PDF_COLORS["white"], bold=True)
     page.text(content_left + 10, _PDF_PAGE_H - 130, "Sistem Agen Terpadu Reconnaissance, Intelijen, dan Asesmen", 12.5, _PDF_COLORS["light"], bold=True)
     page.line(content_left + 10, _PDF_PAGE_H - 146, content_left + 150, _PDF_PAGE_H - 146, _PDF_COLORS["teal"], 1.2)
-    page.text(content_left + 10, _PDF_PAGE_H - 196, "ACTIVE & PASSIVE RECON", 8.6, _PDF_COLORS["white"], bold=True)
-    page.text(content_left + 190, _PDF_PAGE_H - 196, "TECHNOLOGY FINGERPRINTING", 8.6, _PDF_COLORS["white"], bold=True)
-    page.text(content_left + 400, _PDF_PAGE_H - 196, "CVE INTELLIGENCE", 8.6, _PDF_COLORS["white"], bold=True)
-    page.text(content_left + 10, _PDF_PAGE_H - 214, "ASESMEN KERENTANAN", 8.6, _PDF_COLORS["white"], bold=True)
+    page.text(content_left + 10, _PDF_PAGE_H - 202,
+              "ACTIVE & PASSIVE RECON   TECHNOLOGY FINGERPRINTING   CVE INTELLIGENCE   ASESMEN KERENTANAN",
+              8.2, _PDF_COLORS["white"], bold=True)
     page.text(content_left + 10, _PDF_PAGE_H - 240, "Laporan asesmen keamanan terpadu: observasi, analisis kode, teknologi, reconnaissance, dan pemindaian aktif.", 8.8, _PDF_COLORS["light"])
 
     page.y = _PDF_PAGE_H - 310
     page.paragraph(content_left, content_width, "Ringkasan Eksekutif", 20, _PDF_COLORS["navy"], bold=True, space_before=4)
+    page.y -= 6
     page.paragraph(content_left, content_width,
                    "Laporan ini menyajikan hasil pemindaian dan analisis keamanan web berdasarkan kemampuan gabungan engine. Seluruh data yang ditampilkan merupakan hasil aktual dari proses pemindaian/analisis yang dijalankan (HTTP, deteksi teknologi, analisis kode, recon/discovery, lab scan aktif/pasif, serta intelijen NVD/OSV/Censys bila tersedia).",
                    10.2, _PDF_COLORS["muted"])
@@ -20591,4 +20623,3 @@ def run_satria_fix1_scan(target_url: str, html: str = "", authorized: bool = Fal
         "cves": len(engine.get("cves") or []),
     }
     return result
-
