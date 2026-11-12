@@ -112,6 +112,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import threading
 import unicodedata
 import uuid
 from bisect import bisect_left
@@ -156,7 +157,7 @@ RUN_NVD = True
 ENABLE_LLM = True
 ALLOW_PARTIAL_TOOLS = True
 ACTIVE_SCAN_AUTHORIZED = True
-SCAN_DEADLINE_SECONDS = 600.0
+SCAN_DEADLINE_SECONDS = 1800.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
@@ -685,7 +686,7 @@ class SatriaBaruScanner:
         *,
         authorized: bool = False,
         allow_private: bool = False,
-        max_pages: int = 3,
+        max_pages: int = 1,
         max_points: int = 24,
         max_requests: int = 520,
         timeout: float = 8.0,
@@ -712,7 +713,7 @@ class SatriaBaruScanner:
         if not allow_private:
             self._validate_public_target(self.target_url)
         self.origin = self._origin(self.target_url)
-        self.max_pages = max(1, min(max_pages, 3))
+        self.max_pages = 1  # Hanya URL utama yang dipindai; discovery terpisah.
         self.max_points = max(4, min(max_points, 60))
         self.max_requests = max(100, min(max_requests, 1200))
         self.timeout = max(3.0, min(timeout, 30.0))
@@ -720,9 +721,9 @@ class SatriaBaruScanner:
         self.request_count = 0
         self.started = time.monotonic()
         try:
-            self.deadline_seconds = float(globals().get("SCAN_DEADLINE_SECONDS") or 600.0)
+            self.deadline_seconds = max(1800.0, float(globals().get("SCAN_DEADLINE_SECONDS") or 1800.0))
         except (TypeError, ValueError):
-            self.deadline_seconds = 600.0
+            self.deadline_seconds = 1800.0
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
@@ -786,7 +787,20 @@ class SatriaBaruScanner:
         return is_same_origin(url, self.target_url)
 
     def _within_budget(self) -> bool:
-        return self.request_count < self.max_requests and (time.monotonic() - self.started) < self.deadline_seconds
+        """Periksa batas request, deadline scanner, dan deadline satu pipeline."""
+        if self.request_count >= self.max_requests:
+            self.stats.setdefault("stop_reason", "request_budget_exhausted")
+            return False
+        if (time.monotonic() - self.started) >= self.deadline_seconds:
+            self.stats.setdefault("stop_reason", "scanner_deadline_exceeded")
+            return False
+        try:
+            if _scan_deadline_exceeded():
+                self.stats.setdefault("stop_reason", "pipeline_deadline_exceeded")
+                return False
+        except Exception:
+            pass
+        return True
 
     # ------------------------------------------------------------------
     # OOB setup
@@ -2007,6 +2021,7 @@ class SatriaBaruScanner:
             "injection_points": len(self.points),
             "requests": int(self.request_count),
             "elapsed_seconds": elapsed,
+            "stop_reason": scan_stats.get("stop_reason") or "completed",
             "oob_status": str(getattr(self, "oob_status", "not_configured")),
         })
         summary = {
@@ -6550,7 +6565,7 @@ def scan_target(
     *,
     authorized: bool = False,
     allow_private: bool = False,
-    max_pages: int = 3,
+    max_pages: int = 1,
     max_points: int = 24,
     max_requests: int = 520,
     timeout: float = 8.0,
@@ -6673,9 +6688,9 @@ def configure_runtime(*args: Any, **overrides: Any) -> dict[str, Any]:
             new_value = Path(str(value)).expanduser()
         elif target == "SCAN_DEADLINE_SECONDS":
             try:
-                new_value = float(value)
+                new_value = max(1800.0, float(value))
             except (TypeError, ValueError):
-                new_value = 600.0
+                new_value = 1800.0
         elif target in {"SCRAPE_PATH", "FINDINGS_PATH", "OUTPUT_PDF"}:
             new_value = str(value)
         globals()[target] = new_value
@@ -7907,6 +7922,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
     auth = authorized if authorized is not None else bool(globals().get("ACTIVE_SCAN_AUTHORIZED"))
     if not auth:
         raise RuntimeError("Pemindaian aktif memerlukan authorized=True (otorisasi wajib diberikan).")
+    _scan_begin(force=True)
     target_url = url or _scrape_url(scrape_data) or ""
     if not target_url:
         raise RuntimeError("URL target tidak ditemukan pada scrape_data/url.")
@@ -7938,27 +7954,34 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
     for u in discovered:
         if u and u not in _seen_d:
             _seen_d.add(u); discovered_u.append(u)
-    try:
-        _max_pp = int(os.getenv("SATRIA_MAX_PER_PAGE_MAIN_SCANS", "3"))
-    except (TypeError, ValueError):
-        _max_pp = 3
-    _max_pp = max(1, min(_max_pp, 3))
-    pages_to_scan = discovered_u[:_max_pp]
+    # Discovery dapat berisi hingga 73 URL, tetapi pemeriksaan kerentanan utama
+    # hanya dilakukan pada URL yang dimasukkan pengguna (bukan halaman hasil crawl).
+    pages_to_scan = [target_url]
 
-    # 2) Proses LENGKAP per halaman — sama seperti halaman pertama/origin (tanpa pembedaan)
+    # 2) Proses LENGKAP hanya pada URL utama yang dimasukkan pengguna.
     per_page_main = []
     per_page_full = []
     merged_confirmed: dict[tuple, dict] = {}
     first_report = None
 
     for pi, page_url in enumerate(pages_to_scan, 1):
-        print(f"[PROGRESS {pi}/{len(pages_to_scan)}] Pemindaian & analisis lengkap per halaman (proses sama seperti halaman pertama): {page_url}", flush=True)
+        print(f"[PROGRESS {pi}/1] Pemindaian URL utama (halaman hasil discovery tidak dipindai): {page_url}", flush=True)
         page_entry = {"url": page_url, "main_vuln": {"confirmed": 0, "labs": []},
                       "technologies": [], "cves": [], "code_findings": [], "http": {}, "error": None}
         _scan_started_at = datetime.now(timezone.utc).isoformat()
         # HTML halaman diambil SEBELUM pemindaian: bila render JavaScript tersedia,
         # scanner memakainya agar link/form/JS dari konten dinamis ikut diuji.
-        _page_fetch = _fetch_page_html_for_analysis(page_url)
+        try:
+            _page_fetch = _fetch_page_html_for_analysis(page_url)
+        except Exception as _fetch_exc:
+            _page_fetch = {
+                "html": html or "", "final_url": page_url, "status": None,
+                "content_type": "", "server": "", "powered_by": "",
+                "source": "input_html_fallback",
+                "html_source_label": "HTML input/fallback (pengambilan halaman gagal)",
+                "error": f"{type(_fetch_exc).__name__}: {str(_fetch_exc)[:180]}",
+            }
+            print(f"[WARN] Pengambilan HTML halaman gagal; memakai HTML input bila tersedia: {_page_fetch['error']}", flush=True)
         _rendered_seed = _page_fetch.get("html") if _page_fetch.get("source") == "playwright_render" else None
         try:
             # (a) Pemindaian kerentanan utama (basis, 24 kategori) — parameter sama seperti halaman pertama
@@ -8095,6 +8118,17 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         "per_page_main_scans": per_page_main,
         "per_page_full_reports": per_page_full,
         "site_wide_findings": site_wide_findings,
+        "scan_diagnostics": {
+            "discovery_limit": 73,
+            "discovered_urls": len(discovered_u),
+            "scanned_urls": [target_url],
+            "scanned_url_count": 1,
+            "deadline_seconds": float(SCAN_DEADLINE_SECONDS or 0),
+            "deadline_floor_seconds": 1800,
+            "engine_errors": list(engine_scan.get("engine_errors") or []) if isinstance(engine_scan, dict) else [],
+            "page_errors": [p.get("error") for p in per_page_main if p.get("error")],
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        },
     }
 
     # Agregasi CVE unik lintas halaman ke engine_scan
@@ -8132,8 +8166,15 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         findings_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:
         result.setdefault("errors", []).append(f"findings.json: {exc}")
-    pdf_path = render_pdf(result, str(globals().get("OUTPUT_PDF") or "artifacts/laporan_kerentanan.pdf"))
-    globals()["OUTPUT_PDF"] = str(pdf_path)
+    try:
+        pdf_path = render_pdf(result, str(globals().get("OUTPUT_PDF") or "artifacts/laporan_kerentanan.pdf"))
+        globals()["OUTPUT_PDF"] = str(pdf_path)
+        result["pdf_path"] = str(pdf_path)
+    except Exception as _pdf_exc:
+        # Jangan buang hasil scan hanya karena pembuatan PDF gagal.
+        result["pdf_error"] = f"{type(_pdf_exc).__name__}: {str(_pdf_exc)[:240]}"
+        result.setdefault("errors", []).append(f"render_pdf: {result['pdf_error']}")
+        print(f"[WARN] PDF gagal dibuat; hasil JSON/temuan tetap dikembalikan: {result['pdf_error']}", flush=True)
     return result
 
 
@@ -8142,7 +8183,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("target", help="URL target HTTP/HTTPS (mis. URL instance lab PortSwigger)")
     parser.add_argument("--authorized", action="store_true", help="Wajib: Anda menyatakan memiliki izin pengujian.")
     parser.add_argument("--allow-private", action="store_true", help="Izinkan target localhost/private (untuk pengujian lokal).")
-    parser.add_argument("--max-pages", type=int, default=3)
+    parser.add_argument("--max-pages", type=int, default=1)
     parser.add_argument("--max-points", type=int, default=24)
     parser.add_argument("--max-requests", type=int, default=520)
     parser.add_argument("--timeout", type=float, default=8.0)
@@ -8337,34 +8378,49 @@ SLEEP_BETWEEN_NVD = 3.0
 CENSYS_RATE_SLEEP = 1.0
 REQUEST_TIMEOUT = 20
 
-# ── Batas waktu scan global + progress per kerentanan ────────────────────────
-# Dulu tidak ada deadline: discovery (≤137 halaman × ≤24 script) × semua probe
-# aktif di SETIAP halaman (SQLi saja ≤240 request) berjalan sekuensial tanpa
-# progress per-probe, sehingga terlihat "terhenti" puluhan menit. Deadline ini
-# membuat scan selalu berhenti dan tetap menghasilkan laporan parsial.
-_scan_deadline: Optional[float] = None
+# ── Batas waktu scan per-run + progress per kerentanan ───────────────────────
+# Discovery/recon dibatasi 73 halaman, sedangkan probe kerentanan hanya pada URL
+# utama. Deadline di-reset pada awal setiap run dan dipisahkan per thread/sesi UI.
+# Jika deadline/budget tercapai, hasil parsial tetap disusun dan alasannya dicatat.
+_scan_deadline: Optional[float] = None  # fallback kompatibilitas thread lama
 _scan_progress_cb = None
 _scan_deadline_reported = False
+_scan_local = threading.local()
 
 
 def set_scan_progress_callback(cb) -> None:
-    """Callback opsional (done, total, label) untuk UI selain stdout."""
+    """Callback progress per thread/run untuk mencegah tabrakan antar sesi UI."""
     global _scan_progress_cb
-    _scan_progress_cb = cb
+    _scan_local.progress_cb = cb
+    _scan_progress_cb = cb  # fallback kompatibilitas pemanggil lama
 
 
-def _scan_begin() -> None:
+def _scan_begin(force: bool = False) -> None:
+    """Mulai deadline baru per run/thread; pemanggilan internal bersifat idempoten."""
     global _scan_deadline, _scan_deadline_reported
-    # Idempoten dalam satu run: _run_pipeline_impl memanggil ini, lalu
-    # run_lab_scan memanggilnya lagi -- jangan reset deadline-nya.
-    if _scan_deadline is not None and not _scan_deadline_exceeded():
+    local_deadline = getattr(_scan_local, "deadline", None)
+    local_initialized = bool(getattr(_scan_local, "initialized", False))
+    if (not force and local_initialized and
+            (local_deadline is None or time.monotonic() < local_deadline)):
         return
+    try:
+        limit = float(SCAN_DEADLINE_SECONDS or 0)
+    except (TypeError, ValueError):
+        limit = 1800.0
+    # Batas 30 menit mencegah konfigurasi lama 600 detik memotong scan besar.
+    limit = max(1800.0, limit) if limit > 0 else 0.0
+    _scan_local.initialized = True
+    _scan_local.deadline = (time.monotonic() + limit) if limit > 0 else None
+    _scan_local.reported = False
+    # Salin untuk fungsi lama yang masih membaca variabel global.
+    _scan_deadline = _scan_local.deadline
     _scan_deadline_reported = False
-    limit = float(SCAN_DEADLINE_SECONDS or 0)
-    _scan_deadline = (time.monotonic() + limit) if limit > 0 else None
 
 
 def _scan_deadline_exceeded() -> bool:
+    if getattr(_scan_local, "initialized", False):
+        deadline = getattr(_scan_local, "deadline", None)
+        return deadline is not None and time.monotonic() >= deadline
     return _scan_deadline is not None and time.monotonic() >= _scan_deadline
 
 
@@ -8372,22 +8428,24 @@ def _emit_progress(done: int, total: int, label: str) -> None:
     """Satu baris progress per kerentanan/probe (dibaca app.py + callback)."""
     total = max(1, int(total)); done = max(0, min(int(done), total))
     print(f"[PROGRESS {done}/{total}] {label}", flush=True)
-    if _scan_progress_cb is not None:
+    _callback = getattr(_scan_local, "progress_cb", None) or _scan_progress_cb
+    if _callback is not None:
         try:
-            _scan_progress_cb(done, total, label)
+            _callback(done, total, label)
         except Exception:
             pass
 
 
 def _scan_stop(label: str) -> bool:
-    """True bila deadline habis; cetak pemberitahuan sekali saja."""
+    """True bila deadline habis; catat alasan stop satu kali per thread/run."""
     global _scan_deadline_reported
     if not _scan_deadline_exceeded():
         return False
-    if not _scan_deadline_reported:
+    if not getattr(_scan_local, "reported", False):
+        _scan_local.reported = True
         _scan_deadline_reported = True
-        print(f"[!] Batas waktu scan {SCAN_DEADLINE_SECONDS:.0f} detik tercapai "
-              f"pada {label}; scan dihentikan agar laporan tetap dapat dibuat.", flush=True)
+        print(f"[!] BATAS WAKTU SCAN tercapai ({SCAN_DEADLINE_SECONDS:.0f} detik) pada {label}. "
+              "Hasil parsial akan tetap disusun; periksa scan_diagnostics.", flush=True)
     return True
 
 
@@ -14170,7 +14228,7 @@ def group_detected(rows: list[dict]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # ORKESTRATOR LAB
 # ══════════════════════════════════════════════════════════════════════════════
-def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 3) -> list[TargetContext]:
+def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 73) -> list[TargetContext]:
     """Crawl halaman, form GET, dan endpoint yang dirujuk JavaScript pada origin sama.
 
     Discovery hanya memakai GET dan tidak mengirim form POST atau aksi mutasi.
@@ -14221,12 +14279,13 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 3) 
     commons_added = False
     contexts: list[TargetContext] = [root_ctx]
     scripts_seen: set[str] = set()
+    discovery_attempted: list[str] = []
+    # Batas discovery ditetapkan 73 (tidak terpengaruh env lama yang mungkin masih bernilai 3).
+    max_pages = 73
     try:
-        _discovery_limit = int(os.getenv("SATRIA_MAX_DISCOVERY_PAGES", str(max_pages)))
+        max_scripts = max(0, min(int(os.getenv("SATRIA_MAX_DISCOVERY_SCRIPTS", "24")), 40))
     except (TypeError, ValueError):
-        _discovery_limit = 3
-    max_pages = max(1, min(_discovery_limit, 3))
-    max_scripts = max(0, min(int(os.getenv("SATRIA_MAX_DISCOVERY_SCRIPTS", "24")), 40))
+        max_scripts = 24
     blocked = re.compile(r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|remove|unsubscribe|deactivate|purchase|checkout|transfer|payment)(?:/|$)", re.I)
     static_ext = re.compile(r"\.(?:png|jpe?g|gif|svg|ico|css|woff2?|ttf|eot|mp[34]|pdf|zip)(?:$|\?)", re.I)
     endpoint_pattern = re.compile(
@@ -14268,7 +14327,8 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 3) 
         if current in seen:
             continue
         seen.add(current)
-        _emit_progress(len(seen), max_pages, f"Tahap 1/2 - Penemuan seluruh halaman: {current[:90]}")
+        discovery_attempted.append(current)
+        _emit_progress(len(seen), max_pages, f"Tahap 1/2 - Penemuan halaman ({len(seen)}/{max_pages}): {current[:90]}")
         parsed = urlparse(current)
         if (parsed.scheme.lower(), parsed.netloc.lower()) != origin:
             continue
@@ -14359,6 +14419,8 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 3) 
                     continue
                 scripts_seen.add(script_url)
                 try:
+                    if _scan_deadline_exceeded():
+                        break
                     sr = _disc_session.get(script_url, timeout=min(ACTIVE_TIMEOUT, 8),
                                            allow_redirects=False)
                     root_ctx.http_log.append({"method": "GET", "url": script_url,
@@ -14383,6 +14445,8 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 3) 
         if _jar:
             root_ctx.cookies = _jar
     root_ctx.http_log.append({"phase": "discovery_summary", "pages": len(contexts),
+                              "attempted_pages": len(discovery_attempted),
+                              "discovered_urls": discovery_attempted[:73],
                               "scripts": len(scripts_seen), "queued_pages_limit": max_pages})
     return contexts
 
@@ -14395,9 +14459,12 @@ def run_lab_scan(ctx) -> dict[str, Any]:
     _SQLI_OAST_HOSTS.clear()
     _SQLI_PROVEN.clear()
     _SQLI_SEEN_POINTS.clear()
-    # Skenario: Tahap 1 selesaikan penemuan seluruh halaman pada origin yang sama,
-    # lalu Tahap 2 jalankan seluruh jenis pemeriksaan yang tersedia pada setiap halaman satu per satu.
-    page_contexts = _discover_same_origin_contexts(ctx)
+    # Tahap 1: discovery maksimal 73 halaman pada origin yang sama.
+    # Tahap 2: semua probe hanya dijalankan pada URL utama yang dimasukkan.
+    discovered_contexts = _discover_same_origin_contexts(ctx, max_pages=73)
+    # Kebijakan yang diminta: 73 halaman hanya untuk discovery/recon.
+    # Seluruh probe kerentanan dijalankan HANYA pada URL utama yang dimasukkan.
+    page_contexts = [ctx]
     aggregate_app: dict[str, tuple[bool, str]] = {}
     confirmed_all: list[dict] = []
     candidates_all: list[dict] = []
@@ -14405,9 +14472,14 @@ def run_lab_scan(ctx) -> dict[str, Any]:
         key for key, cat in LAB_DB.items()
         if key not in _ENGINE_DISABLED_CATEGORIES and not PASSIVE_PROBES.get(cat["probe"]) and not ACTIVE_PROBES.get(cat["probe"])
     ]
+    _discovery_meta = next((x for x in reversed(ctx.http_log or [])
+                            if isinstance(x, dict) and x.get("phase") == "discovery_summary"), {})
     stats = {"passive_runs": 0, "active_runs": 0, "errors": [],
-             "skipped_probes": [], "pages_discovered": len(page_contexts),
-             "discovery_requests": max(0, len(page_contexts) - 1),
+             "skipped_probes": [], "pages_discovered": len(discovered_contexts),
+             "discovery_attempted": int(_discovery_meta.get("attempted_pages") or len(discovered_contexts)),
+             "discovery_limit": 73,
+             "pages_scanned": 1,
+             "discovery_requests": max(0, len(discovered_contexts) - 1),
              "catalog_categories": len([k for k in LAB_DB if k not in _ENGINE_DISABLED_CATEGORIES]),
              "catalog_labs": sum(len(cat["labs"]) for k,cat in LAB_DB.items() if k not in _ENGINE_DISABLED_CATEGORIES),
              "passive_probe_families": sorted(PASSIVE_PROBES),
@@ -14416,8 +14488,8 @@ def run_lab_scan(ctx) -> dict[str, Any]:
 
     per_page_scans = []
     for page_idx, page_ctx in enumerate(page_contexts, start=1):
-        _emit_progress(page_idx, len(page_contexts),
-                       f"Tahap 2/2 - Pemindaian halaman {page_idx}/{len(page_contexts)} (semua jenis pemeriksaan tersedia): {page_ctx.url}")
+        _emit_progress(page_idx, 1,
+                       f"Tahap 2/2 - Pemindaian URL utama {page_idx}/1 (semua jenis pemeriksaan tersedia): {page_ctx.url}")
         if _scan_stop(f"halaman {page_ctx.url}"):
             stats["deadline_exceeded"] = True
             break
@@ -14502,7 +14574,8 @@ def run_lab_scan(ctx) -> dict[str, Any]:
         })
 
     print(f"\n[PortSwigger] Target      : {ctx.url}")
-    print(f"[SATRIA] Halaman     : {len(page_contexts)} dalam origin yang sama")
+    print(f"[SATRIA] Discovery   : {len(discovered_contexts)} halaman berhasil ditemukan "
+          f"(dicoba {stats['discovery_attempted']}/73); dipindai: 1 URL utama")
     print(f"[SATRIA] Pemeriksaan katalog : {TOTAL_LABS}")
     print(f"[SATRIA] Probe pasif : {stats['passive_runs']} | aktif: {stats['active_runs']} "
           f"({'diizinkan' if ctx.authorized else 'tidak diizinkan'})")
@@ -14514,7 +14587,8 @@ def run_lab_scan(ctx) -> dict[str, Any]:
 
     return {
         "target": ctx.url, "host": ctx.host, "authorized": ctx.authorized,
-        "labs_total": TOTAL_LABS, "pages_discovered": len(page_contexts),
+        "labs_total": TOTAL_LABS, "pages_discovered": len(discovered_contexts),
+        "pages_scanned": 1,
         "applicable_probes": applicable_categories, "detected": detected,
         "detected_lab_count": len(detected_rows), "candidates": cand_rows,
         "not_verified": not_verified, "not_applicable": not_applicable,
@@ -14522,7 +14596,9 @@ def run_lab_scan(ctx) -> dict[str, Any]:
         "findings": confirmed, "candidate_findings": candidates,
         "stats": stats, "http_requests": len(ctx.http_log),
         "per_page_scans": per_page_scans,
-        "discovered_pages": [getattr(pc, "url", "") for pc in page_contexts],
+        "discovered_pages": [getattr(pc, "url", "") for pc in discovered_contexts],
+        "discovery_attempted_urls": list(_discovery_meta.get("discovered_urls") or []),
+        "scanned_pages": [ctx.url],
     }
 
 
@@ -14623,7 +14699,7 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
     if authorized is None:
         authorized = active_probe_enabled()
 
-    _scan_begin()
+    _scan_begin(force=True)
     print(f"\n[*] Target: {target_url}", flush=True)
     print(f"[*] Mode  : {'PASIF + AKTIF (diizinkan)' if authorized else 'PASIF saja'}", flush=True)
 
@@ -18644,8 +18720,10 @@ def _collect_engine_scan_results(target_url: str, html: str = "", http_result: d
     stats = lab.get("stats") if isinstance(lab.get("stats"), dict) else {}
     out["discovery_recon"] = {
         "pages_discovered": stats.get("pages_discovered", lab.get("pages_discovered", 0)),
-        "discovery_note": "Tahap 1: penemuan seluruh halaman same-origin selesai terlebih dahulu; Tahap 2: setiap halaman dipindai satu per satu (analisis HTTP/meta, teknologi, analisis kode, dan pemeriksaan tersedia).",
+        "discovery_note": "Tahap 1: discovery/recon same-origin maksimal 73 halaman. Tahap 2: hanya URL utama yang dimasukkan pengguna dipindai; halaman lain hanya dicatat sebagai hasil discovery.",
         "discovered_pages": (lab.get("discovered_pages") or lab.get("pages") or [])[:200],
+        "discovery_attempted_urls": (lab.get("discovery_attempted_urls") or [])[:73],
+        "pages_scanned": (stats.get("pages_scanned") or 1),
         "endpoints": (lab.get("endpoints") or lab.get("discovered_endpoints") or [])[:50],
     }
     out["per_page_scans"] = lab.get("per_page_scans") or []
