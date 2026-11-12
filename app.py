@@ -333,7 +333,11 @@ st.markdown(
 )
 
 with st.sidebar:
-    st.markdown("## 🛡️ SATRIA WebSec")
+    logo_path = Path(__file__).resolve().parent / "Logo_satria.png"
+    if logo_path.is_file():
+        st.image(str(logo_path), width=240)
+    else:
+        st.markdown("## 🛡️ SATRIA WebSec")
     st.caption("Evidence-driven website security assessment")
     st.markdown("---")
     st.markdown("**Integrasi layanan**")
