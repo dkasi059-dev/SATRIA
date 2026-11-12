@@ -31,3 +31,4 @@ libxi6
 libxtst6
 libglib2.0-0t64
 fonts-liberation
+ca-certificates
