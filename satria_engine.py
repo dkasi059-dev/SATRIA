@@ -688,7 +688,7 @@ class SatriaBaruScanner:
         allow_private: bool = False,
         max_pages: int = 1,
         max_points: int = 24,
-        max_requests: int = 1370,
+        max_requests: int = 520,
         timeout: float = 8.0,
         time_delay: float = 3.0,
         oob_domain: str | None = None,
@@ -8137,6 +8137,15 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                     if cid not in ex_ids:
                         existing.append(c); ex_ids.add(cid)
                 engine_scan["cves"] = existing
+        if isinstance(engine_scan, dict) and isinstance(base_report, dict) and base_report:
+            engine_scan["engine_lab_scan"] = _legacy_scan_to_engine_lab_report(base_report, discovered_u)
+            engine_scan["active_scan"] = {
+                "authorized": True,
+                "scanner": "SatriaBaruScanner (227 criteria)",
+                "auxiliary_31_category_scanner": "removed",
+                "findings": list(base_report.get("findings") or []),
+                "detected_count": int((base_report.get("summary") or {}).get("confirmed", 0)),
+            }
         result["engine_scan"] = engine_scan if isinstance(engine_scan, dict) else {}
         result["engine_http"] = (engine_scan.get("engine_http", {}) if isinstance(engine_scan, dict) else {})
         result["engine_lab_scan"] = (engine_scan.get("engine_lab_scan", {}) if isinstance(engine_scan, dict) else {})
@@ -13925,71 +13934,6 @@ _ENGINE_DISABLE_ALL_VULN_PROBES = False
 _ENGINE_DISABLED_PROBES = set()
 _ENGINE_DISABLED_CATEGORIES = set()
 
-def _run_probes(ctx, app: dict[str, tuple[bool, str]], progress_offset: int = 0,
-                progress_total: int = 0) -> tuple[list[dict], list[dict], dict]:
-    confirmed: list[dict] = []
-    candidates: list[dict] = []
-    stats = {"passive_runs": 0, "active_runs": 0, "errors": [], "skipped_probes": []}
-    # Fail-safe hanya jika operator secara eksplisit menonaktifkan seluruh probe.
-    # Default produksi False agar fase pemeriksaan benar-benar tersambung.
-    if globals().get("_ENGINE_DISABLE_ALL_VULN_PROBES", False):
-        stats["disabled"] = True
-        return confirmed, candidates, stats
-    probe_items = list(app.items())
-    probe_total = sum(len(PASSIVE_PROBES.get(pr, [])) + len(ACTIVE_PROBES.get(pr, []))
-                      for pr, _ in probe_items)
-    probe_done = 0
-    for probe, (ok, reason) in probe_items:
-        if probe in _ENGINE_DISABLED_PROBES:
-            continue
-        if not ok:
-            stats["skipped_probes"].append({"probe": probe, "reason": reason})
-            continue
-        probe_done += 1
-        cat_title = next((c["title"] for c in LAB_DB.values() if c["probe"] == probe), probe)
-        _emit_progress(progress_offset + probe_done,
-                       progress_total or len(probe_items),
-                       f"Scan kerentanan: {probe} ({cat_title}) — {ctx.url}")
-        if _scan_stop(f"probe {probe}"):
-            stats["deadline_exceeded"] = True
-            break
-
-        for fn in PASSIVE_PROBES.get(probe, []):
-            if _scan_stop(f"probe pasif {probe}"):
-                stats["deadline_exceeded"] = True
-                break
-            try:
-                stats["passive_runs"] += 1
-                for f in fn(ctx) or []:
-                    if not isinstance(f, dict):
-                        continue
-                    if not _scope_ok(f, ctx):
-                        stats["errors"].append(
-                            f"scope guard menolak temuan dari {f.get('target')} pada probe {probe}")
-                        continue
-                    (confirmed if f.get("confidence") == "confirmed" else candidates).append(f)
-            except Exception as exc:
-                stats["errors"].append(f"passive:{probe}:{fn.__name__}: {exc}")
-
-        if ctx.authorized:
-            for fn in ACTIVE_PROBES.get(probe, []):
-                if _scan_stop(f"probe aktif {probe}"):
-                    stats["deadline_exceeded"] = True
-                    break
-                try:
-                    stats["active_runs"] += 1
-                    for f in fn(ctx) or []:
-                        if not isinstance(f, dict):
-                            continue
-                        if not _scope_ok(f, ctx):
-                            stats["errors"].append(
-                                f"scope guard menolak temuan dari {f.get('target')} pada probe {probe}")
-                            continue
-                        (confirmed if f.get("confidence") == "confirmed" else candidates).append(f)
-                except Exception as exc:
-                    stats["errors"].append(f"active:{probe}:{fn.__name__}: {exc}")
-
-    return _dedupe_findings(confirmed), _dedupe_findings(candidates), stats
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -14415,169 +14359,91 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 73)
     return contexts
 
 
-def run_lab_scan(ctx) -> dict[str, Any]:
-    _scan_begin()
-    _SQLI_HOST_BUDGET.clear()
-    _SQLI_TIME_HOSTS.clear()
-    _SQLI_ERROR_HOSTS.clear()
-    _SQLI_OAST_HOSTS.clear()
-    _SQLI_PROVEN.clear()
-    _SQLI_SEEN_POINTS.clear()
-    # Tahap 1: discovery maksimal 73 halaman pada origin yang sama.
-    # Tahap 2: semua probe hanya dijalankan pada URL utama yang dimasukkan.
-    discovered_contexts = _discover_same_origin_contexts(ctx, max_pages=73)
-    # Kebijakan yang diminta: 73 halaman hanya untuk discovery/recon.
-    # Seluruh probe kerentanan dijalankan HANYA pada URL utama yang dimasukkan.
-    page_contexts = [ctx]
-    aggregate_app: dict[str, tuple[bool, str]] = {}
-    confirmed_all: list[dict] = []
-    candidates_all: list[dict] = []
-    categories_without_detector = [
-        key for key, cat in LAB_DB.items()
-        if key not in _ENGINE_DISABLED_CATEGORIES and not PASSIVE_PROBES.get(cat["probe"]) and not ACTIVE_PROBES.get(cat["probe"])
-    ]
-    _discovery_meta = next((x for x in reversed(ctx.http_log or [])
-                            if isinstance(x, dict) and x.get("phase") == "discovery_summary"), {})
-    stats = {"passive_runs": 0, "active_runs": 0, "errors": [],
-             "skipped_probes": [], "pages_discovered": len(discovered_contexts),
-             "discovery_attempted": int(_discovery_meta.get("attempted_pages") or len(discovered_contexts)),
-             "discovery_limit": 73,
-             "pages_scanned": 1,
-             "discovery_requests": max(0, len(discovered_contexts) - 1),
-             "catalog_categories": len([k for k in LAB_DB if k not in _ENGINE_DISABLED_CATEGORIES]),
-             "catalog_labs": sum(len(cat["labs"]) for k,cat in LAB_DB.items() if k not in _ENGINE_DISABLED_CATEGORIES),
-             "passive_probe_families": sorted(PASSIVE_PROBES),
-             "active_probe_families": sorted(ACTIVE_PROBES),
-             "categories_without_detector": categories_without_detector}
-
-    per_page_scans = []
-    for page_idx, page_ctx in enumerate(page_contexts, start=1):
-        _emit_progress(page_idx, 1,
-                       f"Tahap 2/2 - Pemindaian URL utama {page_idx}/1 (semua jenis pemeriksaan tersedia): {page_ctx.url}")
-        if _scan_stop(f"halaman {page_ctx.url}"):
-            stats["deadline_exceeded"] = True
-            break
-        # Pemindaian per halaman: analisis HTTP (meta teramati), teknologi, analisis kode, dsb.
-        page_scan = {"url": getattr(page_ctx, "url", ""), "status": getattr(page_ctx, "status", 0) or 0,
-                     "server": "", "powered_by": "", "content_type": "",
-                     "technologies": [], "code_findings": [], "notes": []}
-        try:
-            hdrs = getattr(page_ctx, "headers", {}) or {}
-            # header keys may be mixed case
-            def _h(name):
-                if isinstance(hdrs, dict):
-                    for k,v in hdrs.items():
-                        if str(k).lower() == name.lower():
-                            return str(v)
-                return ""
-            page_scan["server"] = _h("Server") or "-"
-            page_scan["powered_by"] = _h("X-Powered-By") or "-"
-            page_scan["content_type"] = _h("Content-Type") or "-"
-        except Exception:
-            pass
-        try:
-            html = getattr(page_ctx, "html", "") or ""
-            if html:
-                page_scan["technologies"] = extract_tech_versions_deterministic(html) or []
-        except Exception as e:
-            page_scan["notes"].append(f"teknologi: {type(e).__name__}")
-        try:
-            html = getattr(page_ctx, "html", "") or ""
-            if html:
-                page_scan["code_findings"] = detect_code_findings_deterministic(html, getattr(page_ctx, "url", "")) or []
-        except Exception as e:
-            page_scan["notes"].append(f"analisis_kode: {type(e).__name__}")
-        per_page_scans.append(page_scan)
-
-        page_app = applicability(page_ctx)
-        # exclude broken/false-positive engine categories
-        page_app = {p:v for p,v in page_app.items() if p not in _ENGINE_DISABLED_PROBES}
-        for probe, (ok, reason) in page_app.items():
-            previous = aggregate_app.get(probe, (False, ""))
-            if ok:
-                aggregate_app[probe] = (True, "")
-            elif probe not in aggregate_app:
-                aggregate_app[probe] = (False, reason)
-        confirmed, candidates, page_stats = _run_probes(
-            page_ctx, page_app,
-            progress_offset=(page_idx - 1) * max(len(page_app),1),
-            progress_total=max(len(page_contexts) * max(len(page_app),1),1))
-        confirmed_all.extend(confirmed)
-        candidates_all.extend(candidates)
-        stats["passive_runs"] += page_stats.get("passive_runs", 0)
-        stats["active_runs"] += page_stats.get("active_runs", 0)
-        stats["errors"].extend(page_stats.get("errors", []))
-        # do not accumulate skipped_probes details (per report requirement)
-        if page_stats.get("deadline_exceeded"):
-            stats["deadline_exceeded"] = True
-
-    confirmed = _dedupe_findings(confirmed_all)
-    candidates = _dedupe_findings(candidates_all)
-    rows = attribute_labs(ctx, confirmed, candidates, aggregate_app)
-    rows = [r for r in rows if r.get("category") not in _ENGINE_DISABLED_CATEGORIES]
-
-    detected_rows = [r for r in rows if r["status"] == STATUS_DETECTED]
-    detected = group_detected(detected_rows)
-    cand_rows = [r for r in rows if r["status"] == STATUS_CANDIDATE]
-    not_verified = [r for r in rows if r["status"] == STATUS_NOT_VERIFIED]
-    not_applicable = [r for r in rows if r["status"] == STATUS_NOT_APPLICABLE]
-
-    applicable_categories = sorted({k for k, (ok, _) in aggregate_app.items() if ok})
-    category_summary = []
-    for cat_key, cat in LAB_DB.items():
-        if cat_key in _ENGINE_DISABLED_CATEGORIES or cat.get("probe") in _ENGINE_DISABLED_PROBES:
-            continue
-        cat_rows = [r for r in rows if r["category"] == cat_key]
-        category_summary.append({
-            "category": cat_key, "title": cat["title"], "total": len(cat_rows),
-            "detected": sum(1 for r in cat_rows if r["status"] == STATUS_DETECTED),
-            "candidate": sum(1 for r in cat_rows if r["status"] == STATUS_CANDIDATE),
-            "not_verified": sum(1 for r in cat_rows if r["status"] == STATUS_NOT_VERIFIED),
-            "not_applicable": sum(1 for r in cat_rows if r["status"] == STATUS_NOT_APPLICABLE),
-            "applicable": aggregate_app.get(cat["probe"], (False, ""))[0],
-        })
-
-    print(f"\n[PortSwigger] Target      : {ctx.url}")
-    print(f"[SATRIA] Discovery   : {len(discovered_contexts)} halaman berhasil ditemukan "
-          f"(dicoba {stats['discovery_attempted']}/73); dipindai: 1 URL utama")
-    print(f"[SATRIA] Pemeriksaan katalog : {TOTAL_LABS}")
-    print(f"[SATRIA] Probe pasif : {stats['passive_runs']} | aktif: {stats['active_runs']} "
-          f"({'diizinkan' if ctx.authorized else 'tidak diizinkan'})")
-    print(f"[SATRIA] Terkonfirmasi : {len(detected_rows)} pemeriksaan / {len(detected)} kelompok | "
-          f"kandidat: {len(cand_rows)} | tidak relevan: {len(not_applicable)} | "
-          f"belum terbukti: {len(not_verified)}")
-    if stats["errors"]:
-        print(f"[SATRIA] Catatan     : {len(stats['errors'])} error/penolakan (lihat report['errors'])")
-
-    return {
-        "target": ctx.url, "host": ctx.host, "authorized": ctx.authorized,
-        "labs_total": TOTAL_LABS, "pages_discovered": len(discovered_contexts),
-        "pages_scanned": 1,
-        "applicable_probes": applicable_categories, "detected": detected,
-        "detected_lab_count": len(detected_rows), "candidates": cand_rows,
-        "not_verified": not_verified, "not_applicable": not_applicable,
-        "per_lab": rows, "category_summary": category_summary,
-        "findings": confirmed, "candidate_findings": candidates,
-        "stats": stats, "http_requests": len(ctx.http_log),
-        "per_page_scans": per_page_scans,
-        "discovered_pages": [getattr(pc, "url", "") for pc in discovered_contexts],
-        "discovery_attempted_urls": list(_discovery_meta.get("discovered_urls") or []),
-        "scanned_pages": [ctx.url],
-    }
 
 
-def scan_labs(url: str, html: str, http_result: Optional[dict] = None,
-              authorized: Optional[bool] = None) -> dict[str, Any]:
-    """Entry point: bangun konteks dari SATU target lalu pindai."""
-    if authorized is None:
-        authorized = active_probe_enabled()
-    ctx = build_target_context(url, html, http_result or {}, authorized=bool(authorized))
-    return run_lab_scan(ctx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # RENDER RINGKASAN
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+# ---------------------------------------------------------------------------
+# Adapter laporan: satu-satunya pemindai kerentanan adalah SatriaBaruScanner.
+# Mesin probe tambahan 31-kategori telah dihapus dari jalur eksekusi.
+def _legacy_scan_to_engine_lab_report(scan_report: dict[str, Any],
+                                      discovered_urls: list[str] | None = None) -> dict[str, Any]:
+    discovered_urls = list(dict.fromkeys(str(u) for u in (discovered_urls or []) if u))[:73]
+    source_labs = scan_report.get("labs") if isinstance(scan_report, dict) else []
+    source_labs = source_labs if isinstance(source_labs, list) else []
+    ranges = globals().get("_LAB_TYPE_RANGES", [])
+
+    def category_for(item: dict) -> str:
+        match = re.search(r"-(\d{2})$", str(item.get("id") or ""))
+        number = int(match.group(1)) if match else -1
+        for low, high, title in ranges:
+            if low <= number <= high:
+                return title
+        return "Pemeriksaan SATRIA"
+
+    per_lab: list[dict[str, Any]] = []
+    for raw in source_labs:
+        if not isinstance(raw, dict):
+            continue
+        category_title = category_for(raw)
+        status = "detected" if raw.get("status") == "confirmed" else "not_verified"
+        per_lab.append({
+            "id": raw.get("id", ""),
+            "title": raw.get("title", ""),
+            "level": str(raw.get("severity") or "info").lower(),
+            "category": category_title,
+            "category_title": category_title,
+            "status": status,
+            "evidence": str(raw.get("evidence") or "Belum ada bukti yang memenuhi kriteria konfirmasi."),
+            "location": raw.get("location", "-"),
+            "method": raw.get("method", ""),
+        })
+
+    detected = [x for x in per_lab if x["status"] == "detected"]
+    not_verified = [x for x in per_lab if x["status"] == "not_verified"]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in per_lab:
+        groups.setdefault(item["category_title"], []).append(item)
+    category_summary = []
+    for title, items in groups.items():
+        category_summary.append({
+            "category": title, "title": title, "total": len(items),
+            "detected": sum(x["status"] == "detected" for x in items),
+            "candidate": 0, "not_verified": sum(x["status"] == "not_verified" for x in items),
+            "not_applicable": 0,
+        })
+
+    source_stats = scan_report.get("scan_stats") if isinstance(scan_report, dict) else {}
+    source_stats = dict(source_stats) if isinstance(source_stats, dict) else {}
+    errors = list(scan_report.get("errors") or []) if isinstance(scan_report, dict) else []
+    source_stats.update({
+        "pages_discovered": len(discovered_urls),
+        "pages_scanned": 1 if scan_report else 0,
+        "discovery_limit": 73,
+        "passive_runs": 0, "active_runs": 0,
+        "errors": list(dict.fromkeys(errors + list(source_stats.get("errors") or []))),
+        "scanner": "SatriaBaruScanner (227 criteria)",
+        "auxiliary_31_category_scanner": "removed",
+    })
+    summary = scan_report.get("summary") if isinstance(scan_report, dict) else {}
+    return {
+        "target": scan_report.get("target", "") if isinstance(scan_report, dict) else "",
+        "labs_total": len(per_lab), "pages_discovered": len(discovered_urls),
+        "pages_scanned": 1 if scan_report else 0,
+        "detected": detected, "detected_lab_count": len(detected),
+        "candidates": [], "not_verified": not_verified, "not_applicable": [],
+        "per_lab": per_lab, "category_summary": category_summary,
+        "findings": list(scan_report.get("findings") or []) if isinstance(scan_report, dict) else [],
+        "candidate_findings": [], "stats": source_stats,
+        "discovered_pages": discovered_urls, "scanned_pages": [scan_report.get("target", "")] if scan_report else [],
+        "summary": summary if isinstance(summary, dict) else {},
+    }
+
 def render_lab_report(report: dict, max_rows: int = 40) -> str:
     lines = [
         f"## Pemindaian Kerentanan Terstruktur — {report['target']}",
@@ -14681,11 +14547,22 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
     print("[2/10] Menganalisis temuan kode deterministik (SRI, skrip pihak ketiga) ...", flush=True)
     code_findings = detect_code_findings_deterministic(page_html, target_url)
 
-    # ── Section 3: Pemindaian terstruktur scan (48 lab SQLi+XSS di dalamnya) ────────
-    print("[3/10] Memindai katalog kerentanan (termasuk 48 lab SQL injection + XSS) ...", flush=True)
-    lab_report = scan_labs(target_url, page_html, http_result, authorized=authorized)
-    print("[4/10] Pemindaian kerentanan selesai; menyusun hasil ...", flush=True)
-    lab_findings = lab_report["findings"]
+    # ── Section 3: discovery 73 URL (GET-only), lalu scan 1 URL utama ─────────
+    print("[3/10] Discovery same-origin maksimal 73 URL (tanpa probe pada subhalaman) ...", flush=True)
+    discovery_urls: list[str] = [target_url]
+    try:
+        root_context = build_target_context(target_url, page_html, http_result or {}, authorized=bool(authorized))
+        discovered_contexts = _discover_same_origin_contexts(root_context, max_pages=73)
+        discovery_urls = [str(getattr(item, "url", "")) for item in discovered_contexts if getattr(item, "url", "")]
+    except Exception as discovery_exc:
+        print(f"[WARN] Discovery gagal; scan URL utama tetap dilanjutkan: {type(discovery_exc).__name__}: {discovery_exc}", flush=True)
+    print("[4/10] Memindai kerentanan hanya pada URL utama ...", flush=True)
+    primary_scan = scan_target(
+        target_url, authorized=bool(authorized), allow_private=False, max_pages=1,
+        rendered_html=None, render_html=None,
+    )
+    lab_report = _legacy_scan_to_engine_lab_report(primary_scan, discovery_urls)
+    lab_findings = list(primary_scan.get("findings") or [])
 
     # ── Section 4: teknologi & CVE (opsional) ────────────────────────────────
     print("[5/10] Mengidentifikasi teknologi dan mencari CVE ...", flush=True)
@@ -14728,7 +14605,7 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
             "headers": http_result.get("headers"),
             "errors": http_result.get("errors"),
         },
-        "errors": lab_report["stats"]["errors"],
+        "errors": list(primary_scan.get("errors") or []),
     }
 
     print("[7/10] Menyimpan temuan ...", flush=True)
@@ -18673,13 +18550,52 @@ def _collect_engine_scan_results(target_url: str, html: str = "", http_result: d
     except Exception as e:
         out["engine_errors"].append(f"extract_tech_versions_deterministic: {type(e).__name__}: {e}")
 
+    # Hanya discovery same-origin pada tahap ini. Tidak ada eksekusi 31 keluarga
+    # probe tambahan; pemindaian kerentanan dilakukan sekali oleh scan_target().
     try:
-        out["engine_lab_scan"] = scan_labs(out.get("engine_http", {}).get("final_url") or target_url, fetched_html, out.get("engine_http") or {}, authorized=authorized) or {}
+        discovery_url = out.get("engine_http", {}).get("final_url") or target_url
+        root_context = build_target_context(discovery_url, fetched_html, out.get("engine_http") or {},
+                                            authorized=bool(authorized))
+        discovered_contexts = _discover_same_origin_contexts(root_context, max_pages=73)
+        discovered_urls = [str(getattr(item, "url", "")) for item in discovered_contexts
+                           if getattr(item, "url", "")]
+        discovery_meta = next((x for x in reversed(root_context.http_log or [])
+                               if isinstance(x, dict) and x.get("phase") == "discovery_summary"), {})
+        discovery_stats = {
+            "pages_discovered": len(discovered_urls),
+            "discovery_attempted": int(discovery_meta.get("attempted_pages") or len(discovered_urls)),
+            "discovery_limit": 73, "pages_scanned": 0,
+            "passive_runs": 0, "active_runs": 0, "errors": [],
+            "scanner": "discovery-only; vulnerability scanning delegated to scan_target",
+            "auxiliary_31_category_scanner": "removed",
+        }
+        out["engine_lab_scan"] = {
+            "target": discovery_url, "labs_total": 0, "pages_discovered": len(discovered_urls),
+            "pages_scanned": 0, "detected": [], "detected_lab_count": 0,
+            "candidates": [], "not_verified": [], "not_applicable": [],
+            "per_lab": [], "category_summary": [], "findings": [],
+            "candidate_findings": [], "stats": discovery_stats,
+            "discovered_pages": discovered_urls,
+            "discovery_attempted_urls": list(discovery_meta.get("discovered_urls") or [])[:73],
+            "scanned_pages": [], "per_page_scans": [],
+        }
     except Exception as e:
-        out["engine_errors"].append(f"scan_labs: {type(e).__name__}: {e}")
-        out["engine_lab_scan"] = {}
+        out["engine_errors"].append(f"discovery_only: {type(e).__name__}: {e}")
+        out["engine_lab_scan"] = {
+            "target": target_url, "labs_total": 0, "pages_discovered": 0,
+            "pages_scanned": 0, "detected": [], "detected_lab_count": 0,
+            "candidates": [], "not_verified": [], "not_applicable": [],
+            "per_lab": [], "category_summary": [], "findings": [],
+            "candidate_findings": [],
+            "stats": {"pages_discovered": 0, "discovery_limit": 73,
+                      "pages_scanned": 0, "passive_runs": 0, "active_runs": 0,
+                      "errors": [f"{type(e).__name__}: {e}"],
+                      "auxiliary_31_category_scanner": "removed"},
+            "discovered_pages": [], "discovery_attempted_urls": [],
+            "scanned_pages": [], "per_page_scans": [],
+        }
 
-    # Discovery & Reconnaissance summary from engine lab scan and available context
+    # Discovery & Reconnaissance summary (tanpa menjalankan probe kategori).
     lab = out.get("engine_lab_scan") or {}
     stats = lab.get("stats") if isinstance(lab.get("stats"), dict) else {}
     out["discovery_recon"] = {
@@ -18916,7 +18832,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
                        "Hasil discovery/reconnaissance dari kemampuan engine, termasuk metrik penemuan halaman, DNS records, email security (DNS observation), dan TLS protocols.")
     stats = lab.get("stats") if isinstance(lab.get("stats"), dict) else {}
     recon_rows = [
-        ("Halaman ditemukan", str(recon.get("pages_discovered") or stats.get("pages_discovered") or 0), "Discovery same-origin (scan_labs)."),
+        ("Halaman ditemukan", str(recon.get("pages_discovered") or stats.get("pages_discovered") or 0), "Discovery same-origin maksimal 73 URL; vulnerability scan hanya pada URL utama."),
         ("Probe pasif", str(stats.get("passive_runs", 0)), "Jumlah probe pasif engine."),
         ("Probe aktif", str(stats.get("active_runs", 0)), "Jumlah probe aktif (jika diizinkan)."),
     ]
@@ -19840,6 +19756,17 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 def run_satria_fix1_scan(target_url: str, html: str = "", authorized: bool = False) -> dict:
     from datetime import datetime, timezone
     engine = _collect_engine_scan_results(target_url, html=html, authorized=authorized)
+    primary = None
+    if authorized:
+        primary = scan_target(target_url, authorized=True, allow_private=False, max_pages=1)
+        discovery_urls = (engine.get("discovery_recon") or {}).get("discovered_pages") or [target_url]
+        engine["engine_lab_scan"] = _legacy_scan_to_engine_lab_report(primary, discovery_urls)
+        engine["active_scan"] = {
+            "authorized": True, "scanner": "SatriaBaruScanner (227 criteria)",
+            "auxiliary_31_category_scanner": "removed",
+            "findings": list(primary.get("findings") or []),
+            "detected_count": int((primary.get("summary") or {}).get("confirmed", 0)),
+        }
     result = {
         "target": target_url,
         "generated_at": datetime.now(timezone.utc).isoformat(),
