@@ -15347,25 +15347,20 @@ def _dedupe_findings(findings: list[dict]) -> list[dict]:
 # EKSEKUSI PROBE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Engine vulnerability scan categories disabled (known broken/false-positive in engine) - removed from execution
-_ENGINE_DISABLED_PROBES = {
-    "sqli", "xss", "dom", "clickjacking", "cors", "path_traversal",
-    "access_control", "cache_poisoning", "cache_deception", "deserialization",
-    "info_disclosure", "business_logic", "jwt", "essential", "graphql", "api",
-    "xxe", "ssrf", "smuggling", "os_command", "ssti", "file_upload", "race", "llm",
-}
-_ENGINE_DISABLED_CATEGORIES = {
-    "sql_injection", "xss", "dom", "clickjacking", "cors", "path_traversal",
-    "access_control", "cache_poisoning", "cache_deception", "deserialization",
-    "info_disclosure", "business_logic", "jwt", "essential", "graphql", "api",
-    "xxe", "ssrf", "smuggling", "os_command", "ssti", "file_upload", "race", "llm",
-}
+# Engine vulnerability scan (probe/kategori dari satria_engine.py) dinonaktifkan sepenuhnya:
+# tidak dijalankan dan tidak ditampilkan progres/hasilnya.
+_ENGINE_DISABLE_ALL_VULN_PROBES = True
+_ENGINE_DISABLED_PROBES = set()  # semua dinonaktifkan via flag di atas
+_ENGINE_DISABLED_CATEGORIES = set()
 
 def _run_probes(ctx, app: dict[str, tuple[bool, str]], progress_offset: int = 0,
                 progress_total: int = 0) -> tuple[list[dict], list[dict], dict]:
     confirmed: list[dict] = []
     candidates: list[dict] = []
     stats = {"passive_runs": 0, "active_runs": 0, "errors": [], "skipped_probes": []}
+    # Seluruh kelompok pemindaian kerentanan engine (satria_engine.py) dinonaktifkan.
+    if globals().get("_ENGINE_DISABLE_ALL_VULN_PROBES", False):
+        return confirmed, candidates, stats
     probe_items = list(app.items())
     probe_total = sum(len(PASSIVE_PROBES.get(pr, [])) + len(ACTIVE_PROBES.get(pr, []))
                       for pr, _ in probe_items)
