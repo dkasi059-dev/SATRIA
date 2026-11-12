@@ -694,8 +694,16 @@ class SatriaBaruScanner:
         oob_poll_url: str | None = None,
         oob_webhook_site: bool = False,
         rendered_html: str | None = None,
+        render_html: Callable[[str], dict[str, Any]] | None = None,
     ):
         self.target_url = self._normalize_target(target_url)
+        # Callback render untuk sub-halaman hasil crawl (bukan hanya halaman target).
+        self.render_html = render_html
+        try:
+            _crawl_render_cap = int(os.getenv("SATRIA_JS_RENDER_CRAWL_PAGES", "12") or 12)
+        except (TypeError, ValueError):
+            _crawl_render_cap = 12
+        self.crawl_render_left = max(0, min(_crawl_render_cap, 40)) if render_html else 0
         # HTML hasil render JavaScript untuk halaman target (seed). Bila ada,
         # link/form/JS dari konten dinamis ikut menjadi titik injeksi.
         self.seed_rendered_html = (rendered_html or "")[:1_500_000]
@@ -952,6 +960,10 @@ class SatriaBaruScanner:
                 self.stats["seed_html_source"] = "javascript_render"
             elif canonical_url(url) == canonical_url(self.target_url):
                 self.stats.setdefault("seed_html_source", "http_static")
+            else:
+                # Sub-halaman juga dirender selama kuota tersedia, supaya link/form
+                # yang baru muncul setelah JavaScript ikut diuji (bukan hanya halaman awal).
+                resp = self._render_crawl_page(url, resp)
             if resp.error or not resp.text:
                 self.stats["errors"].append(f"Crawl gagal {url}: {resp.error}")
                 continue
@@ -961,6 +973,31 @@ class SatriaBaruScanner:
                 if link not in visited and link not in queue and len(visited) + len(queue) < self.max_pages * 3:
                     queue.append(link)
         self._build_points()
+
+    def _render_crawl_page(self, url: str, resp: Response) -> Response:
+        """Ganti isi halaman crawl dengan HTML hasil render JavaScript bila memungkinkan."""
+        if self.render_html is None or self.crawl_render_left <= 0 or not self._within_budget():
+            return resp
+        try:
+            headers = {str(k).lower(): str(v) for k, v in (getattr(resp, "headers", {}) or {}).items()}
+        except Exception:
+            headers = {}
+        ctype = headers.get("content-type", "").lower()
+        if ctype and "html" not in ctype:
+            return resp
+        self.crawl_render_left -= 1
+        try:
+            rendered = self.render_html(url) or {}
+        except Exception:
+            return resp
+        html = str(rendered.get("html") or "")
+        if not html:
+            return resp
+        self.stats["crawl_pages_rendered"] = int(self.stats.get("crawl_pages_rendered") or 0) + 1
+        if resp.error or not resp.text:
+            return Response(status=int(rendered.get("status") or 200) or 200, url=url,
+                            text=html, headers={}, elapsed=0.0)
+        return replace(resp, text=html)
 
     def _append_page(self, url: str, resp: Response) -> None:
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -8566,6 +8603,7 @@ class SatriaBaruScanner:
                 "elapsed_seconds": round(time.monotonic() - self.started, 2),
                 "oob_status": self.oob_status,
                 "seed_html_source": self.stats.get("seed_html_source", "not_fetched"),
+                "crawl_pages_rendered": int(self.stats.get("crawl_pages_rendered") or 0),
                 "errors": self.stats["errors"][:20],
             },
         }
@@ -8715,6 +8753,7 @@ def scan_target(
     oob_poll_url: str | None = None,
     oob_webhook_site: bool = False,
     rendered_html: str | None = None,
+    render_html: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     scanner = SatriaBaruScanner(
         target_url,
@@ -8729,6 +8768,7 @@ def scan_target(
         oob_poll_url=oob_poll_url,
         oob_webhook_site=oob_webhook_site,
         rendered_html=rendered_html,
+        render_html=render_html,
     )
     return scanner.scan()
 
@@ -9668,6 +9708,132 @@ def _install_playwright_chromium() -> tuple[bool, str]:
     return ok, detail
 
 
+_JS_RENDER_LIBS_STATE: dict[str, Any] = {"attempted": False, "ok": False, "detail": ""}
+_JS_RENDER_DEP_PACKAGES: tuple[str, ...] = (
+    # Daftar dependensi Chromium Playwright + pustaka transisinya.
+    "libasound2", "libasound2t64", "libatk-bridge2.0-0", "libatk-bridge2.0-0t64",
+    "libatk1.0-0", "libatk1.0-0t64", "libatspi2.0-0", "libatspi2.0-0t64",
+    "libcairo2", "libcups2", "libcups2t64", "libdbus-1-3", "libdrm2", "libgbm1",
+    "libglib2.0-0", "libglib2.0-0t64", "libnspr4", "libnss3", "libpango-1.0-0",
+    "libwayland-client0", "libx11-6", "libxcb1", "libxcomposite1", "libxdamage1",
+    "libxext6", "libxfixes3", "libxkbcommon0", "libxrandr2", "libxi6", "libxtst6",
+    "libxcursor1", "libxinerama1", "libxrender1", "libxft2", "libfontconfig1",
+    "libfreetype6", "libpng16-16", "libpng16-16t64", "libpixman-1-0", "libharfbuzz0b",
+    "libfribidi0", "libthai0", "libdatrie1", "libgraphite2-3", "libexpat1",
+    "libbz2-1.0", "liblzma5", "libzstd1", "libuuid1", "libselinux1", "libpcre2-8-0",
+    "libffi8", "libmount1", "libblkid1", "libcap2", "libgcrypt20", "libgpg-error0",
+    "liblz4-1", "libbrotli1", "libxau6", "libxdmcp6", "libbsd0", "libmd0",
+    "libxcb-render0", "libxcb-shm0", "libxcb-render-util0", "libxcb-shape0",
+    "libxcb-xfixes0", "libxcb-sync1", "libxcb-randr0", "libxcb-glx0", "libxcb-present0",
+    "libxcb-dri3-0", "libxcb-xkb1", "libxkbcommon-x11-0", "libx11-xcb1", "libsm6",
+    "libice6", "libxt6",
+)
+
+
+def _js_render_lib_root() -> str:
+    configured = str(os.getenv("SATRIA_JS_RENDER_LIBDIR") or "").strip()
+    if configured:
+        return configured
+    return os.path.join(os.path.expanduser("~"), ".cache", "satria", "js-render-libs")
+
+
+def _js_render_lib_paths() -> list[str]:
+    root = _js_render_lib_root()
+    return [os.path.join(root, "usr", "lib", "x86_64-linux-gnu"),
+            os.path.join(root, "lib", "x86_64-linux-gnu"),
+            os.path.join(root, "usr", "lib"),
+            os.path.join(root, "lib")]
+
+
+def _prepend_js_render_lib_path() -> bool:
+    """Tambahkan pustaka hasil unduhan ke LD_LIBRARY_PATH (sebelum driver Playwright start)."""
+    entries = [p for p in _js_render_lib_paths() if os.path.isdir(p)]
+    if not entries:
+        return False
+    current = [p for p in str(os.environ.get("LD_LIBRARY_PATH") or "").split(":") if p]
+    merged = entries + [p for p in current if p not in entries]
+    os.environ["LD_LIBRARY_PATH"] = ":".join(merged)
+    return True
+
+
+def _apt_package_names(lists_dir: str) -> set[str]:
+    """Nama paket yang tersedia menurut indeks apt yang sudah diunduh."""
+    names: set[str] = set()
+    for path in glob.glob(os.path.join(lists_dir, "*_Packages")):
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("Package: "):
+                        names.add(line[9:].strip())
+        except OSError:
+            continue
+    return names
+
+
+def _bootstrap_js_render_libs() -> tuple[bool, str]:
+    """Pasang pustaka sistem Chromium tanpa root: unduh .deb ke cache, ekstrak, pakai via LD_LIBRARY_PATH."""
+    if _JS_RENDER_LIBS_STATE["attempted"]:
+        return bool(_JS_RENDER_LIBS_STATE["ok"]), str(_JS_RENDER_LIBS_STATE["detail"])
+    _JS_RENDER_LIBS_STATE["attempted"] = True
+    if _js_render_install_mode() == "off":
+        _JS_RENDER_LIBS_STATE["detail"] = "pemasangan otomatis dimatikan (SATRIA_JS_RENDER_INSTALL=off)"
+        return False, str(_JS_RENDER_LIBS_STATE["detail"])
+    if not (shutil.which("apt-get") and shutil.which("dpkg-deb")):
+        _JS_RENDER_LIBS_STATE["detail"] = "apt-get/dpkg-deb tidak tersedia (image non-Debian?)"
+        return False, str(_JS_RENDER_LIBS_STATE["detail"])
+    root = _js_render_lib_root()
+    lists = os.path.join(root, "apt-lists")
+    cache = os.path.join(root, "apt-cache")
+    debs = os.path.join(root, "debs")
+    for path in (os.path.join(lists, "partial"), os.path.join(cache, "archives", "partial"), debs, root):
+        os.makedirs(path, exist_ok=True)
+    print(f"[JS RENDER] Pustaka sistem Chromium belum lengkap — memasang ke cache lokal {root} "
+          f"(unduh .deb, tanpa root)...", flush=True)
+    apt_opts = ["-o", f"Dir::State::lists={lists}", "-o", f"Dir::Cache={cache}",
+                "-o", "APT::Get::Assume-Yes=true"]
+
+    def _run(args: list[str], timeout: int, cwd: str | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+
+    try:
+        _run(["apt-get", *apt_opts, "update"], 300)
+    except Exception as exc:
+        _JS_RENDER_LIBS_STATE["detail"] = f"apt-get update gagal: {type(exc).__name__}: {str(exc)[:160]}"
+        return False, str(_JS_RENDER_LIBS_STATE["detail"])
+    packages = list(dict.fromkeys(_JS_RENDER_DEP_PACKAGES))
+    available = _apt_package_names(lists)
+    if available:
+        # Satu nama paket yang tidak ada membuat apt membatalkan SEMUA unduhan,
+        # jadi saring dulu sesuai isi indeks distro (t64 vs non-t64).
+        packages = [name for name in packages if name in available]
+    if not packages:
+        _JS_RENDER_LIBS_STATE["detail"] = "tidak ada paket dependensi yang cocok dengan indeks distro"
+        return False, str(_JS_RENDER_LIBS_STATE["detail"])
+    try:
+        proc = _run(["apt-get", *apt_opts, "download", *packages], 600, cwd=debs)
+    except Exception as exc:
+        _JS_RENDER_LIBS_STATE["detail"] = f"unduh paket gagal: {type(exc).__name__}: {str(exc)[:160]}"
+        return False, str(_JS_RENDER_LIBS_STATE["detail"])
+    deb_files = sorted(glob.glob(os.path.join(debs, "*.deb")))
+    if not deb_files:
+        err_tail = _clean_js_error(getattr(proc, "stderr", "") or "", 200)
+        _JS_RENDER_LIBS_STATE["detail"] = ("unduhan .deb kosong" + (f" ({err_tail})" if err_tail else ""))
+        return False, str(_JS_RENDER_LIBS_STATE["detail"])
+    for deb in deb_files:
+        try:
+            _run(["dpkg-deb", "-x", deb, root], 120)
+        except Exception:
+            continue
+    _prepend_js_render_lib_path()
+    required = os.path.join(root, "usr", "lib", "x86_64-linux-gnu", "libnss3.so")
+    ok = os.path.exists(required)
+    _JS_RENDER_LIBS_STATE["ok"] = ok
+    _JS_RENDER_LIBS_STATE["detail"] = (f"{len(deb_files)} paket diekstrak ke {root}" if ok
+                                       else "libnss3.so tidak ditemukan setelah ekstrak")
+    print(f"[JS RENDER] Pustaka sistem: {_JS_RENDER_LIBS_STATE['detail']}", flush=True)
+    return ok, str(_JS_RENDER_LIBS_STATE["detail"])
+
+
 def _js_render_error_hint(errors: list[str]) -> str:
     """Pesan kegagalan yang menjelaskan langkah perbaikan konkret."""
     # Diagnosa hanya dari penyebab utama (browser bawaan Playwright), bukan pesan
@@ -9726,6 +9892,7 @@ def _launch_js_browser(pw: Any) -> tuple[Any, str]:
     args = ["--no-sandbox", "--disable-dev-shm-usage"]
     errors: list[str] = []
     install_tried = False
+    libs_tried = False
     for candidate in _playwright_launch_candidates():
         kwargs: dict[str, Any] = {"headless": True, "args": args}
         if candidate.get("channel"):
@@ -9737,11 +9904,17 @@ def _launch_js_browser(pw: Any) -> tuple[Any, str]:
         except Exception as exc:
             text = str(exc)
             errors.append(f"{candidate['label']}: {type(exc).__name__}: {_clean_js_error(text, 800)}")
-            if not install_tried and "executable doesn't exist" in text.lower():
+            low = text.lower()
+            if not install_tried and "executable doesn't exist" in low:
                 install_tried = True
                 if _install_playwright_chromium()[0]:
                     # Driver Playwright menyimpan daftar browser saat start, jadi
                     # launch ulang di proses yang sama tetap "tidak ada". Mulai ulang.
+                    raise _BrowserRestartNeeded()
+            if not libs_tried and ("error while loading shared libraries" in low
+                                   or "host system is missing dependencies" in low):
+                libs_tried = True
+                if _bootstrap_js_render_libs()[0]:
                     raise _BrowserRestartNeeded()
     return None, _js_render_error_hint(errors)
 
@@ -9769,6 +9942,7 @@ def _render_html_with_playwright(url: str) -> dict[str, Any]:
     if wait_until not in {"load", "domcontentloaded", "networkidle", "commit"}:
         wait_until = "networkidle"
 
+    _prepend_js_render_lib_path()
     last_error = ""
     # Percobaan kedua dipakai setelah browser baru diunduh: driver Playwright harus
     # dimulai ulang agar mengenali browser yang baru terpasang.
@@ -9982,6 +10156,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                 oob_poll_url=_oob_poll_url,
                 oob_webhook_site=_oob_webhook_site,
                 rendered_html=_rendered_seed,
+                render_html=_fetch_page_html_for_analysis,
             )
             if first_report is None:
                 first_report = page_report
@@ -21342,7 +21517,9 @@ def _render_full_per_page_reports(page, content_left, content_width, result):
             ("Sumber HTML Analisis",
              str(pf.get("html_source_label") or "HTML statis via HTTP (JavaScript tidak dijalankan)")
              + (" | titik injeksi scanner memakai HTML render"
-                if str((_stats or {}).get("seed_html_source")) == "javascript_render" else ""),
+                if str((_stats or {}).get("seed_html_source")) == "javascript_render" else "")
+             + (f" | {_stats.get('crawl_pages_rendered')} sub-halaman crawl juga dirender"
+                if int((_stats or {}).get("crawl_pages_rendered") or 0) > 0 else ""),
              "Menunjukkan apakah analisis & titik injeksi memakai HTML hasil render JavaScript atau HTML statis."),
         ]
         _draw_kv_table(page, content_left, content_width, "Ringkasan Halaman", rows,
