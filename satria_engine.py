@@ -9545,176 +9545,163 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         raise RuntimeError("URL target tidak ditemukan pada scrape_data/url.")
     if scrape_data is not None:
         persist_scrape_artifacts(scrape_data)
-    print(f"[PROGRESS] Memulai pemindaian kerentanan utama (basis) — {target_url}", flush=True)
+    print(f"[PROGRESS] Discovery (Tahap 1) — penemuan seluruh halaman: {target_url}", flush=True)
     _oob_domain = os.getenv("SATRIA_OOB_DOMAIN") or None
     _oob_poll_url = os.getenv("SATRIA_OOB_POLL_URL") or None
     _oob_webhook_site = os.getenv("SATRIA_OOB_WEBHOOK_SITE") in {"1", "true", "yes", "on"}
-    report = scan_target(
-        target_url,
-        authorized=True,
-        allow_private=False,
-        oob_domain=_oob_domain,
-        oob_poll_url=_oob_poll_url,
-        oob_webhook_site=_oob_webhook_site,
-    )
-    print("[PROGRESS] Pemindaian kerentanan utama (target awal) selesai. Menjalankan discovery, analisis, dan pemindaian per halaman...", flush=True)
-    summary = _summary_from_report(report)
-    result: dict[str, Any] = {
-        "target": report.get("target", target_url),
-        "generated_at": report.get("generated_at"),
-        "mode": "active",
-        "labs": report.get("labs", []),
-        "report": report,
-        "summary": summary,
-        "errors": list(report.get("scan_stats", {}).get("errors", []) or []),
-        "per_page_main_scans": [],
-    }
-    # Integrate engine scan results (discovery Tahap 1 + analisis/pemindaian Tahap 2 per halaman)
+
+    # 1) Discovery semua halaman dulu (origin sama)
+    engine_scan = {}
     try:
         engine_scan = _collect_engine_scan_results(target_url, authorized=auth)
-        result["engine_scan"] = engine_scan
-        result["engine_http"] = engine_scan.get("engine_http", {})
-        result["engine_lab_scan"] = engine_scan.get("engine_lab_scan", {})
-        result["engine_code_findings"] = engine_scan.get("engine_code_findings", [])
     except Exception as _eng_exc:
-        result.setdefault("errors", []).append(f"engine_scan integration: {type(_eng_exc).__name__}: {_eng_exc}")
-        result["engine_scan"] = {"engine_errors": [str(_eng_exc)]}
-        engine_scan = result["engine_scan"]
+        engine_scan = {"engine_errors": [str(_eng_exc)], "discovery_recon": {"discovered_pages": [target_url]}}
 
-    # Pemindaian kerentanan utama (basis, bukan engine) + analisis/CVE/teknologi per halaman yang ditemukan
-    try:
-        recon = (engine_scan.get("discovery_recon") or {}) if isinstance(engine_scan, dict) else {}
-        discovered = list(recon.get("discovered_pages") or [])
-        # ensure target included
-        if target_url and target_url not in discovered:
-            discovered.insert(0, target_url)
-        # dedupe preserve order
-        _seen_d=set(); discovered_u=[]
-        for u in discovered:
-            if u and u not in _seen_d:
-                _seen_d.add(u); discovered_u.append(u)
-        # batasi agar tetap layak dijalankan
-        _max_pp = int(os.getenv("SATRIA_MAX_PER_PAGE_MAIN_SCANS", "30"))
-        pages_to_scan = discovered_u[:max(1,_max_pp)]
+    recon = (engine_scan.get("discovery_recon") or {}) if isinstance(engine_scan, dict) else {}
+    discovered = list(recon.get("discovered_pages") or [])
+    if target_url and target_url not in discovered:
+        discovered.insert(0, target_url)
+    _seen_d=set(); discovered_u=[]
+    for u in discovered:
+        if u and u not in _seen_d:
+            _seen_d.add(u); discovered_u.append(u)
+    _max_pp = int(os.getenv("SATRIA_MAX_PER_PAGE_MAIN_SCANS", "30"))
+    pages_to_scan = discovered_u[:max(1,_max_pp)]
 
-        merged_confirmed: dict[tuple, dict] = {}
-        for lab in (result.get("labs") or []):
-            if isinstance(lab, dict) and lab.get("status") == "confirmed":
-                key = (lab.get("id") or lab.get("title"), lab.get("location"), str(lab.get("evidence",""))[:120])
-                merged_confirmed[key] = lab
-        per_page_main = []
+    # 2) Proses LENGKAP per halaman — sama seperti halaman pertama/origin (tanpa pembedaan)
+    per_page_main = []
+    per_page_full = []
+    merged_confirmed: dict[tuple, dict] = {}
+    first_report = None
+    first_page_result = None
 
-        for pi, page_url in enumerate(pages_to_scan, 1):
-            page_entry = {"url": page_url, "main_vuln": {"confirmed": 0, "labs": []},
-                          "technologies": [], "cves": [], "code_findings": [], "http": {}, "error": None}
-            try:
-                print(f"[PROGRESS {pi}/{len(pages_to_scan)}] Pemindaian kerentanan utama (basis) per halaman: {page_url}", flush=True)
-                # scan kerentanan utama per halaman (fokus halaman tsb, tanpa crawl ulang besar)
-                if page_url != target_url:
-                    _pp_max_requests = int(os.getenv("SATRIA_PER_PAGE_MAX_REQUESTS", "120"))
-                    _pp_max_points = int(os.getenv("SATRIA_PER_PAGE_MAX_POINTS", "12"))
-                    _pp_timeout = float(os.getenv("SATRIA_PER_PAGE_TIMEOUT", "6.0"))
-                    page_report = scan_target(
-                        page_url,
-                        authorized=True,
-                        allow_private=False,
-                        max_pages=1,
-                        max_points=max(4, _pp_max_points),
-                        max_requests=max(30, _pp_max_requests),
-                        timeout=max(3.0, _pp_timeout),
-                        oob_domain=_oob_domain,
-                        oob_poll_url=_oob_poll_url,
-                        oob_webhook_site=_oob_webhook_site,
-                    )
-                    page_labs = page_report.get("labs", []) if isinstance(page_report, dict) else []
-                    conf = [l for l in page_labs if isinstance(l, dict) and l.get("status") == "confirmed"]
-                    page_entry["main_vuln"]["confirmed"] = len(conf)
-                    page_entry["main_vuln"]["labs"] = conf[:50]
-                    for l in conf:
-                        key = (l.get("id") or l.get("title"), l.get("location"), str(l.get("evidence",""))[:120])
-                        if key not in merged_confirmed:
-                            merged_confirmed[key] = l
-                else:
-                    # target awal sudah discan di atas
-                    base_conf = [l for l in (report.get("labs") or []) if isinstance(l, dict) and l.get("status") == "confirmed"]
-                    page_entry["main_vuln"]["confirmed"] = len(base_conf)
-                    page_entry["main_vuln"]["labs"] = base_conf[:50]
-
-                # analisis per halaman: HTTP, teknologi, analisis kode, CVE (NVD/OSV) berdasarkan teknologi halaman
-                try:
-                    page_http = analyze_http_security(page_url)
-                    page_entry["http"] = {"status_code": page_http.get("status_code"), "server": page_http.get("server"),
-                                          "technologies": page_http.get("technologies", [])}
-                    page_html = page_http.get("html") or ""
-                    page_tech = extract_tech_versions_deterministic(page_html) or []
-                    # merge tech dari header/http
-                    ht = page_http.get("technologies") or []
-                    if isinstance(ht, list):
-                        for t in ht:
-                            if t and t not in page_tech: page_tech.append(t)
-                    page_entry["technologies"] = page_tech[:30]
-                    page_entry["code_findings"] = (detect_code_findings_deterministic(page_html, page_url) or [])[:30]
-                    # CVE lookup per halaman berdasarkan teknologi terdeteksi
-                    try:
-                        cve_res = collect_cve_findings(page_tech, enabled=True) if page_tech else {"cves": [], "nvd_osv": {}, "cve_search_audit": []}
-                        page_cves = cve_res.get("cves") or []
-                        page_entry["cves"] = page_cves[:30] if isinstance(page_cves, list) else []
-                    except Exception as _ce:
-                        page_entry["cves"] = []
-                        result.setdefault("errors", []).append(f"cve_per_page {page_url}: {type(_ce).__name__}")
-                except Exception as _ae:
-                    page_entry["error"] = f"analisis: {type(_ae).__name__}"
-            except Exception as _pe:
-                page_entry["error"] = str(_pe)[:200]
-                result.setdefault("errors", []).append(f"per_page_main {page_url}: {type(_pe).__name__}")
-            per_page_main.append(page_entry)
-
-        result["per_page_main_scans"] = per_page_main
-        # gabungkan temuan terkonfirmasi basis dari semua halaman (dedupe)
-        if merged_confirmed:
-            all_labs = []
-            # keep all catalog entries but mark confirmed if in merged
-            for lab in (result.get("labs") or []):
-                if not isinstance(lab, dict):
-                    continue
-                key = (lab.get("id") or lab.get("title"), lab.get("location"), str(lab.get("evidence",""))[:120])
-                if lab.get("status") == "confirmed":
-                    all_labs.append(lab)
-                elif key in merged_confirmed:
-                    all_labs.append(merged_confirmed[key])
-                else:
-                    all_labs.append(lab)
-            # add confirmed from merged not in catalog by key match (best-effort)
-            existing_keys = {(l.get("id") or l.get("title"), l.get("location"), str(l.get("evidence",""))[:120]) for l in all_labs if isinstance(l,dict) and l.get("status")=="confirmed"}
-            for k,v in merged_confirmed.items():
-                if k not in existing_keys:
-                    all_labs.append(v)
-            result["labs"] = all_labs
-        result["summary"] = _summary_from_report({"labs": result.get("labs", [])})
-        # also attach aggregated per-page CVE/tech insights into engine_scan for reporting
+    for pi, page_url in enumerate(pages_to_scan, 1):
+        print(f"[PROGRESS {pi}/{len(pages_to_scan)}] Pemindaian & analisis lengkap per halaman (proses sama seperti halaman pertama): {page_url}", flush=True)
+        page_entry = {"url": page_url, "main_vuln": {"confirmed": 0, "labs": []},
+                      "technologies": [], "cves": [], "code_findings": [], "http": {}, "error": None}
         try:
-            if isinstance(engine_scan, dict):
-                engine_scan["per_page_main_scans"] = per_page_main
-                # aggregate unique CVEs found across pages
-                agg_cves=[]; seen_c=set()
-                for pe in per_page_main:
-                    for c in (pe.get("cves") or []):
-                        cid = c.get("id") if isinstance(c, dict) else str(c)
-                        if cid and cid not in seen_c:
-                            seen_c.add(cid); agg_cves.append(c)
-                if agg_cves:
-                    existing = engine_scan.get("cves") or []
-                    ex_ids = { (x.get("id") if isinstance(x,dict) else str(x)) for x in existing }
-                    for c in agg_cves:
-                        cid = c.get("id") if isinstance(c,dict) else str(c)
-                        if cid not in ex_ids:
-                            existing.append(c); ex_ids.add(cid)
-                    engine_scan["cves"] = existing
-                result["engine_scan"] = engine_scan
-        except Exception:
-            pass
-    except Exception as _pp_exc:
-        result.setdefault("errors", []).append(f"per_page_pipeline: {type(_pp_exc).__name__}: {_pp_exc}")
+            # (a) Pemindaian kerentanan utama (basis, 24 kategori) — parameter sama seperti halaman pertama
+            page_report = scan_target(
+                page_url,
+                authorized=True,
+                allow_private=False,
+                oob_domain=_oob_domain,
+                oob_poll_url=_oob_poll_url,
+                oob_webhook_site=_oob_webhook_site,
+            )
+            if first_report is None:
+                first_report = page_report
+            page_labs = page_report.get("labs", []) if isinstance(page_report, dict) else []
+            conf = [l for l in page_labs if isinstance(l, dict) and l.get("status") == "confirmed"]
+            page_entry["main_vuln"]["confirmed"] = len(conf)
+            page_entry["main_vuln"]["labs"] = conf
+            page_entry["main_vuln"]["summary"] = _summary_from_report(page_report) if isinstance(page_report, dict) else {}
+            page_entry["main_vuln"]["scan_stats"] = (page_report.get("scan_stats") or {}) if isinstance(page_report, dict) else {}
+            for l in conf:
+                key = (l.get("id") or l.get("title"), l.get("location"), str(l.get("evidence",""))[:120])
+                if key not in merged_confirmed:
+                    merged_confirmed[key] = l
+
+            # (b) Analisis per halaman (HTTP, teknologi, analisis kode, CVE) — lengkap
+            try:
+                page_http = analyze_http_security(page_url)
+                page_entry["http"] = page_http if isinstance(page_http, dict) else {}
+                page_html = page_http.get("html") or ""
+                page_tech = extract_tech_versions_deterministic(page_html) or []
+                ht = page_http.get("technologies") or []
+                if isinstance(ht, list):
+                    for t in ht:
+                        if t and t not in page_tech: page_tech.append(t)
+                page_entry["technologies"] = page_tech
+                page_entry["code_findings"] = detect_code_findings_deterministic(page_html, page_url) or []
+                try:
+                    cve_res = collect_cve_findings(page_tech, enabled=True) if page_tech else {"cves": [], "nvd_osv": {}, "cve_search_audit": []}
+                    page_cves = cve_res.get("cves") or []
+                    page_entry["cves"] = page_cves if isinstance(page_cves, list) else []
+                    page_entry["cve_search_audit"] = cve_res.get("cve_search_audit") or []
+                except Exception as _ce:
+                    page_entry["cves"] = []
+            except Exception as _ae:
+                page_entry["error"] = f"analisis: {type(_ae).__name__}"
+
+            # (c) Simpan hasil lengkap per halaman (seperti halaman pertama)
+            page_full = {
+                "url": page_url,
+                "report": page_report,
+                "summary": _summary_from_report(page_report) if isinstance(page_report, dict) else {},
+                "labs": page_labs,
+                "http": page_entry.get("http") or {},
+                "technologies": page_entry.get("technologies") or [],
+                "code_findings": page_entry.get("code_findings") or [],
+                "cves": page_entry.get("cves") or [],
+                "cve_search_audit": page_entry.get("cve_search_audit") or [],
+            }
+            per_page_full.append(page_full)
+            if first_page_result is None:
+                first_page_result = page_entry
+        except Exception as _pe:
+            page_entry["error"] = str(_pe)[:200]
+        per_page_main.append(page_entry)
+
+    # Bangun hasil akhir (agregat) + simpan hasil lengkap per halaman
+    base_report = first_report if isinstance(first_report, dict) else {}
+    base_labs = base_report.get("labs", []) if isinstance(base_report, dict) else []
+    # gabungkan temuan terkonfirmasi basis dari semua halaman (dedupe) ke daftar labs
+    if merged_confirmed:
+        all_labs = []
+        for lab in base_labs:
+            if not isinstance(lab, dict):
+                continue
+            key = (lab.get("id") or lab.get("title"), lab.get("location"), str(lab.get("evidence",""))[:120])
+            if lab.get("status") == "confirmed":
+                all_labs.append(lab)
+            elif key in merged_confirmed:
+                all_labs.append(merged_confirmed[key])
+            else:
+                all_labs.append(lab)
+        existing_keys = {(l.get("id") or l.get("title"), l.get("location"), str(l.get("evidence",""))[:120]) for l in all_labs if isinstance(l,dict) and l.get("status")=="confirmed"}
+        for k,v in merged_confirmed.items():
+            if k not in existing_keys:
+                all_labs.append(v)
+        base_labs = all_labs
+
+    result: dict[str, Any] = {
+        "target": base_report.get("target", target_url) if isinstance(base_report, dict) else target_url,
+        "generated_at": base_report.get("generated_at") if isinstance(base_report, dict) else None,
+        "mode": "active",
+        "labs": base_labs,
+        "report": base_report,
+        "summary": _summary_from_report({"labs": base_labs}),
+        "errors": list((base_report.get("scan_stats", {}) or {}).get("errors", []) or []) if isinstance(base_report, dict) else [],
+        "per_page_main_scans": per_page_main,
+        "per_page_full_reports": per_page_full,
+    }
+
+    # Agregasi CVE unik lintas halaman ke engine_scan
+    try:
+        if isinstance(engine_scan, dict):
+            engine_scan["per_page_main_scans"] = per_page_main
+            engine_scan["per_page_full_reports"] = per_page_full
+            agg_cves=[]; seen_c=set()
+            for pe in per_page_main:
+                for c in (pe.get("cves") or []):
+                    cid = c.get("id") if isinstance(c, dict) else str(c)
+                    if cid and cid not in seen_c:
+                        seen_c.add(cid); agg_cves.append(c)
+            if agg_cves:
+                existing = engine_scan.get("cves") or []
+                ex_ids = { (x.get("id") if isinstance(x,dict) else str(x)) for x in existing }
+                for c in agg_cves:
+                    cid = c.get("id") if isinstance(c,dict) else str(c)
+                    if cid not in ex_ids:
+                        existing.append(c); ex_ids.add(cid)
+                engine_scan["cves"] = existing
+        result["engine_scan"] = engine_scan if isinstance(engine_scan, dict) else {}
+        result["engine_http"] = (engine_scan.get("engine_http", {}) if isinstance(engine_scan, dict) else {})
+        result["engine_lab_scan"] = (engine_scan.get("engine_lab_scan", {}) if isinstance(engine_scan, dict) else {})
+        result["engine_code_findings"] = (engine_scan.get("engine_code_findings", []) if isinstance(engine_scan, dict) else [])
+    except Exception as _agg_exc:
+        result.setdefault("errors", []).append(f"agg: {type(_agg_exc).__name__}")
 
     try:
         findings_path = Path(globals().get("FINDINGS_PATH") or Path(globals().get("ARTIFACTS_DIR", Path("artifacts"))) / "findings.json").expanduser()
@@ -20866,6 +20853,152 @@ def _collect_additional_oob_evidence(http: dict, engine_lab: dict, tls_infos: li
     return outd
 
 
+
+
+def _render_full_per_page_reports(page, content_left, content_width, result):
+    """Render laporan lengkap per halaman (setiap halaman sama lengkapnya: HTTP/observasi, teknologi, analisis kode, CVE, kerentanan utama basis)."""
+    eng = result.get("engine_scan") or {}
+    per_page_full = list(result.get("per_page_full_reports") or eng.get("per_page_full_reports") or [])
+    if not per_page_full:
+        return
+    for idx, pf in enumerate(per_page_full, 1):
+        if not isinstance(pf, dict):
+            continue
+        url = str(pf.get("url") or "-")
+        page.new_page()
+        page.section_title(f"Laporan Lengkap Halaman {idx}: {url}",
+                           "Hasil pemindaian dan analisis lengkap untuk halaman ini (proses sama seperti halaman pertama/origin). Hanya temuan/observasi yang benar-benar ditemukan yang dilaporkan.")
+
+        # Ringkasan halaman
+        http = pf.get("http") if isinstance(pf.get("http"), dict) else {}
+        techs = pf.get("technologies") or []
+        code_findings = pf.get("code_findings") or []
+        cves = pf.get("cves") or []
+        labs = pf.get("labs") or []
+        conf_labs = [l for l in labs if isinstance(l, dict) and l.get("status") == "confirmed"]
+        summary = pf.get("summary") or {}
+        tech_str = ", ".join([f"{t.get('name','?')} {t.get('version','')}".strip() if isinstance(t,dict) else str(t) for t in techs]) or "-"
+        rows = [
+            ("URL Halaman", url, "Halaman yang dipindai/dianalisis."),
+            ("Status HTTP", str(http.get("status_code") or "-"), "Kode status respons."),
+            ("Server", str(http.get("server") or "-"), "Header Server teramati."),
+            ("X-Powered-By", str(http.get("powered_by") or "-"), "Header X-Powered-By teramati."),
+            ("Content-Type", str(http.get("content_type") or "-"), "Tipe konten respons."),
+            ("Teknologi Terdeteksi", tech_str, "Deteksi teknologi/versi pada halaman ini."),
+            ("Temuan Kode (deterministik)", str(len(code_findings)), "Jumlah temuan analisis kode."),
+            ("CVE Ditemukan", str(len(cves)), "CVE berdasarkan teknologi halaman ini."),
+            ("Kerentanan Terkonfirmasi (basis)", str(len(conf_labs)), "Temuan terkonfirmasi pemindaian utama basis."),
+        ]
+        _draw_kv_table(page, content_left, content_width, "Ringkasan Halaman", rows,
+                       widths=(170.0, 220.0, 109.0), header_color=_PDF_COLORS["navy"])
+
+        # Observasi HTTP lengkap
+        http_findings = list(http.get("findings") or [])
+        if http_findings:
+            _draw_finding_cards(page, content_left, content_width, "Observasi HTTP (analyze_http_security)", http_findings, max_items=50)
+        else:
+            page.ensure(24)
+            page.text(content_left, page.y - 12, "Observasi HTTP (analyze_http_security)", 10.5, _PDF_COLORS["navy"], bold=True)
+            page.y -= 20
+            page.bullet_paragraph("Tidak ada observasi HTTP tambahan yang dilaporkan oleh analisis untuk halaman ini.")
+
+        # Temuan analisis kode lengkap
+        page.ensure(24)
+        page.text(content_left, page.y - 14, "Hasil Analisis Kode (deterministik)", 11.0, _PDF_COLORS["navy"], bold=True)
+        page.y -= 24
+        if code_findings:
+            for cf in code_findings[:60]:
+                if not isinstance(cf, dict):
+                    page.bullet_paragraph(str(cf), 8.6)
+                    continue
+                title = str(cf.get("title") or cf.get("type") or cf.get("name") or "Temuan").strip()
+                sev = str(cf.get("severity") or cf.get("risk") or "info").strip()
+                detail = str(cf.get("evidence") or cf.get("detail") or cf.get("description") or cf.get("match") or "-").strip()
+                rec = str(cf.get("recommendation") or cf.get("remediation") or "-").strip()
+                card = [f"[{sev.upper()}] {title}",
+                        f"Bukti/Detail: {detail[:500]}",
+                        f"Rekomendasi: {rec[:300]}" if rec and rec != "-" else "Rekomendasi: -"]
+                body_lines = []
+                for part in card:
+                    body_lines += _pdf_wrap(part, content_width - 28, 8.6)
+                card_h = max(40, len(body_lines) * 11.0 + 14)
+                page.ensure(card_h + 6)
+                page.rect_top(content_left, page.y, content_width, card_h, _PDF_COLORS["light"])
+                page.rect_top(content_left, page.y, 4, card_h, _PDF_COLORS["amber"])
+                ytxt = page.y - 13
+                for li, line in enumerate(body_lines):
+                    page.text(content_left + 12, ytxt, line, 8.6 if li else 9.0, _PDF_COLORS["navy"] if li==0 else _PDF_COLORS["text"], bold=(li==0))
+                    ytxt -= 11.0
+                page.y -= (card_h + 6)
+        else:
+            page.bullet_paragraph("Tidak ada temuan analisis kode deterministik pada halaman ini.")
+
+        # CVE lengkap
+        page.ensure(24)
+        page.text(content_left, page.y - 14, "CVE (NVD/OSV) berdasarkan Teknologi Halaman", 11.0, _PDF_COLORS["navy"], bold=True)
+        page.y -= 24
+        if cves:
+            cve_rows = []
+            for c in cves[:40]:
+                if isinstance(c, dict):
+                    cid = str(c.get("id") or c.get("cve_id") or c.get("cve") or "-")
+                    sev = str(c.get("severity") or c.get("cvss") or "-")
+                    desc = str(c.get("summary") or c.get("description") or c.get("title") or "-")
+                    src = str(c.get("source") or "NVD/OSV")
+                    cve_rows.append((cid, sev, src, desc))
+                else:
+                    cve_rows.append((str(c), "-", "-", "-"))
+            _draw_kv_table(page, content_left, content_width, None, cve_rows,
+                           headers=("CVE/ID", "Severity/CVSS", "Sumber", "Deskripsi"), widths=(90.0, 70.0, 60.0, 279.0), header_color=_PDF_COLORS["navy"])
+        else:
+            page.bullet_paragraph("Tidak ada CVE yang ditemukan/dikembalikan untuk teknologi terdeteksi pada halaman ini.")
+
+        # Kerentanan terkonfirmasi (pemindaian utama basis) — lengkap
+        page.ensure(24)
+        page.text(content_left, page.y - 14, "Kerentanan Terkonfirmasi — Pemindaian Utama (Basis, 24 Kategori)", 11.0, _PDF_COLORS["navy"], bold=True)
+        page.y -= 24
+        if conf_labs:
+            for lab in conf_labs[:80]:
+                if not isinstance(lab, dict):
+                    page.bullet_paragraph(str(lab), 8.6)
+                    continue
+                lid = str(lab.get("id") or lab.get("lab_id") or "-")
+                title = str(lab.get("title") or lab.get("name") or "-")
+                sev = str(lab.get("severity") or "info")
+                method = str(lab.get("method") or "-")
+                loc = str(lab.get("location") or lab.get("url") or url)
+                ev = str(lab.get("evidence") or "-")
+                lines_card = [
+                    f"[{sev.upper()}] {lid} — {title}",
+                    f"Metode: {method}",
+                    f"Lokasi: {loc}",
+                    f"Bukti: {ev[:700]}",
+                ]
+                body_lines = []
+                for part in lines_card:
+                    body_lines += _pdf_wrap(part, content_width - 28, 8.6)
+                card_h = max(52, len(body_lines) * 11.0 + 14)
+                page.ensure(card_h + 6)
+                page.rect_top(content_left, page.y, content_width, card_h, _PDF_COLORS["light"])
+                sev_l = sev.lower()
+                barc = _PDF_COLORS["red"] if sev_l in ("critical","high") else (_PDF_COLORS["amber"] if sev_l=="medium" else _PDF_COLORS["teal"])
+                page.rect_top(content_left, page.y, 4, card_h, barc)
+                ytxt = page.y - 13
+                for li, line in enumerate(body_lines):
+                    page.text(content_left + 12, ytxt, line, 8.8 if li else 9.0, _PDF_COLORS["navy"] if li==0 else _PDF_COLORS["text"], bold=(li==0))
+                    ytxt -= 11.0
+                page.y -= (card_h + 6)
+        else:
+            page.bullet_paragraph("Tidak ada kerentanan terkonfirmasi oleh pemindaian utama basis pada halaman ini.")
+
+        # Statistik scan utama halaman
+        stats = (pf.get("report") or {}).get("scan_stats") if isinstance(pf.get("report"), dict) else {}
+        if isinstance(stats, dict) and stats:
+            srows = [(str(k), str(v), "-") for k,v in list(stats.items())[:20]]
+            _draw_kv_table(page, content_left, content_width, "Statistik Pemindaian Utama Halaman", srows,
+                           headers=("Metrik", "Nilai", "Keterangan"), widths=(220.0, 120.0, 159.0), header_color=_PDF_COLORS["teal"])
+
+
 def _render_additional_quality_scans(page, content_left, content_width, result):
     eng = result.get("engine_scan") or result
     additional = result.get("additional_quality_scans") or eng.get("additional_quality_scans") or {}
@@ -21056,6 +21189,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
 
     # Render all requested engine sections (includes DNS/TLS/email/Censys/NVD/CVE/active/discovery/observasi & analisis kode/teknologi)
     _render_engine_sections_v2(page, content_left, content_width, result)
+    _render_full_per_page_reports(page, content_left, content_width, result)
 
     # Pemindaian kerentanan dikelompokkan per jenis (mencakup seluruh 227 kriteria)
     _render_vuln_types_v2(page, content_left, content_width, result)
