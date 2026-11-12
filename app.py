@@ -335,7 +335,7 @@ st.markdown(
 with st.sidebar:
     logo_path = Path(__file__).resolve().parent / "Logo_satria.png"
     if logo_path.is_file():
-        st.image(str(logo_path), width=240)
+        st.image(str(logo_path), width=333)
     else:
         st.markdown("## 🛡️ SATRIA WebSec")
     if not APP_ACCESS_PASSWORD:
