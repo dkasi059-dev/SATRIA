@@ -9565,7 +9565,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
     for u in discovered:
         if u and u not in _seen_d:
             _seen_d.add(u); discovered_u.append(u)
-    _max_pp = int(os.getenv("SATRIA_MAX_PER_PAGE_MAIN_SCANS", "30"))
+    _max_pp = int(os.getenv("SATRIA_MAX_PER_PAGE_MAIN_SCANS", "7"))
     pages_to_scan = discovered_u[:max(1,_max_pp)]
 
     # 2) Proses LENGKAP per halaman — sama seperti halaman pertama/origin (tanpa pembedaan)
@@ -9573,7 +9573,6 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
     per_page_full = []
     merged_confirmed: dict[tuple, dict] = {}
     first_report = None
-    first_page_result = None
 
     for pi, page_url in enumerate(pages_to_scan, 1):
         print(f"[PROGRESS {pi}/{len(pages_to_scan)}] Pemindaian & analisis lengkap per halaman (proses sama seperti halaman pertama): {page_url}", flush=True)
@@ -9637,8 +9636,6 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                 "cve_search_audit": page_entry.get("cve_search_audit") or [],
             }
             per_page_full.append(page_full)
-            if first_page_result is None:
-                first_page_result = page_entry
         except Exception as _pe:
             page_entry["error"] = str(_pe)[:200]
         per_page_main.append(page_entry)
@@ -9917,7 +9914,7 @@ CENSYS_RATE_SLEEP = 1.0
 REQUEST_TIMEOUT = 20
 
 # ── Batas waktu scan global + progress per kerentanan ────────────────────────
-# Dulu tidak ada deadline: discovery (≤80 halaman × ≤24 script) × semua probe
+# Dulu tidak ada deadline: discovery (≤137 halaman × ≤24 script) × semua probe
 # aktif di SETIAP halaman (SQLi saja ≤240 request) berjalan sekuensial tanpa
 # progress per-probe, sehingga terlihat "terhenti" puluhan menit. Deadline ini
 # membuat scan selalu berhenti dan tetap menghasilkan laporan parsial.
@@ -15746,7 +15743,7 @@ def group_detected(rows: list[dict]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # ORKESTRATOR LAB
 # ══════════════════════════════════════════════════════════════════════════════
-def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80) -> list[TargetContext]:
+def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 137) -> list[TargetContext]:
     """Crawl halaman, form GET, dan endpoint yang dirujuk JavaScript pada origin sama.
 
     Discovery hanya memakai GET dan tidak mengirim form POST atau aksi mutasi.
@@ -15797,7 +15794,7 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
     commons_added = False
     contexts: list[TargetContext] = [root_ctx]
     scripts_seen: set[str] = set()
-    max_pages = max(1, min(int(os.getenv("SATRIA_MAX_DISCOVERY_PAGES", str(max_pages))), 120))
+    max_pages = max(1, min(int(os.getenv("SATRIA_MAX_DISCOVERY_PAGES", str(max_pages))), 137))
     max_scripts = max(0, min(int(os.getenv("SATRIA_MAX_DISCOVERY_SCRIPTS", "24")), 40))
     blocked = re.compile(r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|remove|unsubscribe|deactivate|purchase|checkout|transfer|payment)(?:/|$)", re.I)
     static_ext = re.compile(r"\.(?:png|jpe?g|gif|svg|ico|css|woff2?|ttf|eot|mp[34]|pdf|zip)(?:$|\?)", re.I)
@@ -21312,4 +21309,3 @@ def run_satria_fix1_scan(target_url: str, html: str = "", authorized: bool = Fal
         "cves": len(engine.get("cves") or []),
     }
     return result
-
