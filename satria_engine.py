@@ -114,7 +114,7 @@ import unicodedata
 import uuid
 from bisect import bisect_left
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -691,8 +691,12 @@ class SatriaBaruScanner:
         oob_domain: str | None = None,
         oob_poll_url: str | None = None,
         oob_webhook_site: bool = False,
+        rendered_html: str | None = None,
     ):
         self.target_url = self._normalize_target(target_url)
+        # HTML hasil render JavaScript untuk halaman target (seed). Bila ada,
+        # link/form/JS dari konten dinamis ikut menjadi titik injeksi.
+        self.seed_rendered_html = (rendered_html or "")[:1_500_000]
         if not authorized:
             raise ValueError("Pengujian aktif memerlukan --authorized (Anda menyatakan memiliki izin pengujian).")
         if not allow_private:
@@ -935,6 +939,17 @@ class SatriaBaruScanner:
                 continue
             visited.add(url)
             resp = self._request("GET", url, allow_redirects=True)
+            if self.seed_rendered_html and canonical_url(url) == canonical_url(self.target_url):
+                # Gunakan HTML hasil render JavaScript untuk halaman target, tetapi
+                # pertahankan header/status/cookie dari respons HTTP sebenarnya bila ada.
+                if resp.error or not resp.text:
+                    resp = Response(status=200, url=url, text=self.seed_rendered_html,
+                                    headers={}, elapsed=0.0)
+                else:
+                    resp = replace(resp, text=self.seed_rendered_html)
+                self.stats["seed_html_source"] = "javascript_render"
+            elif canonical_url(url) == canonical_url(self.target_url):
+                self.stats.setdefault("seed_html_source", "http_static")
             if resp.error or not resp.text:
                 self.stats["errors"].append(f"Crawl gagal {url}: {resp.error}")
                 continue
@@ -8548,6 +8563,7 @@ class SatriaBaruScanner:
                 "requests": self.request_count,
                 "elapsed_seconds": round(time.monotonic() - self.started, 2),
                 "oob_status": self.oob_status,
+                "seed_html_source": self.stats.get("seed_html_source", "not_fetched"),
                 "errors": self.stats["errors"][:20],
             },
         }
@@ -8696,6 +8712,7 @@ def scan_target(
     oob_domain: str | None = None,
     oob_poll_url: str | None = None,
     oob_webhook_site: bool = False,
+    rendered_html: str | None = None,
 ) -> dict[str, Any]:
     scanner = SatriaBaruScanner(
         target_url,
@@ -8709,6 +8726,7 @@ def scan_target(
         oob_domain=oob_domain,
         oob_poll_url=oob_poll_url,
         oob_webhook_site=oob_webhook_site,
+        rendered_html=rendered_html,
     )
     return scanner.scan()
 
@@ -9522,6 +9540,171 @@ def _summary_from_report(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _finding_signature(lab: dict) -> tuple:
+    """Signature temuan yang mengabaikan URL halaman.
+
+    Tujuan: temuan identik yang muncul di banyak halaman (mis. form footer,
+    header keamanan, atau skrip bersama) dikenali sebagai SATU isu situs,
+    bukan disalin berulang-ulang sebagai temuan berbeda per halaman.
+    """
+    ev = re.sub(r"https?://[^\s)\"']+", "{URL}", str(lab.get("evidence") or ""))
+    loc = re.sub(r"https?://[^\s)\"']+", "{URL}", str(lab.get("location") or ""))
+    ev = re.sub(r"\s+", " ", ev).strip().lower()
+    loc = re.sub(r"\s+", " ", loc).strip().lower()
+    return (str(lab.get("id") or lab.get("title") or ""), loc, ev[:400])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Renderer JavaScript opsional (Playwright) + fallback HTTP statis
+# ══════════════════════════════════════════════════════════════════════════════
+_JS_RENDER_CACHE: dict[str, dict[str, Any]] = {}
+_JS_RENDER_NOTE_SHOWN = False
+
+
+def _js_render_mode() -> str:
+    """Mode render: auto (default) | on | off.
+
+    auto = coba render JavaScript, fallback otomatis ke HTTP statis bila
+    Playwright/Chromium tidak tersedia atau render gagal.
+    """
+    mode = str(os.getenv("SATRIA_JS_RENDER", "auto")).strip().lower()
+    if mode in {"0", "off", "false", "no", "static"}:
+        return "off"
+    if mode in {"1", "on", "true", "yes", "render"}:
+        return "on"
+    return "auto"
+
+
+def _render_html_with_playwright(url: str) -> dict[str, Any]:
+    """Render halaman dengan Chromium (Playwright) dan kembalikan HTML hasil render.
+
+    Tidak pernah melempar exception: kegagalan dikembalikan sebagai {"error": ...}
+    agar pemanggil dapat fallback ke HTML statis.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return {"error": f"paket playwright tidak tersedia ({type(exc).__name__}: {str(exc)[:120]})"}
+
+    try:
+        timeout_ms = int(os.getenv("SATRIA_JS_RENDER_TIMEOUT_MS", "25000") or 25000)
+    except Exception:
+        timeout_ms = 25000
+    wait_until = str(os.getenv("SATRIA_JS_RENDER_WAIT", "networkidle") or "networkidle").strip().lower()
+    if wait_until not in {"load", "domcontentloaded", "networkidle", "commit"}:
+        wait_until = "networkidle"
+
+    browser = None
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            ctx = browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+                ignore_https_errors=True,
+                viewport={"width": 1366, "height": 900},
+            )
+            page = ctx.new_page()
+            response = page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            try:
+                # Beri kesempatan singkat untuk skrip async menyelesaikan render.
+                page.wait_for_timeout(600)
+            except Exception:
+                pass
+            html = page.content() or ""
+            final_url = page.url or url
+            status = None
+            content_type = server = ""
+            try:
+                if response is not None:
+                    status = response.status
+                    hdrs = {str(k).lower(): str(v) for k, v in (response.headers or {}).items()}
+                    content_type = hdrs.get("content-type", "")
+                    server = hdrs.get("server", "")
+            except Exception:
+                pass
+            ctx.close()
+            browser.close()
+            browser = None
+        if not html.strip():
+            return {"error": "render menghasilkan HTML kosong"}
+        return {
+            "html": html[:1_500_000],
+            "final_url": final_url,
+            "status": status,
+            "content_type": content_type,
+            "server": server,
+            "source": "playwright_render",
+            "html_source_label": "Hasil render JavaScript (Playwright/Chromium)",
+        }
+    except Exception as exc:
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+
+def _fetch_page_html_for_analysis(url: str) -> dict[str, Any]:
+    """HTML untuk analisis halaman: render JavaScript bila tersedia, fallback HTTP statis."""
+    global _JS_RENDER_NOTE_SHOWN
+    if url in _JS_RENDER_CACHE:
+        return dict(_JS_RENDER_CACHE[url])
+
+    mode = _js_render_mode()
+    if mode != "off":
+        rendered = _render_html_with_playwright(url)
+        if rendered.get("html"):
+            _JS_RENDER_CACHE[url] = dict(rendered)
+            return dict(rendered)
+        if not _JS_RENDER_NOTE_SHOWN:
+            _JS_RENDER_NOTE_SHOWN = True
+            print(f"[JS RENDER] Render JavaScript tidak tersedia untuk {url}: {rendered.get('error')}. "
+                  f"Analisis memakai HTML statis (fallback).", flush=True)
+
+    result: dict[str, Any] = {
+        "html": "", "final_url": url, "status": None, "content_type": "", "server": "",
+        "powered_by": "", "source": "static_http",
+        "html_source_label": "HTML statis via HTTP (JavaScript tidak dijalankan)",
+    }
+    try:
+        import requests as _req
+        _resp = _req.get(url, timeout=15, allow_redirects=True, headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        })
+        result.update({
+            "html": (_resp.text or "")[:1_500_000],
+            "final_url": _resp.url,
+            "status": _resp.status_code,
+            "content_type": str(_resp.headers.get("Content-Type", "")),
+            "server": str(_resp.headers.get("Server", "")),
+            "powered_by": str(_resp.headers.get("X-Powered-By", "")),
+        })
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+
+    _JS_RENDER_CACHE[url] = dict(result)
+    return result
+
+
+def _js_render_status_line() -> str:
+    """Ringkasan status renderer untuk log pipeline."""
+    mode = _js_render_mode()
+    if mode == "off":
+        return "Render JavaScript: NONAKTIF (SATRIA_JS_RENDER=off) — analisis memakai HTML statis."
+    try:
+        import playwright  # noqa: F401
+        has_pkg = True
+    except Exception:
+        has_pkg = False
+    if not has_pkg:
+        return "Render JavaScript: paket playwright belum terpasang — analisis memakai HTML statis (fallback otomatis)."
+    return f"Render JavaScript: aktif (Playwright/Chromium, mode {mode}) — fallback HTML statis bila render gagal."
+
+
 def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None = None,
                  html: str | None = None, authorized: bool | None = None,
                  http_result: dict[str, Any] | None = None,
@@ -9545,6 +9728,10 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         raise RuntimeError("URL target tidak ditemukan pada scrape_data/url.")
     if scrape_data is not None:
         persist_scrape_artifacts(scrape_data)
+    # Cache render hanya berlaku untuk satu kali pipeline, agar pemindaian ulang
+    # pada proses yang sama (mis. Streamlit) selalu mengambil HTML terbaru.
+    _JS_RENDER_CACHE.clear()
+    print(f"[JS RENDER] {_js_render_status_line()}", flush=True)
     print(f"[PROGRESS] Discovery (Tahap 1) — penemuan seluruh halaman: {target_url}", flush=True)
     _oob_domain = os.getenv("SATRIA_OOB_DOMAIN") or None
     _oob_poll_url = os.getenv("SATRIA_OOB_POLL_URL") or None
@@ -9578,6 +9765,11 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         print(f"[PROGRESS {pi}/{len(pages_to_scan)}] Pemindaian & analisis lengkap per halaman (proses sama seperti halaman pertama): {page_url}", flush=True)
         page_entry = {"url": page_url, "main_vuln": {"confirmed": 0, "labs": []},
                       "technologies": [], "cves": [], "code_findings": [], "http": {}, "error": None}
+        _scan_started_at = datetime.now(timezone.utc).isoformat()
+        # HTML halaman diambil SEBELUM pemindaian: bila render JavaScript tersedia,
+        # scanner memakainya agar link/form/JS dari konten dinamis ikut diuji.
+        _page_fetch = _fetch_page_html_for_analysis(page_url)
+        _rendered_seed = _page_fetch.get("html") if _page_fetch.get("source") == "playwright_render" else None
         try:
             # (a) Pemindaian kerentanan utama (basis, 24 kategori) — parameter sama seperti halaman pertama
             page_report = scan_target(
@@ -9587,6 +9779,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                 oob_domain=_oob_domain,
                 oob_poll_url=_oob_poll_url,
                 oob_webhook_site=_oob_webhook_site,
+                rendered_html=_rendered_seed,
             )
             if first_report is None:
                 first_report = page_report
@@ -9597,20 +9790,42 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
             page_entry["main_vuln"]["summary"] = _summary_from_report(page_report) if isinstance(page_report, dict) else {}
             page_entry["main_vuln"]["scan_stats"] = (page_report.get("scan_stats") or {}) if isinstance(page_report, dict) else {}
             for l in conf:
-                key = (l.get("id") or l.get("title"), l.get("location"), str(l.get("evidence",""))[:120])
-                if key not in merged_confirmed:
-                    merged_confirmed[key] = l
+                # Satu isu situs yang sama di banyak halaman digabung (bukan duplikat),
+                # dengan daftar halaman terdampak agar bukti tetap lengkap.
+                sig = _finding_signature(l)
+                if sig not in merged_confirmed:
+                    item = dict(l)
+                    item["affected_pages"] = [page_url]
+                    merged_confirmed[sig] = item
+                else:
+                    hit = merged_confirmed[sig].setdefault("affected_pages", [])
+                    if page_url not in hit:
+                        hit.append(page_url)
 
-            # (b) Analisis per halaman (HTTP, teknologi, analisis kode, CVE) — lengkap
+            # (b) Analisis per halaman (HTTP, teknologi, analisis kode, CVE) — lengkap, data nyata per halaman
             try:
                 page_http = analyze_http_security(page_url)
                 page_entry["http"] = page_http if isinstance(page_http, dict) else {}
-                page_html = page_http.get("html") or ""
+                # Ambil HTML & Content-Type aktual halaman ini untuk analisis deterministik (nyata, bukan dummy)
+                page_html = _page_fetch.get("html") or ((page_http or {}).get("html") or "")
+                page_ct = str((page_http or {}).get("content_type") or _page_fetch.get("content_type") or "")
+                page_entry["html_source"] = _page_fetch.get("source")
+                page_entry["html_source_label"] = _page_fetch.get("html_source_label")
+                if isinstance(page_http, dict):
+                    page_http.setdefault("content_type", page_ct or "-")
+                    if not page_http.get("server"):
+                        page_http["server"] = str(_page_fetch.get("server") or "")
+                    if not page_http.get("powered_by"):
+                        page_http["powered_by"] = str(_page_fetch.get("powered_by") or "")
+                if not page_ct and isinstance(page_http, dict):
+                    page_http.setdefault("content_type", "-")
+
                 page_tech = extract_tech_versions_deterministic(page_html) or []
-                ht = page_http.get("technologies") or []
+                ht = (page_http or {}).get("technologies") or []
                 if isinstance(ht, list):
                     for t in ht:
-                        if t and t not in page_tech: page_tech.append(t)
+                        if t and t not in page_tech:
+                            page_tech.append(t)
                 page_entry["technologies"] = page_tech
                 page_entry["code_findings"] = detect_code_findings_deterministic(page_html, page_url) or []
                 try:
@@ -9634,7 +9849,23 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                 "code_findings": page_entry.get("code_findings") or [],
                 "cves": page_entry.get("cves") or [],
                 "cve_search_audit": page_entry.get("cve_search_audit") or [],
+                # Bukti eksekusi nyata per halaman (waktu & sidik isi halaman yang benar-benar diambil)
+                "scan_started_at": _scan_started_at,
+                "scan_finished_at": datetime.now(timezone.utc).isoformat(),
+                "html_source": page_entry.get("html_source"),
+                "html_source_label": page_entry.get("html_source_label"),
             }
+            page_entry["scan_started_at"] = page_full["scan_started_at"]
+            page_entry["scan_finished_at"] = page_full["scan_finished_at"]
+            try:
+                import hashlib as _hl
+                _hb = (page_html or "").encode("utf-8", "ignore")
+                page_full["html_bytes"] = len(_hb)
+                page_full["html_sha256"] = _hl.sha256(_hb).hexdigest()[:16] if _hb else ""
+                page_entry["html_bytes"] = page_full["html_bytes"]
+                page_entry["html_sha256"] = page_full["html_sha256"]
+            except Exception:
+                pass
             per_page_full.append(page_full)
         except Exception as _pe:
             page_entry["error"] = str(_pe)[:200]
@@ -9643,24 +9874,24 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
     # Bangun hasil akhir (agregat) + simpan hasil lengkap per halaman
     base_report = first_report if isinstance(first_report, dict) else {}
     base_labs = base_report.get("labs", []) if isinstance(base_report, dict) else []
-    # gabungkan temuan terkonfirmasi basis dari semua halaman (dedupe) ke daftar labs
+    # Gabungkan temuan terkonfirmasi basis dari semua halaman: satu isu = satu entri,
+    # dengan daftar halaman terdampak (mencegah blok temuan identik berulang).
     if merged_confirmed:
-        all_labs = []
-        for lab in base_labs:
-            if not isinstance(lab, dict):
+        base_labs = [l for l in base_labs if isinstance(l, dict) and l.get("status") != "confirmed"]
+        base_labs.extend(merged_confirmed.values())
+
+    # Pisahkan temuan per halaman menjadi unik-halaman vs berulang-situs (>=2 halaman).
+    shared_sigs = {sig for sig, item in merged_confirmed.items()
+                   if len(item.get("affected_pages") or []) >= 2}
+    site_wide_findings = [item for sig, item in merged_confirmed.items() if sig in shared_sigs]
+    for _pf in per_page_full:
+        _unique, _shared = [], []
+        for _l in (_pf.get("labs") or []):
+            if not isinstance(_l, dict) or _l.get("status") != "confirmed":
                 continue
-            key = (lab.get("id") or lab.get("title"), lab.get("location"), str(lab.get("evidence",""))[:120])
-            if lab.get("status") == "confirmed":
-                all_labs.append(lab)
-            elif key in merged_confirmed:
-                all_labs.append(merged_confirmed[key])
-            else:
-                all_labs.append(lab)
-        existing_keys = {(l.get("id") or l.get("title"), l.get("location"), str(l.get("evidence",""))[:120]) for l in all_labs if isinstance(l,dict) and l.get("status")=="confirmed"}
-        for k,v in merged_confirmed.items():
-            if k not in existing_keys:
-                all_labs.append(v)
-        base_labs = all_labs
+            (_shared if _finding_signature(_l) in shared_sigs else _unique).append(_l)
+        _pf["labs_unique"] = _unique
+        _pf["labs_shared"] = _shared
 
     result: dict[str, Any] = {
         "target": base_report.get("target", target_url) if isinstance(base_report, dict) else target_url,
@@ -9672,6 +9903,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         "errors": list((base_report.get("scan_stats", {}) or {}).get("errors", []) or []) if isinstance(base_report, dict) else [],
         "per_page_main_scans": per_page_main,
         "per_page_full_reports": per_page_full,
+        "site_wide_findings": site_wide_findings,
     }
 
     # Agregasi CVE unik lintas halaman ke engine_scan
@@ -9679,6 +9911,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         if isinstance(engine_scan, dict):
             engine_scan["per_page_main_scans"] = per_page_main
             engine_scan["per_page_full_reports"] = per_page_full
+            engine_scan["site_wide_findings"] = site_wide_findings
             agg_cves=[]; seen_c=set()
             for pe in per_page_main:
                 for c in (pe.get("cves") or []):
@@ -20467,7 +20700,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
         page.text(content_left, page.y - 14, "Hasil Pemindaian per Halaman", 11.0, _PDF_COLORS["navy"], bold=True)
         page.y -= 22
         page.paragraph(content_left, content_width,
-                       "Setiap halaman yang ditemukan pada Tahap 1 dipindai satu per satu. Berikut hasil per halaman (analisis HTTP/meta, teknologi, analisis kode, CVE berdasarkan teknologi terdeteksi, dan pemindaian kerentanan utama basis). Hanya temuan/observasi yang benar-benar ditemukan yang dilaporkan; halaman dengan hasil serupa mencerminkan kondisi aktual halaman tersebut.",
+                       "Setiap halaman yang ditemukan pada Tahap 1 dipindai satu per satu. Berikut hasil per halaman (analisis HTTP/meta, teknologi, analisis kode, CVE berdasarkan teknologi terdeteksi, dan pemindaian kerentanan utama basis). Hanya temuan/observasi yang benar-benar ditemukan yang dilaporkan. Halaman dengan hasil serupa mencerminkan kondisi aktual halaman tersebut; temuan yang identik di beberapa halaman dikenali sebagai satu isu situs dan dilaporkan sekali pada bagian Temuan Berulang Seluruh Situs agar tidak tumpang tindih.",
                        9.0, _PDF_COLORS["muted"])
         page.y -= 6
         # index per_page_scans by url for merge
@@ -20525,10 +20758,12 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
             mv_conf = int(mv.get("confirmed") or 0) if isinstance(mv, dict) else 0
             mv_labs = mv.get("labs") or [] if isinstance(mv, dict) else []
             mv_titles = []
+            _shared_ids = {str(x.get("id") or "") for x in (result.get("site_wide_findings") or []) if isinstance(x, dict)}
             if isinstance(mv_labs, list):
                 for l in mv_labs[:6]:
                     if isinstance(l, dict):
-                        mv_titles.append(str(l.get("id") or l.get("title") or "Temuan"))
+                        _lid = str(l.get("id") or l.get("title") or "Temuan")
+                        mv_titles.append(_lid + (" (berulang situs)" if _lid in _shared_ids else " (unik halaman)"))
             err = it.get("error") or ps.get("notes")
 
             header = f"{idx}. {url}"
@@ -20874,6 +21109,12 @@ def _render_full_per_page_reports(page, content_left, content_width, result):
         labs = pf.get("labs") or []
         conf_labs = [l for l in labs if isinstance(l, dict) and l.get("status") == "confirmed"]
         summary = pf.get("summary") or {}
+        _stats = (pf.get("report") or {}).get("scan_stats") if isinstance(pf.get("report"), dict) else {}
+        _stats = _stats if isinstance(_stats, dict) else {}
+        unique_labs = pf.get("labs_unique")
+        shared_labs = pf.get("labs_shared")
+        unique_labs = unique_labs if isinstance(unique_labs, list) else conf_labs
+        shared_labs = shared_labs if isinstance(shared_labs, list) else []
         tech_str = ", ".join([f"{t.get('name','?')} {t.get('version','')}".strip() if isinstance(t,dict) else str(t) for t in techs]) or "-"
         rows = [
             ("URL Halaman", url, "Halaman yang dipindai/dianalisis."),
@@ -20885,6 +21126,22 @@ def _render_full_per_page_reports(page, content_left, content_width, result):
             ("Temuan Kode (deterministik)", str(len(code_findings)), "Jumlah temuan analisis kode."),
             ("CVE Ditemukan", str(len(cves)), "CVE berdasarkan teknologi halaman ini."),
             ("Kerentanan Terkonfirmasi (basis)", str(len(conf_labs)), "Temuan terkonfirmasi pemindaian utama basis."),
+            ("Temuan Unik Halaman", str(len(unique_labs)), "Temuan yang hanya muncul di halaman ini."),
+            ("Temuan Berulang Situs", str(len(shared_labs)), "Temuan sama yang juga muncul di halaman lain; dilaporkan sekali pada bagian Temuan Berulang Seluruh Situs."),
+            ("Cakupan Pemindaian Halaman",
+             f"{_stats.get('pages_fetched', '-')} halaman di-crawl | {_stats.get('injection_points', '-')} titik injeksi | {_stats.get('requests', '-')} request | {_stats.get('elapsed_seconds', '-')} s",
+             "Bukti eksekusi nyata pemindaian utama pada halaman ini."),
+            ("Waktu Eksekusi Pemindaian",
+             f"{(pf.get('scan_started_at') or '-')[:19].replace('T', ' ')} -> {(pf.get('scan_finished_at') or '-')[:19].replace('T', ' ')} UTC",
+             "Timestamp nyata mulai/selesai pemindaian halaman ini (setiap halaman punya waktunya sendiri)."),
+            ("Sidik Isi Halaman (SHA-256)",
+             f"{pf.get('html_sha256') or '-'} ({pf.get('html_bytes') or 0} byte)",
+             "Hash HTML yang benar-benar diambil dari halaman ini; bukti data nyata, bukan dummy."),
+            ("Sumber HTML Analisis",
+             str(pf.get("html_source_label") or "HTML statis via HTTP (JavaScript tidak dijalankan)")
+             + (" | titik injeksi scanner memakai HTML render"
+                if str((_stats or {}).get("seed_html_source")) == "javascript_render" else ""),
+             "Menunjukkan apakah analisis & titik injeksi memakai HTML hasil render JavaScript atau HTML statis."),
         ]
         _draw_kv_table(page, content_left, content_width, "Ringkasan Halaman", rows,
                        widths=(170.0, 220.0, 109.0), header_color=_PDF_COLORS["navy"])
@@ -20952,10 +21209,10 @@ def _render_full_per_page_reports(page, content_left, content_width, result):
 
         # Kerentanan terkonfirmasi (pemindaian utama basis) — lengkap
         page.ensure(24)
-        page.text(content_left, page.y - 14, "Kerentanan Terkonfirmasi — Pemindaian Utama (Basis, 24 Kategori)", 11.0, _PDF_COLORS["navy"], bold=True)
+        page.text(content_left, page.y - 14, "Kerentanan Terkonfirmasi — Unik untuk Halaman Ini (Basis, 24 Kategori)", 11.0, _PDF_COLORS["navy"], bold=True)
         page.y -= 24
-        if conf_labs:
-            for lab in conf_labs[:80]:
+        if unique_labs:
+            for lab in unique_labs[:80]:
                 if not isinstance(lab, dict):
                     page.bullet_paragraph(str(lab), 8.6)
                     continue
@@ -20986,7 +21243,22 @@ def _render_full_per_page_reports(page, content_left, content_width, result):
                     ytxt -= 11.0
                 page.y -= (card_h + 6)
         else:
-            page.bullet_paragraph("Tidak ada kerentanan terkonfirmasi oleh pemindaian utama basis pada halaman ini.")
+            page.bullet_paragraph("Tidak ada temuan yang unik untuk halaman ini. Seluruh temuan terkonfirmasi pada halaman ini identik dengan temuan situs dan tidak diulang di sini agar tidak tumpang tindih.")
+
+        # Temuan berulang situs yang juga muncul pada halaman ini (ringkas, tanpa duplikasi bukti)
+        if shared_labs:
+            page.ensure(30)
+            page.text(content_left, page.y - 14, "Temuan Berulang Situs yang Juga Terdeteksi pada Halaman Ini", 10.5, _PDF_COLORS["navy"], bold=True)
+            page.y -= 20
+            for lab in shared_labs[:20]:
+                if not isinstance(lab, dict):
+                    page.bullet_paragraph(str(lab), 8.6)
+                    continue
+                lid = str(lab.get("id") or lab.get("lab_id") or "-")
+                title = str(lab.get("title") or lab.get("name") or "-")
+                sev = str(lab.get("severity") or "info")
+                page.bullet_paragraph(f"{lid} — {title} [{sev.upper()}]", 8.6)
+            page.bullet_paragraph("Bukti lengkap temuan berulang dilaporkan satu kali pada bagian Temuan Berulang Seluruh Situs (di akhir laporan per halaman) agar tidak tumpang tindih.", 8.4)
 
         # Statistik scan utama halaman
         stats = (pf.get("report") or {}).get("scan_stats") if isinstance(pf.get("report"), dict) else {}
@@ -20994,6 +21266,43 @@ def _render_full_per_page_reports(page, content_left, content_width, result):
             srows = [(str(k), str(v), "-") for k,v in list(stats.items())[:20]]
             _draw_kv_table(page, content_left, content_width, "Statistik Pemindaian Utama Halaman", srows,
                            headers=("Metrik", "Nilai", "Keterangan"), widths=(220.0, 120.0, 159.0), header_color=_PDF_COLORS["teal"])
+
+    # Temuan berulang seluruh situs — dilaporkan SEKALI (tidak diulang per halaman)
+    site_wide = list(result.get("site_wide_findings") or eng.get("site_wide_findings") or [])
+    if site_wide:
+        page.new_page()
+        page.section_title("Temuan Berulang Seluruh Situs",
+                           "Temuan terkonfirmasi yang identik pada dua halaman atau lebih. Dilaporkan satu kali di sini (bukan diulang di setiap laporan halaman) agar tidak tumpang tindih; daftar halaman terdampak disertakan sebagai bukti.")
+        for widx, lab in enumerate(site_wide[:40], 1):
+            if not isinstance(lab, dict):
+                page.bullet_paragraph(str(lab), 8.6)
+                continue
+            lid = str(lab.get("id") or lab.get("lab_id") or "-")
+            title = str(lab.get("title") or lab.get("name") or "-")
+            sev = str(lab.get("severity") or "info")
+            method = str(lab.get("method") or "-")
+            ev = str(lab.get("evidence") or "-")
+            affected = [str(u) for u in (lab.get("affected_pages") or [])]
+            lines_card = [
+                f" [{sev.upper()}] {lid} — {title}",
+                f"Metode: {method}",
+                f"Halaman terdampak ({len(affected)}): " + ("; ".join(affected[:12]) + (" ..." if len(affected) > 12 else "") if affected else "-"),
+                f"Bukti (dari halaman pertama yang terdeteksi): {ev[:600]}",
+            ]
+            body_lines = []
+            for part in lines_card:
+                body_lines += _pdf_wrap(part, content_width - 28, 8.6)
+            card_h = max(58, len(body_lines) * 11.0 + 14)
+            page.ensure(card_h + 6)
+            page.rect_top(content_left, page.y, content_width, card_h, _PDF_COLORS["light"])
+            sev_l = sev.lower()
+            barc = _PDF_COLORS["red"] if sev_l in ("critical", "high") else (_PDF_COLORS["amber"] if sev_l == "medium" else _PDF_COLORS["teal"])
+            page.rect_top(content_left, page.y, 4, card_h, barc)
+            ytxt = page.y - 13
+            for li, line in enumerate(body_lines):
+                page.text(content_left + 12, ytxt, line, 8.8 if li else 9.0, _PDF_COLORS["navy"] if li == 0 else _PDF_COLORS["text"], bold=(li == 0))
+                ytxt -= 11.0
+            page.y -= (card_h + 6)
 
 
 def _render_additional_quality_scans(page, content_left, content_width, result):
@@ -21309,3 +21618,4 @@ def run_satria_fix1_scan(target_url: str, html: str = "", authorized: bool = Fal
         "cves": len(engine.get("cves") or []),
     }
     return result
+
