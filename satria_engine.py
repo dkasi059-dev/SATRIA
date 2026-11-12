@@ -157,7 +157,7 @@ RUN_NVD = True
 ENABLE_LLM = True
 ALLOW_PARTIAL_TOOLS = True
 ACTIVE_SCAN_AUTHORIZED = True
-SCAN_DEADLINE_SECONDS = 2220.0
+SCAN_DEADLINE_SECONDS = None  # kompatibilitas: batas waktu total scan dinonaktifkan.
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
@@ -688,7 +688,7 @@ class SatriaBaruScanner:
         allow_private: bool = False,
         max_pages: int = 1,
         max_points: int = 24,
-        max_requests: int = 520,
+        max_requests: int = 1370,
         timeout: float = 8.0,
         time_delay: float = 3.0,
         oob_domain: str | None = None,
@@ -719,11 +719,8 @@ class SatriaBaruScanner:
         self.timeout = max(3.0, min(timeout, 30.0))
         self.time_delay = max(1.0, min(time_delay, 8.0))
         self.request_count = 0
+        # Dipakai hanya untuk metrik elapsed_seconds; tidak menjadi batas penghentian scan.
         self.started = time.monotonic()
-        try:
-            self.deadline_seconds = max(2220.0, float(globals().get("SCAN_DEADLINE_SECONDS") or 2220.0))
-        except (TypeError, ValueError):
-            self.deadline_seconds = 2220.0
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
@@ -787,19 +784,10 @@ class SatriaBaruScanner:
         return is_same_origin(url, self.target_url)
 
     def _within_budget(self) -> bool:
-        """Periksa batas request, deadline scanner, dan deadline satu pipeline."""
+        """Periksa hanya batas jumlah request; tidak ada deadline total scan."""
         if self.request_count >= self.max_requests:
             self.stats.setdefault("stop_reason", "request_budget_exhausted")
             return False
-        if (time.monotonic() - self.started) >= self.deadline_seconds:
-            self.stats.setdefault("stop_reason", "scanner_deadline_exceeded")
-            return False
-        try:
-            if _scan_deadline_exceeded():
-                self.stats.setdefault("stop_reason", "pipeline_deadline_exceeded")
-                return False
-        except Exception:
-            pass
         return True
 
     # ------------------------------------------------------------------
@@ -6687,10 +6675,8 @@ def configure_runtime(*args: Any, **overrides: Any) -> dict[str, Any]:
         if target == "ARTIFACTS_DIR":
             new_value = Path(str(value)).expanduser()
         elif target == "SCAN_DEADLINE_SECONDS":
-            try:
-                new_value = max(2220.0, float(value))
-            except (TypeError, ValueError):
-                new_value = 2220.0
+            # Opsi lama dari app.py diterima untuk kompatibilitas, tetapi diabaikan.
+            new_value = None
         elif target in {"SCRAPE_PATH", "FINDINGS_PATH", "OUTPUT_PDF"}:
             new_value = str(value)
         globals()[target] = new_value
@@ -8123,8 +8109,8 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
             "discovered_urls": len(discovered_u),
             "scanned_urls": [target_url],
             "scanned_url_count": 1,
-            "deadline_seconds": float(SCAN_DEADLINE_SECONDS or 0),
-            "deadline_floor_seconds": 2220,
+            "scan_time_limit": None,
+            "time_limit_disabled": True,
             "engine_errors": list(engine_scan.get("engine_errors") or []) if isinstance(engine_scan, dict) else [],
             "page_errors": [p.get("error") for p in per_page_main if p.get("error")],
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -8378,50 +8364,36 @@ SLEEP_BETWEEN_NVD = 3.0
 CENSYS_RATE_SLEEP = 1.0
 REQUEST_TIMEOUT = 20
 
-# ── Batas waktu scan per-run + progress per kerentanan ───────────────────────
-# Discovery/recon dibatasi 73 halaman, sedangkan probe kerentanan hanya pada URL
-# utama. Satu deadline 37 menit berlaku sepanjang satu pipeline; tidak di-reset saat berpindah fase/subproses.
-# Jika deadline/budget tercapai, hasil parsial tetap disusun dan alasannya dicatat.
-_scan_deadline: Optional[float] = None  # fallback kompatibilitas thread lama
+# ── Progress per kerentanan; tidak ada batas durasi total pemindaian ────────
+# Discovery tetap dibatasi maksimal 73 URL dan probe tetap hanya pada URL utama.
+# SCAN_DEADLINE_SECONDS dipertahankan sebagai nama kompatibilitas, tetapi nilainya
+# None dan tidak digunakan untuk menghentikan scan.
+_scan_deadline: Optional[float] = None  # kompatibilitas pemanggil lama
 _scan_progress_cb = None
 _scan_deadline_reported = False
 _scan_local = threading.local()
 
 
 def set_scan_progress_callback(cb) -> None:
-    """Callback progress per thread/run untuk mencegah tabrakan antar sesi UI."""
+    """Simpan callback progress; callback thread-local menjadi sumber utama."""
     global _scan_progress_cb
     _scan_local.progress_cb = cb
-    _scan_progress_cb = cb  # fallback kompatibilitas pemanggil lama
+    _scan_progress_cb = cb  # kompatibilitas pemanggil lama
 
 
 def _scan_begin(force: bool = False) -> None:
-    """Mulai deadline baru per run/thread; pemanggilan internal bersifat idempoten."""
+    """Kompatibilitas entrypoint lama; tidak membuat atau mereset deadline."""
     global _scan_deadline, _scan_deadline_reported
-    local_deadline = getattr(_scan_local, "deadline", None)
-    local_initialized = bool(getattr(_scan_local, "initialized", False))
-    if (not force and local_initialized and
-            (local_deadline is None or time.monotonic() < local_deadline)):
-        return
-    try:
-        limit = float(SCAN_DEADLINE_SECONDS or 0)
-    except (TypeError, ValueError):
-        limit = 2220.0
-    # Batas minimum 37 menit mencegah konfigurasi lama 600/1800 detik memotong scan besar.
-    limit = max(2220.0, limit) if limit > 0 else 0.0
-    _scan_local.initialized = True
-    _scan_local.deadline = (time.monotonic() + limit) if limit > 0 else None
-    _scan_local.reported = False
-    # Salin untuk fungsi lama yang masih membaca variabel global.
-    _scan_deadline = _scan_local.deadline
+    _scan_deadline = None
     _scan_deadline_reported = False
+    _scan_local.deadline = None
+    _scan_local.initialized = True
+    _scan_local.reported = False
 
 
 def _scan_deadline_exceeded() -> bool:
-    if getattr(_scan_local, "initialized", False):
-        deadline = getattr(_scan_local, "deadline", None)
-        return deadline is not None and time.monotonic() >= deadline
-    return _scan_deadline is not None and time.monotonic() >= _scan_deadline
+    """Selalu False: penghentian berdasarkan durasi total scan dinonaktifkan."""
+    return False
 
 
 def _emit_progress(done: int, total: int, label: str) -> None:
@@ -8437,16 +8409,8 @@ def _emit_progress(done: int, total: int, label: str) -> None:
 
 
 def _scan_stop(label: str) -> bool:
-    """True bila deadline habis; catat alasan stop satu kali per thread/run."""
-    global _scan_deadline_reported
-    if not _scan_deadline_exceeded():
-        return False
-    if not getattr(_scan_local, "reported", False):
-        _scan_local.reported = True
-        _scan_deadline_reported = True
-        print(f"[!] BATAS WAKTU SCAN tercapai ({SCAN_DEADLINE_SECONDS:.0f} detik) pada {label}. "
-              "Hasil parsial akan tetap disusun; periksa scan_diagnostics.", flush=True)
-    return True
+    """Tidak menghentikan scan berdasarkan waktu; label dipertahankan untuk API lama."""
+    return False
 
 
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
