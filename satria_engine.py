@@ -157,7 +157,7 @@ RUN_NVD = True
 ENABLE_LLM = True
 ALLOW_PARTIAL_TOOLS = True
 ACTIVE_SCAN_AUTHORIZED = True
-SCAN_DEADLINE_SECONDS = 1800.0
+SCAN_DEADLINE_SECONDS = 2220.0
 _RUNTIME_CONFIG: dict[str, Any] = {"_ignored": []}
 
 # ----------------------------------------------------------------------------
@@ -721,9 +721,9 @@ class SatriaBaruScanner:
         self.request_count = 0
         self.started = time.monotonic()
         try:
-            self.deadline_seconds = max(1800.0, float(globals().get("SCAN_DEADLINE_SECONDS") or 1800.0))
+            self.deadline_seconds = max(2220.0, float(globals().get("SCAN_DEADLINE_SECONDS") or 2220.0))
         except (TypeError, ValueError):
-            self.deadline_seconds = 1800.0
+            self.deadline_seconds = 2220.0
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
@@ -6688,9 +6688,9 @@ def configure_runtime(*args: Any, **overrides: Any) -> dict[str, Any]:
             new_value = Path(str(value)).expanduser()
         elif target == "SCAN_DEADLINE_SECONDS":
             try:
-                new_value = max(1800.0, float(value))
+                new_value = max(2220.0, float(value))
             except (TypeError, ValueError):
-                new_value = 1800.0
+                new_value = 2220.0
         elif target in {"SCRAPE_PATH", "FINDINGS_PATH", "OUTPUT_PDF"}:
             new_value = str(value)
         globals()[target] = new_value
@@ -8124,7 +8124,7 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
             "scanned_urls": [target_url],
             "scanned_url_count": 1,
             "deadline_seconds": float(SCAN_DEADLINE_SECONDS or 0),
-            "deadline_floor_seconds": 1800,
+            "deadline_floor_seconds": 2220,
             "engine_errors": list(engine_scan.get("engine_errors") or []) if isinstance(engine_scan, dict) else [],
             "page_errors": [p.get("error") for p in per_page_main if p.get("error")],
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -8380,7 +8380,7 @@ REQUEST_TIMEOUT = 20
 
 # ── Batas waktu scan per-run + progress per kerentanan ───────────────────────
 # Discovery/recon dibatasi 73 halaman, sedangkan probe kerentanan hanya pada URL
-# utama. Deadline di-reset pada awal setiap run dan dipisahkan per thread/sesi UI.
+# utama. Satu deadline 37 menit berlaku sepanjang satu pipeline; tidak di-reset saat berpindah fase/subproses.
 # Jika deadline/budget tercapai, hasil parsial tetap disusun dan alasannya dicatat.
 _scan_deadline: Optional[float] = None  # fallback kompatibilitas thread lama
 _scan_progress_cb = None
@@ -8406,9 +8406,9 @@ def _scan_begin(force: bool = False) -> None:
     try:
         limit = float(SCAN_DEADLINE_SECONDS or 0)
     except (TypeError, ValueError):
-        limit = 1800.0
-    # Batas 30 menit mencegah konfigurasi lama 600 detik memotong scan besar.
-    limit = max(1800.0, limit) if limit > 0 else 0.0
+        limit = 2220.0
+    # Batas minimum 37 menit mencegah konfigurasi lama 600/1800 detik memotong scan besar.
+    limit = max(2220.0, limit) if limit > 0 else 0.0
     _scan_local.initialized = True
     _scan_local.deadline = (time.monotonic() + limit) if limit > 0 else None
     _scan_local.reported = False
