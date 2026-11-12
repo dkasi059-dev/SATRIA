@@ -9282,7 +9282,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.section_title("Hal yang penting dibaca")
     page.bullet_paragraph("227 judul lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning, 5 Information disclosure, 7 HTTP Host header attacks, 4 NoSQL injection, 8 JWT, 13 Access control, 6 Race conditions, 8 Web LLM attacks, 5 Web cache deception, 7 File upload vulnerabilities, 10 Prototype pollution, 10 Insecure deserialization, 14 Authentication) yang diminta dimasukkan ke laporan ini.")
     page.bullet_paragraph("Status confirmed memakai bukti diferensial yang dapat diulang; not_confirmed bukan bukti tidak rentan.")
-    page.bullet_paragraph("Lab 16-17 hanya dapat terkonfirmasi bila collaborator/poller mencatat interaksi OOB. Tanpa itu, lab terkait tetap not_confirmed.")
+    page.bullet_paragraph("Pemeriksaan OOB (out-of-band) hanya dapat terkonfirmasi bila kolaborator/poller mencatat interaksi nyata. Tanpa itu, temuan terkait tidak dikonfirmasi.")
     page.bullet_paragraph("Bukti ditampilkan apa adanya berdasarkan temuan terverifikasi.")
     page.y -= 18
 
@@ -9326,9 +9326,9 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.section_title("Cakupan dan Metodologi")
     page.bullet_paragraph("Discovery same-origin dari halaman awal, tautan GET yang aman, form GET, cookie terindikasi SQLi, dan endpoint XML stock-check yang ditemukan di JS.")
     page.bullet_paragraph("Baseline ganda dan uji ulangan dipakai untuk menghindari false positive dari halaman dinamis.")
-    page.bullet_paragraph("Lab UNION memakai canary acak, hitung kolom, deteksi kolom teks, dan query metadata yang direlasikan ke DBMS.")
-    page.bullet_paragraph("Lab blind/boolean, conditional error, dan time delay memakai pasangan benar/salah untuk diferensial yang jelas.")
-    page.bullet_paragraph("Lab XML encoding memakai perbandingan payload mentah vs hex-entity encoded.")
+    page.bullet_paragraph("Pemeriksaan injeksi berbasis UNION menggunakan canary acak, hitung kolom, deteksi kolom teks, dan kueri metadata sesuai DBMS teridentifikasi.")
+    page.bullet_paragraph("Pemeriksaan blind/boolean, conditional error, dan time delay menggunakan pasangan kondisi benar/salah untuk perbedaan respons yang jelas.")
+    page.bullet_paragraph("Pemeriksaan enkode XML membandingkan payload mentah dengan varian terenkode untuk observasi perbedaan respons.")
 
     page.y -= 18
     page.section_title("Interpretasi")
@@ -9340,7 +9340,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # ------------------------------------------------------------------- TABEL
     page.new_page()
     page.section_title("Hasil Pemindaian", "Tabel ringkas: satu baris untuk setiap 227 lab.")
-    headers = ("Lab", "Status", "Fokus", "Judul", "Severity")
+    headers = ("Pemeriksaan", "Status", "Fokus", "Judul", "Tingkat Risiko")
     widths = (82.0, 92.0, 90.0, 190.0, 45.0)
     x_cols = []
     x = content_left
@@ -9429,7 +9429,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.bullet_paragraph("Dokumen ini memuat 227 lab (18 SQL injection, 30 XSS, 11 CSRF, 5 Clickjacking, 7 DOM-based, 3 CORS, 9 XXE, 7 SSRF, 22 HTTP request smuggling, 5 OS command injection, 13 Web cache poisoning, 5 Information disclosure, 7 HTTP Host header attacks, 4 NoSQL injection, 8 JWT, 13 Access control, 6 Race conditions, 8 Web LLM attacks, 5 Web cache deception, 7 File upload vulnerabilities, 10 Prototype pollution, 10 Insecure deserialization, 14 Authentication) yang diminta. Status not_confirmed berarti bukti tidak cukup, bukan klaim tidak rentan.")
     page.bullet_paragraph("Status not_confirmed tidak sama dengan tidak rentan; ia hanya menyatakan bukti pemindaian tidak cukup.")
     page.bullet_paragraph("Ringkasan severity dihitung dari temuan terkonfirmasi saja, sesuai field summary yang dibaca app.py.")
-    page.bullet_paragraph("Lab 16-17 memerlukan collaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
+    page.bullet_paragraph("Pemeriksaan out-of-band memerlukan kolaborator atau webhook poller. Tanpa itu, pemindai tidak mengklaim deteksi OOB.")
     page.bullet_paragraph("Target: " + target)
 
 
@@ -9437,7 +9437,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     for idx, page_ops in enumerate(page.pages, start=1):
         page_ops.append(f"{_pdf_rgb(_PDF_COLORS['navy'])} rg 0 {_pdf_num(_PDF_PAGE_H - 32)} {_pdf_num(_PDF_PAGE_W)} 32 re f")
         page_ops.append(f"BT /F2 8 Tf {_pdf_rgb(_PDF_COLORS['white'])} rg {_pdf_num(content_left)} {_pdf_num(_PDF_PAGE_H - 21)} Td (SATRIA BARU - SQL Injection Report) Tj ET")
-        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (90 Lab: SQLi/XSS/CSRF/CJ/DOM/CORS/XXE/SSRF) Tj ET")
+        page_ops.append(f"BT /F1 7.5 Tf {_pdf_rgb(_PDF_COLORS['light'])} rg {_pdf_num(340)} {_pdf_num(_PDF_PAGE_H - 21)} Td (Asesmen Kerentanan Web Terstruktur) Tj ET")
         footer_target = _pdf_safe_text(target)
         if len(footer_target) > 84:
             footer_target = footer_target[:81] + "..."
@@ -9647,7 +9647,7 @@ API publik yang dipakai bagian lain di GitHub tetap sama:
     render_pdf(result, path=...)       -> Path PDF
 
 Integrasi PortSwigger TIDAK mengubah fungsi lama; ia menambah lapisan baru
-(katalog lab + lab-scoped detection) yang dipanggil di akhir run_pipeline.
+(katalog pemeriksaan + deteksi terarah) yang dipanggil di akhir run_pipeline.
 
 Do not use this scanner against systems without explicit authorization.
 """
@@ -15709,7 +15709,7 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 80)
         if _scan_stop("discovery halaman"):
             break
         current = urldefrag(queue.popleft()).url
-        _emit_progress(len(seen) + 1, max_pages, f"Discovery halaman: {current[:90]}")
+        _emit_progress(len(seen) + 1, max_pages, f"Tahap 1/2 - Penemuan seluruh halaman: {current[:90]}")
         if current in seen:
             continue
         seen.add(current)
@@ -15836,8 +15836,8 @@ def run_lab_scan(ctx) -> dict[str, Any]:
     _SQLI_OAST_HOSTS.clear()
     _SQLI_PROVEN.clear()
     _SQLI_SEEN_POINTS.clear()
-    # Cakupan bukan hanya halaman awal: jelajahi tautan, halaman, dan form GET
-    # pada origin yang sama, lalu jalankan keluarga probe pada setiap konteks.
+    # Skenario: Tahap 1 selesaikan penemuan seluruh halaman pada origin yang sama,
+    # lalu Tahap 2 jalankan seluruh jenis pemeriksaan yang tersedia pada setiap halaman satu per satu.
     page_contexts = _discover_same_origin_contexts(ctx)
     aggregate_app: dict[str, tuple[bool, str]] = {}
     confirmed_all: list[dict] = []
@@ -15857,7 +15857,7 @@ def run_lab_scan(ctx) -> dict[str, Any]:
 
     for page_idx, page_ctx in enumerate(page_contexts, start=1):
         _emit_progress(page_idx, len(page_contexts),
-                       f"Scan halaman {page_idx}/{len(page_contexts)}: {page_ctx.url}")
+                       f"Tahap 2/2 - Pemindaian halaman {page_idx}/{len(page_contexts)} (semua jenis pemeriksaan tersedia): {page_ctx.url}")
         if _scan_stop(f"halaman {page_ctx.url}"):
             stats["deadline_exceeded"] = True
             break
@@ -15910,15 +15910,15 @@ def run_lab_scan(ctx) -> dict[str, Any]:
         })
 
     print(f"\n[PortSwigger] Target      : {ctx.url}")
-    print(f"[PortSwigger] Halaman     : {len(page_contexts)} dalam origin yang sama")
-    print(f"[PortSwigger] Lab katalog : {TOTAL_LABS}")
-    print(f"[PortSwigger] Probe pasif : {stats['passive_runs']} | aktif: {stats['active_runs']} "
+    print(f"[SATRIA] Halaman     : {len(page_contexts)} dalam origin yang sama")
+    print(f"[SATRIA] Pemeriksaan katalog : {TOTAL_LABS}")
+    print(f"[SATRIA] Probe pasif : {stats['passive_runs']} | aktif: {stats['active_runs']} "
           f"({'diizinkan' if ctx.authorized else 'tidak diizinkan'})")
-    print(f"[PortSwigger] Terdeteksi  : {len(detected_rows)} lab / {len(detected)} kelompok | "
+    print(f"[SATRIA] Terkonfirmasi : {len(detected_rows)} pemeriksaan / {len(detected)} kelompok | "
           f"kandidat: {len(cand_rows)} | tidak relevan: {len(not_applicable)} | "
           f"belum terbukti: {len(not_verified)}")
     if stats["errors"]:
-        print(f"[PortSwigger] Catatan     : {len(stats['errors'])} error/penolakan (lihat report['errors'])")
+        print(f"[SATRIA] Catatan     : {len(stats['errors'])} error/penolakan (lihat report['errors'])")
 
     return {
         "target": ctx.url, "host": ctx.host, "authorized": ctx.authorized,
@@ -15946,11 +15946,11 @@ def scan_labs(url: str, html: str, http_result: Optional[dict] = None,
 # ══════════════════════════════════════════════════════════════════════════════
 def render_lab_report(report: dict, max_rows: int = 40) -> str:
     lines = [
-        f"## PortSwigger lab scan — {report['target']}",
+        f"## Pemindaian Kerentanan Terstruktur — {report['target']}",
         "",
-        f"- Total lab dalam katalog: **{report['labs_total']}**",
+        f"- Total pemeriksaan dalam katalog: **{report['labs_total']}**",
         f"- Halaman yang dianalisis pada origin yang sama: **{report.get('pages_discovered', 1)}**",
-        f"- Terdeteksi: **{report.get('detected_lab_count', len(report['detected']))} lab** "
+        f"- Terkonfirmasi: **{report.get('detected_lab_count', len(report['detected']))} pemeriksaan** "
         f"(dalam {len(report['detected'])} kelompok ciri)",
         f"- Kandidat (butuh verifikasi): **{len(report['candidates'])}**",
         f"- Tidak relevan untuk target ini: **{len(report['not_applicable'])}**",
@@ -15958,9 +15958,9 @@ def render_lab_report(report: dict, max_rows: int = 40) -> str:
         "",
     ]
     if report["detected"]:
-        lines.append("### Lab terdeteksi (bukti cocok)")
+        lines.append("### Pemeriksaan terkonfirmasi (bukti cocok)")
         lines.append("")
-        lines.append("| Lab | Level | Bukti |")
+        lines.append("| Pemeriksaan | Level | Bukti |")
         lines.append("|---|---|---|")
         for r in report["detected"][:max_rows]:
             label = r["title"].replace("|", "/")
@@ -15969,14 +15969,14 @@ def render_lab_report(report: dict, max_rows: int = 40) -> str:
     if report["candidates"]:
         lines.append("### Kandidat (perlu satu langkah verifikasi)")
         lines.append("")
-        lines.append("| Lab | Level | Indikasi |")
+        lines.append("| Pemeriksaan | Level | Indikasi |")
         lines.append("|---|---|---|")
         for r in report["candidates"][:max_rows]:
             lines.append(f"| {r['title']} | {r['level']} | {r['evidence'][:160]} |")
         lines.append("")
     lines.append("### Ringkasan per kategori")
     lines.append("")
-    lines.append("| Kategori | Lab | Terdeteksi | Kandidat | Tidak relevan |")
+    lines.append("| Kategori | Pemeriksaan | Terkonfirmasi | Kandidat | Tidak relevan |")
     lines.append("|---|---|---|---|---|")
     for c in report["category_summary"]:
         lines.append(f"| {c['title']} | {c['total']} | {c['detected']} | {c['candidate']} | "
@@ -16047,7 +16047,7 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
     print("[2/10] Menganalisis temuan kode deterministik (SRI, skrip pihak ketiga) ...", flush=True)
     code_findings = detect_code_findings_deterministic(page_html, target_url)
 
-    # ── Section 3: PortSwigger lab scan (48 lab SQLi+XSS di dalamnya) ────────
+    # ── Section 3: Pemindaian terstruktur scan (48 lab SQLi+XSS di dalamnya) ────────
     print("[3/10] Memindai katalog kerentanan (termasuk 48 lab SQL injection + XSS) ...", flush=True)
     lab_report = scan_labs(target_url, page_html, http_result, authorized=authorized)
     print("[4/10] Pemindaian kerentanan selesai; menyusun hasil ...", flush=True)
@@ -16227,7 +16227,7 @@ def _build_pdf_html(result: dict) -> str:
 {''.join(rows) or "<tr><td colspan='5'>Tidak ada temuan.</td></tr>"}
 </table>
 
-<h2>PortSwigger lab — terdeteksi ({len(lab.get('detected') or [])} dari {lab.get('labs_total', 0)})</h2>
+<h2>Pemeriksaan terstruktur — terkonfirmasi ({len(lab.get('detected') or [])} dari {lab.get('labs_total', 0)})</h2>
 <table>
 <tr><th>Lab</th><th>Level</th><th>Kategori</th><th>Bukti</th></tr>
 {detected_rows}
@@ -20140,6 +20140,13 @@ def _collect_engine_scan_results(target_url: str, html: str = "", http_result: d
             out["censys"]["notes"].append("Censys: tidak ada data hasil pada pemindaian ini (token/akses/data tidak tersedia).")
         else:
             out["censys"]["notes"].append("Censys: diaktifkan namun tidak ada data hasil pada target ini.")
+
+    # Pemindaian tambahan berkualitas (bermakna, rendah false-positive; sesuai data yang tersedia)
+    try:
+        _collect_additional_quality_scans(out, target_url, authorized)
+    except Exception as e:
+        out["engine_errors"].append(f"_collect_additional_quality_scans: {type(e).__name__}: {e}")
+
     return out
 
 
@@ -20210,13 +20217,13 @@ def _render_vuln_types_v2(page, content_left, content_width, result):
     rows = []
     for g in by_type:
         rows.append((g["label"], str(g["total"]), str(g["confirmed"]),
-                     str(g["total"] - g["confirmed"]), f"#{g['start']}-#{g['end']}"))
+                     str(g["total"] - g["confirmed"])))
     total_conf = sum(g["confirmed"] for g in by_type)
     total_all = sum(g["total"] for g in by_type)
-    rows.append(("TOTAL", str(total_all), str(total_conf), str(total_all - total_conf), "#1-#227"))
+    rows.append(("TOTAL", str(total_all), str(total_conf), str(total_all - total_conf)))
     _draw_kv_table(page, content_left, content_width, "Rekap per Jenis Kerentanan", rows,
-                   headers=("Jenis Kerentanan", "Kriteria", "Terkonfirmasi", "Belum", "Rentang"),
-                   widths=(199.0, 60.0, 85.0, 60.0, 95.0), header_color=_PDF_COLORS["navy"])
+                   headers=("Jenis Kerentanan", "Kriteria", "Terkonfirmasi", "Belum"),
+                   widths=(279.0, 70.0, 85.0, 65.0), header_color=_PDF_COLORS["navy"])
 
 
 
@@ -20334,7 +20341,7 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
     if not active_findings:
         # fallback to lab findings
         active_findings = [f for f in (active.get("findings") or []) if isinstance(f, dict)][:30]
-    _draw_finding_cards(page, content_left, content_width, "Temuan/Kandidat Hasil Pemindaian Aktif & Lab Engine", active_findings, max_items=30)
+    _draw_finding_cards(page, content_left, content_width, "Temuan/Kandidat Hasil Pemindaian Aktif & Pemeriksaan Terstruktur", active_findings, max_items=30)
 
     # 5) Censys, NVD, CVE
     page.ensure(150)
@@ -20405,6 +20412,276 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
 
 
 
+
+
+# Pemindaian tambahan berkualitas + renderer
+_FINGERPRINT_RECORDS: dict[str, list[dict]] = {}
+
+def _collect_additional_quality_scans(out: dict, target_url: str, authorized: bool) -> None:
+    """Kumpulkan hasil pemindaian tambahan bermakna dari data yang benar-benar terobservasi.
+    Hanya menyimpan temuan nyata (bukan asumsi), dan merangkum dalam out['additional_quality_scans']."""
+    http = out.get("engine_http") or {}
+    final_url = str(http.get("final_url") or target_url)
+    host = urlparse(final_url).hostname or urlparse(target_url).hostname or target_url.rstrip("/")
+    aq: dict[str, Any] = {
+        "additional_tls": [],
+        "additional_http_headers": {},
+        "additional_technology_rows": [],
+        "additional_waf": {"observations": [], "notes": [], "name": None},
+        "additional_related": {"same_origin": [], "ns_records": [], "notes": []},
+        "additional_oob": {"notes": []},
+    }
+    try:
+        tls = _collect_additional_tls_baseline(final_url)
+        if isinstance(tls, list) and tls:
+            aq["additional_tls"] = tls
+        out["additional_tls"] = tls
+    except Exception as e:
+        out.setdefault("engine_errors", []).append(f"additional_tls: {type(e).__name__}: {e}")
+    try:
+        hdrs = _collect_additional_http_headers(final_url, http)
+        if isinstance(hdrs, dict) and hdrs:
+            aq["additional_http_headers"] = hdrs
+        out["additional_http_headers"] = hdrs
+    except Exception as e:
+        out.setdefault("engine_errors", []).append(f"additional_http_headers: {type(e).__name__}: {e}")
+    try:
+        tech_rows = _collect_additional_technology_rows(out.get("technologies", []))
+        if tech_rows:
+            aq["additional_technology_rows"] = tech_rows
+        out["additional_technology_rows"] = tech_rows
+    except Exception as e:
+        out.setdefault("engine_errors", []).append(f"additional_technology: {type(e).__name__}: {e}")
+    try:
+        waf = _collect_additional_waf_observations(http, out.get("engine_code_findings", []), final_url)
+        if isinstance(waf, dict):
+            aq["additional_waf"] = waf
+        out["additional_waf"] = waf
+    except Exception as e:
+        out.setdefault("engine_errors", []).append(f"additional_waf: {type(e).__name__}: {e}")
+    try:
+        sub = _collect_additional_related_records(host, final_url, out.get("censys", {}))
+        if isinstance(sub, dict):
+            aq["additional_related"] = sub
+        out["additional_related"] = sub
+    except Exception as e:
+        out.setdefault("engine_errors", []).append(f"additional_related: {type(e).__name__}: {e}")
+    try:
+        oob = _collect_additional_oob_evidence(http, out.get("engine_lab_scan", {}), aq.get("additional_tls", []))
+        if isinstance(oob, dict):
+            aq["additional_oob"] = oob
+        out["additional_oob"] = oob
+    except Exception as e:
+        out.setdefault("engine_errors", []).append(f"additional_oob: {type(e).__name__}: {e}")
+    out["additional_quality_scans"] = aq
+
+def _collect_additional_tls_baseline(final_url: str) -> list[dict]:
+    import ssl, socket
+    u = urlparse(final_url)
+    host = u.hostname
+    port = u.port or (443 if u.scheme == "https" else 80)
+    if not host or (u.scheme != "https" and port != 443):
+        return []
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=12) as sock, ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            cipher = ssock.cipher() or ("-", "", "")
+            alpn = ssock.selected_alpn_protocol() or "-"
+            return [{"protocol": ssock.version() or "?", "cipher_suite": cipher[0] if cipher else "-", "bits": (cipher[2] if cipher and len(cipher) > 2 else "-"), "alpn": alpn}]
+    except Exception:
+        return []
+
+def _collect_additional_http_headers(final_url: str, engine_http: dict | None = None) -> dict:
+    resp: dict[str, Any] = {}
+    engine_http = engine_http or {}
+    try:
+        import requests as _requests
+        session = _requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7", "Pragma": "no-cache", "Cache-Control": "no-cache"})
+        r = session.get(final_url, timeout=15, allow_redirects=True, stream=True)
+        resp["final_url"] = str(getattr(r, "url", final_url) or final_url)
+        resp["status_code"] = int(getattr(r, "status_code", 0) or 0)
+        elapsed = getattr(r, "elapsed", None)
+        resp["elapsed_ms"] = round(elapsed.total_seconds() * 1000, 1) if elapsed else "-"
+        resp["redirect_to"] = str(r.headers.get("Location", "")) or "-"
+        resp["server"] = str(r.headers.get("Server", "")).strip() or str(engine_http.get("server", "")).strip() or "-"
+        resp["powered_by"] = str(r.headers.get("X-Powered-By", "")).strip() or str(engine_http.get("powered_by", "")).strip() or "-"
+        resp["content_type"] = str(r.headers.get("Content-Type", "")).strip() or "-"
+        resp["content_length"] = r.headers.get("Content-Length") or "-"
+        resp["vary"] = str(r.headers.get("Vary", "")).strip() or "-"
+        resp["charset"] = _extract_charset(str(r.headers.get("Content-Type", "")) or "") or "-"
+        for k, hk in [("x_frame_options","X-Frame-Options"),("content_security_policy","Content-Security-Policy"),("strict_transport_security","Strict-Transport-Security"),("referrer_policy","Referrer-Policy"),("permissions_policy","Permissions-Policy"),("cross_origin_opener_policy","Cross-Origin-Opener-Policy"),("cross_origin_resource_policy","Cross-Origin-Resource-Policy"),("cross_origin_embedder_policy","Cross-Origin-Embedder-Policy"),("cors_allow_origin","Access-Control-Allow-Origin"),("cors_allow_credentials","Access-Control-Allow-Credentials"),("x_xss_protection","X-XSS-Protection"),("x_content_type_options","X-Content-Type-Options")]:
+            resp[k] = str(r.headers.get(hk, "")).strip() or "-"
+    except Exception:
+        resp["final_url"] = str(engine_http.get("final_url") or final_url)
+        resp["status_code"] = engine_http.get("status_code", 0) or 0
+        resp["elapsed_ms"] = engine_http.get("elapsed_ms", "-") or "-"
+        resp["server"] = str(engine_http.get("server", "")).strip() or "-"
+        resp["powered_by"] = str(engine_http.get("powered_by", "")).strip() or "-"
+        for k in ("redirect_to","content_type","content_length","vary","charset","x_frame_options","content_security_policy","strict_transport_security","referrer_policy","permissions_policy","cross_origin_opener_policy","cross_origin_resource_policy","cross_origin_embedder_policy","cors_allow_origin","cors_allow_credentials","x_xss_protection","x_content_type_options"):
+            resp.setdefault(k, "-")
+    return resp
+
+def _extract_charset(content_type: str) -> str:
+    m = re.search(r"charset=([a-zA-Z0-9_+-]+)", content_type, re.I)
+    return m.group(1).strip() if m else "-"
+
+def _collect_additional_technology_rows(technologies: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in (technologies or []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip() or "-"
+        version = str(item.get("version", "")).strip() or "-"
+        product = str(item.get("product", item.get("category", ""))).strip() or "-"
+        key = (name, version, product)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"name": name, "version": version, "category": product})
+    return rows
+
+def _collect_additional_waf_observations(http: dict, engine_code_findings: list, final_url: str) -> dict:
+    outd: dict[str, Any] = {"observations": [], "notes": [], "name": None}
+    server = str(http.get("server", "")).lower() if http else ""
+    powered = str(http.get("powered_by", "")).lower() if http else ""
+    if "cloudflare" in server or "cloudflare" in powered:
+        outd["name"] = "Cloudflare (indikasi dari header respons)"
+        outd["observations"].append({"finding": "Indikasi edge WAF/CDN dari header respons", "evidence": f"Server={http.get('server','-')}", "strength": "Observasi", "implication": "Terdapat kemungkinan lapisan edge di depan host aplikasi (berdasarkan header teramati)."})
+    if "akamai" in server:
+        outd["name"] = outd["name"] or "Akamai (indikasi dari header respons)"
+        outd["observations"].append({"finding": "Indikasi WAF/CDN Akamai dari header respons", "evidence": f"Server={http.get('server','-')}", "strength": "Observasi", "implication": "Respons dapat dipengaruhi lapisan edge."})
+    if isinstance(engine_code_findings, list):
+        joined = " ".join(str(x).lower() for x in engine_code_findings if isinstance(x, (dict, str)))
+        if "strict-transport-security" in joined or "hsts" in joined:
+            outd["observations"].append({"finding": "Header Strict-Transport-Security terobservasi", "evidence": "Analisis header/temuan engine", "strength": "Observasi", "implication": "Kebijakan HSTS terdeteksi."})
+        if "content-security-policy" in joined or "csp" in joined:
+            outd["observations"].append({"finding": "Content-Security-Policy terobservasi", "evidence": "Analisis header/temuan engine", "strength": "Observasi", "implication": "Kebijakan CSP terdeteksi."})
+        if "x-frame-options" in joined or "clickjacking" in joined:
+            outd["observations"].append({"finding": "Kontrol framing (mis. X-Frame-Options) terindikasi", "evidence": "Analisis header/temuan engine", "strength": "Observasi", "implication": "Kontrol framing terdeteksi/terindikasi."})
+    if outd["observations"] or outd["name"]:
+        outd["notes"].append("Observasi bersifat indikasi dari respons teramati, bukan klaim kerentanan.")
+    return outd
+
+def _collect_additional_related_records(host: str, final_url: str, censys: dict) -> dict:
+    outd: dict[str, Any] = {"same_origin": [], "ns_records": [], "notes": []}
+    try:
+        import dns.resolver
+        r = dns.resolver.Resolver(); r.lifetime = 5.0; r.timeout = 3.0
+        ns = []
+        for rd in r.resolve(host, "NS"):
+            txt = rd.to_text().rstrip(".")
+            if txt and txt not in ns:
+                ns.append(txt)
+        if ns:
+            outd["ns_records"] = ns[:20]
+    except Exception:
+        pass
+    if not outd["ns_records"]:
+        outd["notes"].append("Catatan NS/DNS terkait tidak tersedia atau tidak dapat diverifikasi pada pemindaian ini.")
+    return outd
+
+def same_origin_given_simple(url: str) -> list[str]:
+    return []
+
+def _collect_additional_oob_evidence(http: dict, engine_lab: dict, tls_infos: list) -> dict:
+    outd: dict[str, Any] = {"notes": []}
+    oob_domain = globals().get("SATRIA_OOB_DOMAIN") or os.getenv("SATRIA_OOB_DOMAIN")
+    if oob_domain:
+        outd["notes"].append("Domain OOB terkonfigurasi; interaksi out-of-band hanya dilaporkan bila teramati.")
+    else:
+        outd["notes"].append("Interaksi DNS/HTTP out-of-band tidak diuji karena tidak ada konfigurasi OOB pada lingkungan ini.")
+    return outd
+
+
+def _render_additional_quality_scans(page, content_left, content_width, result):
+    eng = result.get("engine_scan") or result
+    additional = result.get("additional_quality_scans") or eng.get("additional_quality_scans") or {}
+    if not isinstance(additional, dict) or not additional:
+        return
+    tls_infos = list(additional.get("additional_tls") or [])
+    http_hdrs = dict(additional.get("additional_http_headers") or {})
+    tech_rows = list(additional.get("additional_technology_rows") or [])
+    waf = dict(additional.get("additional_waf") or {})
+    waf_name = waf.get("name")
+    waf_obs = list(waf.get("observations") or [])
+    waf_notes = [n for n in (waf.get("notes") or []) if n]
+    related = dict(additional.get("additional_related") or {})
+    ns_records = list(related.get("ns_records") or [])
+    rel_notes = [n for n in (related.get("notes") or []) if n]
+    oob = dict(additional.get("additional_oob") or {})
+    oob_notes = [n for n in (oob.get("notes") or []) if n]
+    has_http = bool(http_hdrs and (str(http_hdrs.get("status_code","0")) not in ("0","None","") or str(http_hdrs.get("server","-")) != "-" or str(http_hdrs.get("final_url","-")) not in ("-","")))
+    has_meaningful = bool(tls_infos or has_http or tech_rows or waf_name or waf_obs or ns_records)
+    if not has_meaningful and not (waf_notes or rel_notes or oob_notes):
+        return
+    page.new_page()
+    page.section_title("Pemindaian Tambahan Berkualitas",
+                       "Hasil pemindaian tambahan yang memungkinkan dan bermakna. Hanya memuat observasi/data yang benar-benar ditemukan pada target; tidak ada asumsi atau hasil rekaan.")
+    if tls_infos:
+        ssl_rows = [(t.get("protocol","-"), t.get("cipher_suite","-"), t.get("bits","-"), t.get("alpn","-")) for t in tls_infos[:20]]
+        _draw_kv_table(page, content_left, content_width, "Baseline TLS (koneksi teramati)", ssl_rows, headers=("Protokol", "Cipher Suite", "Bit", "ALPN"), widths=(130, 190, 70, 109), header_color=_PDF_COLORS["navy"])
+    if has_http:
+        rows = []
+        for (k, v) in [
+            ("URL respons akhir", http_hdrs.get("final_url", result.get("target", "-"))),
+            ("Kode status", http_hdrs.get("status_code", "-")),
+            ("Waktu respons (ms)", http_hdrs.get("elapsed_ms", "-")),
+            ("Server", http_hdrs.get("server", "-")),
+            ("X-Powered-By", http_hdrs.get("powered_by", "-")),
+            ("Content-Type", http_hdrs.get("content_type", "-")),
+            ("Content-Length", http_hdrs.get("content_length", "-")),
+            ("Strict-Transport-Security", http_hdrs.get("strict_transport_security", "-")),
+            ("Content-Security-Policy", http_hdrs.get("content_security_policy", "-")),
+            ("X-Frame-Options", http_hdrs.get("x_frame_options", "-")),
+            ("X-Content-Type-Options", http_hdrs.get("x_content_type_options", "-")),
+            ("Referrer-Policy", http_hdrs.get("referrer_policy", "-")),
+            ("Permissions-Policy", http_hdrs.get("permissions_policy", "-")),
+            ("CORS Allow-Origin", http_hdrs.get("cors_allow_origin", "-")),
+        ]:
+            sv = str(v).strip() if v is not None else "-"
+            rows.append((str(k), sv or "-", "-"))
+        _draw_kv_table(page, content_left, content_width, "Header & Respons HTTP (observasi)", rows, headers=("Komponen", "Nilai Teramati", "Keterangan"), widths=(200, 220, 79), header_color=_PDF_COLORS["navy"])
+    if tech_rows:
+        trows = [(r.get("name","-"), r.get("version","-"), r.get("category","-")) for r in tech_rows[:25]]
+        _draw_kv_table(page, content_left, content_width, "Teknologi/Framework Terdeteksi", trows, headers=("Nama", "Versi", "Kategori"), widths=(220, 90, 189), header_color=_PDF_COLORS["teal"])
+    if waf_name or waf_obs:
+        page.ensure(28)
+        if waf_name:
+            page.text(content_left, page.y - 14, "Indikasi WAF/CDN/Edge: " + str(waf_name), 11.0, _PDF_COLORS["navy"], bold=True)
+            page.y -= 24
+        for o in waf_obs[:20]:
+            if not isinstance(o, dict):
+                continue
+            line = f"{o.get('finding','-')}: {o.get('evidence','-')} [{o.get('strength','-')}]"
+            imp = str(o.get("implication", "")).strip()
+            if imp:
+                line += f" — {imp}"
+            page.bullet_paragraph(line)
+        for n in waf_notes:
+            page.bullet_paragraph(str(n))
+    if ns_records:
+        page.ensure(24)
+        page.text(content_left, page.y - 14, "Catatan DNS Terkait (NS) yang Teramati", 10.5, _PDF_COLORS["navy"], bold=True)
+        page.y -= 18
+        page.paragraph(content_left, content_width, ", ".join(str(x) for x in ns_records[:20]), 9.0, _PDF_COLORS["text"])
+    for n in rel_notes:
+        page.bullet_paragraph(str(n))
+    if oob.get("dns_oob_interactions"):
+        page.ensure(20)
+        page.text(content_left, page.y - 14, "Interaksi Out-of-Band Teramati", 10.5, _PDF_COLORS["teal"], bold=True)
+        page.y -= 18
+        page.paragraph(content_left, content_width, repr(oob.get("dns_oob_interactions"))[:900], 9.0, _PDF_COLORS["text"])
+    elif globals().get("SATRIA_OOB_DOMAIN") or os.getenv("SATRIA_OOB_DOMAIN"):
+        for n in oob_notes:
+            page.bullet_paragraph(str(n))
+    page.y = max(page.y, _PDF_BOTTOM + 10)
+
+
+
 def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     pdf_path = Path(path or str(globals().get("OUTPUT_PDF") or "SATRIA_FIX1_Report.pdf")).expanduser()
     if not pdf_path.is_absolute():
@@ -20446,8 +20723,11 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     page.text(content_left + 10, _PDF_PAGE_H - 104, "S A T R I A", 38, _PDF_COLORS["white"], bold=True)
     page.text(content_left + 10, _PDF_PAGE_H - 130, "Sistem Agen Terpadu Reconnaissance, Intelijen, dan Asesmen", 12.5, _PDF_COLORS["light"], bold=True)
     page.line(content_left + 10, _PDF_PAGE_H - 146, content_left + 150, _PDF_PAGE_H - 146, _PDF_COLORS["teal"], 1.2)
-    page.text(content_left + 10, _PDF_PAGE_H - 202,
-              "ACTIVE & PASSIVE RECON   TECHNOLOGY FINGERPRINTING   CVE INTELLIGENCE   ASESMEN KERENTANAN",
+    page.text(content_left + 10, _PDF_PAGE_H - 196,
+              "ACTIVE & PASSIVE RECON   TECHNOLOGY FINGERPRINTING",
+              8.2, _PDF_COLORS["white"], bold=True)
+    page.text(content_left + 10, _PDF_PAGE_H - 214,
+              "CVE INTELLIGENCE   ASESMEN KERENTANAN",
               8.2, _PDF_COLORS["white"], bold=True)
     page.text(content_left + 10, _PDF_PAGE_H - 240, "Laporan asesmen keamanan terpadu: observasi, analisis kode, teknologi, reconnaissance, dan pemindaian aktif.", 8.8, _PDF_COLORS["light"])
 
@@ -20499,7 +20779,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
         ("Teknologi terdeteksi", str(len(eng_techs)), "Jumlah teknologi/versi teridentifikasi."),
         ("Observasi/temuan HTTP", str(http_findings_count), "Hasil analyze_http_security (engine)."),
         ("Temuan analisis kode", str(code_findings_count), "Hasil detect_code_findings_deterministic (engine)."),
-        ("Total lab engine", str(eng_lab_total or "-"), "Katalog lab engine (scan_labs)."),
+        ("Total pemeriksaan engine", str(eng_lab_total or "-"), "Katalog pemeriksaan engine (pemindaian terstruktur)."),
         ("Kriteria terkonfirmasi", str(len(confirmed)), "Dari 227 kriteria asesmen kerentanan."),
         ("Kriteria belum terkonfirmasi", str(len(not_confirmed)), "Dari 227 kriteria asesmen kerentanan."),
     ]
@@ -20511,7 +20791,13 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
     # Pemindaian kerentanan dikelompokkan per jenis (mencakup seluruh 227 kriteria)
     _render_vuln_types_v2(page, content_left, content_width, result)
 
-    # Optional: show confirmed XSS evidence if present (bukan "Katalog Utama")
+    # Pemindaian tambahan berkualitas (observasi nyata, tanpa duplikasi)
+    try:
+        _render_additional_quality_scans(page, content_left, content_width, result)
+    except Exception:
+        pass
+
+    # Bukti temuan terkonfirmasi (basis scanner), bila ada
     if confirmed:
         page.ensure(150)
         page.section_title("Bukti Temuan Terkonfirmasi (XSS/Basis Scanner)",
@@ -20524,7 +20810,7 @@ def render_pdf(result: dict[str, Any], path: str | None = None) -> Path:
             method = str(item.get('method','-'))
             evid = _pdf_clean_evidence(item.get('evidence','-'), 500)
             body_lines = []
-            body_lines += _pdf_wrap(f"Lab {item.get('number','-')} [{sev}] - {title}", content_width - 28, 10)
+            body_lines += _pdf_wrap(f"Pemeriksaan {item.get('number','-')} [{sev}] - {title}", content_width - 28, 10)
             body_lines += _pdf_wrap(f"Status: {str(item.get('status','-')).upper()} | Lokasi: {loc}", content_width - 28, 8.4)
             body_lines += _pdf_wrap(f"Metode: {method}", content_width - 28, 8.4)
             body_lines += _pdf_wrap(f"Bukti: {evid}", content_width - 28, 8.2)
@@ -20623,3 +20909,4 @@ def run_satria_fix1_scan(target_url: str, html: str = "", authorized: bool = Fal
         "cves": len(engine.get("cves") or []),
     }
     return result
+
