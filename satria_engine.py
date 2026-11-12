@@ -20325,24 +20325,6 @@ def _render_engine_sections_v2(page, content_left, content_width, result):
     _draw_kv_table(page, content_left, content_width, "TLS PROTOCOLS ACCEPTED", tls_rows,
                    headers=("Protokol/Versi", "Status", "Detail/Cipher"), widths=(140.0, 110.0, 249.0), header_color=_PDF_COLORS["navy"])
 
-    # 4) Hasil pemindaian aktif
-    page.ensure(150)
-    page.section_title("Hasil Pemindaian Aktif",
-                       "Ringkasan dan temuan dari probe aktif engine (sesuai izin/mode pemindaian).")
-    active_rows = [
-        ("Mode aktif diizinkan", "Ya" if active.get("authorized") else "Tidak (pasif)", "Izin active probing."),
-        ("Probe aktif dijalankan", str(active.get("active_runs", 0)), "Jumlah eksekusi probe aktif."),
-        ("Probe pasif dijalankan", str(active.get("passive_runs", 0)), "Jumlah eksekusi probe pasif."),
-        ("Temuan terdeteksi", str(len(active.get("detected") or [])), "Deteksi dengan bukti dari engine lab scan."),
-        ("Kandidat", str(len(active.get("candidates") or [])), "Indikasi kandidat (perlu validasi)."),
-    ]
-    _draw_kv_table(page, content_left, content_width, None, active_rows, widths=(170.0, 120.0, 209.0), header_color=_PDF_COLORS["teal"])
-    active_findings = list(active.get("detected") or []) + list(active.get("candidates") or [])
-    if not active_findings:
-        # fallback to lab findings
-        active_findings = [f for f in (active.get("findings") or []) if isinstance(f, dict)][:30]
-    _draw_finding_cards(page, content_left, content_width, "Temuan/Kandidat Hasil Pemindaian Aktif & Pemeriksaan Terstruktur", active_findings, max_items=30)
-
     # 5) Censys, NVD, CVE
     page.ensure(150)
     page.section_title("Hasil Pemindaian Censys, NVD, dan CVE",
