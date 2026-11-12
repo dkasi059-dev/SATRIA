@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import glob
 import hashlib
 import html as html_module
 import ipaddress
@@ -107,6 +108,7 @@ import re
 import socket
 import statistics
 import string
+import subprocess
 import sys
 import textwrap
 import time
@@ -9575,16 +9577,189 @@ def _js_render_mode() -> str:
     return "auto"
 
 
+_JS_RENDER_INSTALL_STATE: dict[str, Any] = {"attempted": False, "ok": False, "detail": ""}
+_JS_RENDER_UNAVAILABLE: str = ""
+
+
+def _js_render_install_mode() -> str:
+    """auto (default) = unduh Chromium sekali bila belum ada; off = jangan pernah unduh."""
+    value = str(os.getenv("SATRIA_JS_RENDER_INSTALL", "auto")).strip().lower()
+    if value in {"0", "off", "false", "no", "never"}:
+        return "off"
+    return "auto"
+
+
+def _find_chromium_executables() -> list[str]:
+    """Cari Chromium/headless-shell yang sudah ada (mis. hasil install sebagai root)."""
+    roots = [str(os.getenv("PLAYWRIGHT_BROWSERS_PATH") or ""), "/ms-playwright", "/opt/ms-playwright",
+             "/root/.cache/ms-playwright", os.path.expanduser("~/.cache/ms-playwright")]
+    patterns = ("chromium-*/chrome-linux*/chrome",
+                "chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell")
+    found: list[str] = []
+    for root in roots:
+        if not root:
+            continue
+        try:
+            if not os.path.isdir(root):
+                continue
+        except OSError:
+            continue
+        for pattern in patterns:
+            try:
+                matches = sorted(glob.glob(os.path.join(root, pattern)), reverse=True)
+            except Exception:
+                matches = []
+            for path in matches:
+                try:
+                    if os.path.isfile(path) and os.access(path, os.X_OK):
+                        found.append(path)
+                except OSError:
+                    continue
+    unique: list[str] = []
+    for path in found:
+        if path not in unique:
+            unique.append(path)
+    return unique[:4]
+
+
+def _playwright_launch_candidates() -> list[dict[str, str]]:
+    """Urutan percobaan browser: override env, browser bawaan Playwright, lalu browser sistem."""
+    candidates: list[dict[str, str]] = []
+    exe = str(os.getenv("SATRIA_JS_RENDER_EXECUTABLE", "") or "").strip()
+    channel = str(os.getenv("SATRIA_JS_RENDER_CHANNEL", "") or "").strip().lower()
+    if exe:
+        candidates.append({"label": f"executable {exe}", "executable_path": exe})
+    if channel:
+        candidates.append({"label": f"channel {channel}", "channel": channel})
+    candidates.append({"label": "browser bawaan Playwright (chromium)"})
+    for path in _find_chromium_executables():
+        candidates.append({"label": f"chromium terpasang di {path}", "executable_path": path})
+    for name in ("chrome", "msedge"):
+        candidates.append({"label": f"channel {name}", "channel": name})
+    for path in ("/usr/bin/google-chrome", "/usr/bin/chromium",
+                 "/usr/bin/chromium-browser", "/usr/bin/microsoft-edge"):
+        if os.path.exists(path):
+            candidates.append({"label": f"executable {path}", "executable_path": path})
+    return candidates
+
+
+def _install_playwright_chromium() -> tuple[bool, str]:
+    """Unduh browser Chromium Playwright sekali per proses (butuh jaringan)."""
+    if _JS_RENDER_INSTALL_STATE["attempted"]:
+        return bool(_JS_RENDER_INSTALL_STATE["ok"]), str(_JS_RENDER_INSTALL_STATE["detail"])
+    _JS_RENDER_INSTALL_STATE["attempted"] = True
+    if _js_render_install_mode() == "off":
+        _JS_RENDER_INSTALL_STATE["detail"] = "instalasi otomatis dimatikan (SATRIA_JS_RENDER_INSTALL=off)"
+        return False, str(_JS_RENDER_INSTALL_STATE["detail"])
+    print("[JS RENDER] Browser Chromium belum terpasang — mengunduh sekali via "
+          "`python -m playwright install chromium` (±150 MB, butuh jaringan)...", flush=True)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=900,
+        )
+        detail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+        ok = proc.returncode == 0
+    except Exception as exc:
+        ok, detail = False, f"{type(exc).__name__}: {str(exc)[:300]}"
+    _JS_RENDER_INSTALL_STATE["ok"] = ok
+    _JS_RENDER_INSTALL_STATE["detail"] = detail[-600:]
+    print(f"[JS RENDER] Unduh browser: {'berhasil' if ok else 'gagal — ' + detail[-300:]}", flush=True)
+    return ok, detail
+
+
+def _js_render_error_hint(errors: list[str]) -> str:
+    """Pesan kegagalan yang menjelaskan langkah perbaikan konkret."""
+    # Diagnosa hanya dari penyebab utama (browser bawaan Playwright), bukan pesan
+    # channel Chrome/Edge yang hanya alternatif dan sering menyesatkan.
+    primary = errors[0] if errors else "browser tidak dapat dijalankan"
+    low = primary.lower()
+    lib_match = re.search(r"error while loading shared libraries: ([^\s:]+)", primary, re.I)
+    others = len(errors) - 1
+    joined = _clean_js_error(primary, 300).rstrip(" .")
+    if others > 0:
+        joined += f" ({others} alternatif browser juga gagal)"
+    if lib_match:
+        return (f"Chromium gagal dijalankan karena pustaka sistem '{lib_match.group(1)[:60]}' tidak ditemukan. "
+                "Jalankan `playwright install-deps chromium` (butuh root) atau pasang paket "
+                "libnss3, libnspr4, libatk1.0-0, libatk-bridge2.0-0, libasound2, libxkbcommon0.")[:400]
+    if "host system is missing dependencies" in low:
+        hint = (" — pustaka sistem Chromium belum lengkap. Jalankan "
+                "`playwright install-deps chromium` (butuh root) atau pasang paket "
+                "libnss3, libnspr4, libatk1.0-0, libatk-bridge2.0-0, libasound2, libxkbcommon0.")
+    elif "executable doesn't exist" in low:
+        hint = (" — browser belum terunduh. Jalankan `python -m playwright install chromium` "
+                "(SATRIA_JS_RENDER_INSTALL=auto mencoba ini otomatis) atau arahkan "
+                "SATRIA_JS_RENDER_EXECUTABLE ke Chrome/Chromium yang sudah ada.")
+    else:
+        hint = (" — periksa keluaran `python -m playwright install chromium` dan "
+                "`playwright install-deps chromium` (butuh root).")
+    return (joined + hint)[:700]
+
+
+class _BrowserRestartNeeded(Exception):
+    """Sinyal: browser baru saja diunduh, driver Playwright perlu dimulai ulang."""
+
+
+def _clean_js_error(text: str, limit: int = 260) -> str:
+    """Rapikan pesan error Playwright jadi satu baris yang informatif.
+
+    Pesan launch Chromium menyertakan daftar argumen sangat panjang sebelum
+    penyebab sebenarnya; ambil baris penyebabnya saja bila ada.
+    """
+    raw = str(text)
+    markers = ("error while loading shared libraries", "host system is missing dependencies",
+               "executable doesn't exist", "no usable sandbox", "missing x server")
+    low = raw.lower()
+    for marker in markers:
+        idx = low.find(marker)
+        if idx != -1:
+            raw = raw[max(0, idx - 60): idx + 240]
+            break
+    cleaned = "".join(ch if (ch.isprintable() and ch not in "\u2550\u2551\u2554\u2557\u255a\u255d") else " "
+                      for ch in raw)
+    return re.sub(r"\s+", " ", cleaned).strip()[:limit]
+
+
+def _launch_js_browser(pw: Any) -> tuple[Any, str]:
+    """Luncurkan browser pertama yang berhasil; unduh Chromium sekali bila executable hilang."""
+    args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    errors: list[str] = []
+    install_tried = False
+    for candidate in _playwright_launch_candidates():
+        kwargs: dict[str, Any] = {"headless": True, "args": args}
+        if candidate.get("channel"):
+            kwargs["channel"] = candidate["channel"]
+        if candidate.get("executable_path"):
+            kwargs["executable_path"] = candidate["executable_path"]
+        try:
+            return pw.chromium.launch(**kwargs), ""
+        except Exception as exc:
+            text = str(exc)
+            errors.append(f"{candidate['label']}: {type(exc).__name__}: {_clean_js_error(text, 800)}")
+            if not install_tried and "executable doesn't exist" in text.lower():
+                install_tried = True
+                if _install_playwright_chromium()[0]:
+                    # Driver Playwright menyimpan daftar browser saat start, jadi
+                    # launch ulang di proses yang sama tetap "tidak ada". Mulai ulang.
+                    raise _BrowserRestartNeeded()
+    return None, _js_render_error_hint(errors)
+
+
 def _render_html_with_playwright(url: str) -> dict[str, Any]:
     """Render halaman dengan Chromium (Playwright) dan kembalikan HTML hasil render.
 
     Tidak pernah melempar exception: kegagalan dikembalikan sebagai {"error": ...}
     agar pemanggil dapat fallback ke HTML statis.
     """
+    global _JS_RENDER_UNAVAILABLE
+    if _JS_RENDER_UNAVAILABLE:
+        return {"error": _JS_RENDER_UNAVAILABLE}
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
-        return {"error": f"paket playwright tidak tersedia ({type(exc).__name__}: {str(exc)[:120]})"}
+        _JS_RENDER_UNAVAILABLE = f"paket playwright tidak tersedia ({type(exc).__name__}: {_clean_js_error(exc, 120)})"
+        return {"error": _JS_RENDER_UNAVAILABLE}
 
     try:
         timeout_ms = int(os.getenv("SATRIA_JS_RENDER_TIMEOUT_MS", "25000") or 25000)
@@ -9594,56 +9769,77 @@ def _render_html_with_playwright(url: str) -> dict[str, Any]:
     if wait_until not in {"load", "domcontentloaded", "networkidle", "commit"}:
         wait_until = "networkidle"
 
-    browser = None
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            ctx = browser.new_context(
-                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-                ignore_https_errors=True,
-                viewport={"width": 1366, "height": 900},
-            )
-            page = ctx.new_page()
-            response = page.goto(url, wait_until=wait_until, timeout=timeout_ms)
-            try:
-                # Beri kesempatan singkat untuk skrip async menyelesaikan render.
-                page.wait_for_timeout(600)
-            except Exception:
-                pass
-            html = page.content() or ""
-            final_url = page.url or url
-            status = None
-            content_type = server = ""
-            try:
-                if response is not None:
-                    status = response.status
-                    hdrs = {str(k).lower(): str(v) for k, v in (response.headers or {}).items()}
-                    content_type = hdrs.get("content-type", "")
-                    server = hdrs.get("server", "")
-            except Exception:
-                pass
-            ctx.close()
-            browser.close()
-            browser = None
-        if not html.strip():
-            return {"error": "render menghasilkan HTML kosong"}
-        return {
-            "html": html[:1_500_000],
-            "final_url": final_url,
-            "status": status,
-            "content_type": content_type,
-            "server": server,
-            "source": "playwright_render",
-            "html_source_label": "Hasil render JavaScript (Playwright/Chromium)",
-        }
-    except Exception as exc:
+    last_error = ""
+    # Percobaan kedua dipakai setelah browser baru diunduh: driver Playwright harus
+    # dimulai ulang agar mengenali browser yang baru terpasang.
+    for _attempt in range(2):
+        browser = None
         try:
-            if browser is not None:
+            with sync_playwright() as pw:
+                browser, launch_error = _launch_js_browser(pw)
+                if browser is None:
+                    # Kegagalan launch bersifat permanen untuk sesi ini: jangan ulangi tiap halaman.
+                    _JS_RENDER_UNAVAILABLE = launch_error
+                    return {"error": launch_error}
+                ctx = browser.new_context(
+                    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+                    ignore_https_errors=True,
+                    viewport={"width": 1366, "height": 900},
+                )
+                page = ctx.new_page()
+                response = None
+                try:
+                    response = page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                except Exception:
+                    # Situs dengan koneksi menggantung sering gagal di networkidle;
+                    # ulangi dengan syarat tunggu yang lebih longgar sebelum menyerah.
+                    if wait_until != "domcontentloaded":
+                        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    else:
+                        raise
+                try:
+                    # Beri kesempatan singkat untuk skrip async menyelesaikan render.
+                    page.wait_for_timeout(600)
+                except Exception:
+                    pass
+                html = page.content() or ""
+                final_url = page.url or url
+                status = None
+                content_type = server = ""
+                try:
+                    if response is not None:
+                        status = response.status
+                        hdrs = {str(k).lower(): str(v) for k, v in (response.headers or {}).items()}
+                        content_type = hdrs.get("content-type", "")
+                        server = hdrs.get("server", "")
+                except Exception:
+                    pass
+                ctx.close()
                 browser.close()
-        except Exception:
-            pass
-        return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+                browser = None
+            if not html.strip():
+                return {"error": "render menghasilkan HTML kosong"}
+            return {
+                "html": html[:1_500_000],
+                "final_url": final_url,
+                "status": status,
+                "content_type": content_type,
+                "server": server,
+                "source": "playwright_render",
+                "html_source_label": "Hasil render JavaScript (Playwright/Chromium)",
+            }
+        except _BrowserRestartNeeded:
+            last_error = "browser baru diunduh; mengulang render dengan driver Playwright baru"
+            continue
+        except Exception as exc:
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            return {"error": f"{type(exc).__name__}: {_clean_js_error(exc, 240)}"}
+    return {"error": last_error or "render gagal"}
 
 
 def _fetch_page_html_for_analysis(url: str) -> dict[str, Any]:
@@ -9653,14 +9849,15 @@ def _fetch_page_html_for_analysis(url: str) -> dict[str, Any]:
         return dict(_JS_RENDER_CACHE[url])
 
     mode = _js_render_mode()
-    if mode != "off":
+    if mode != "off" and not _JS_RENDER_UNAVAILABLE:
         rendered = _render_html_with_playwright(url)
         if rendered.get("html"):
             _JS_RENDER_CACHE[url] = dict(rendered)
             return dict(rendered)
         if not _JS_RENDER_NOTE_SHOWN:
             _JS_RENDER_NOTE_SHOWN = True
-            print(f"[JS RENDER] Render JavaScript tidak tersedia untuk {url}: {rendered.get('error')}. "
+            _err_text = str(rendered.get("error") or "").rstrip(" .")[:420]
+            print(f"[JS RENDER] Render JavaScript tidak tersedia untuk {url}: {_err_text}. "
                   f"Analisis memakai HTML statis (fallback).", flush=True)
 
     result: dict[str, Any] = {
@@ -9702,7 +9899,10 @@ def _js_render_status_line() -> str:
         has_pkg = False
     if not has_pkg:
         return "Render JavaScript: paket playwright belum terpasang — analisis memakai HTML statis (fallback otomatis)."
-    return f"Render JavaScript: aktif (Playwright/Chromium, mode {mode}) — fallback HTML statis bila render gagal."
+    install_note = ("unduh browser otomatis bila belum ada"
+                    if _js_render_install_mode() == "auto" else "unduh browser otomatis dimatikan")
+    return (f"Render JavaScript: aktif (Playwright/Chromium, mode {mode}, {install_note}) "
+            f"— fallback HTML statis bila render gagal.")
 
 
 def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None = None,
@@ -9730,7 +9930,9 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
         persist_scrape_artifacts(scrape_data)
     # Cache render hanya berlaku untuk satu kali pipeline, agar pemindaian ulang
     # pada proses yang sama (mis. Streamlit) selalu mengambil HTML terbaru.
+    global _JS_RENDER_UNAVAILABLE
     _JS_RENDER_CACHE.clear()
+    _JS_RENDER_UNAVAILABLE = ""
     print(f"[JS RENDER] {_js_render_status_line()}", flush=True)
     print(f"[PROGRESS] Discovery (Tahap 1) — penemuan seluruh halaman: {target_url}", flush=True)
     _oob_domain = os.getenv("SATRIA_OOB_DOMAIN") or None
