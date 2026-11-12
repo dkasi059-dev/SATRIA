@@ -7858,8 +7858,12 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
     for u in discovered:
         if u and u not in _seen_d:
             _seen_d.add(u); discovered_u.append(u)
-    _max_pp = int(os.getenv("SATRIA_MAX_PER_PAGE_MAIN_SCANS", "7"))
-    pages_to_scan = discovered_u[:max(1,_max_pp)]
+    try:
+        _max_pp = int(os.getenv("SATRIA_MAX_PER_PAGE_MAIN_SCANS", "3"))
+    except (TypeError, ValueError):
+        _max_pp = 3
+    _max_pp = max(1, min(_max_pp, 3))
+    pages_to_scan = discovered_u[:_max_pp]
 
     # 2) Proses LENGKAP per halaman — sama seperti halaman pertama/origin (tanpa pembedaan)
     per_page_main = []
@@ -14083,7 +14087,7 @@ def group_detected(rows: list[dict]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # ORKESTRATOR LAB
 # ══════════════════════════════════════════════════════════════════════════════
-def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 137) -> list[TargetContext]:
+def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 3) -> list[TargetContext]:
     """Crawl halaman, form GET, dan endpoint yang dirujuk JavaScript pada origin sama.
 
     Discovery hanya memakai GET dan tidak mengirim form POST atau aksi mutasi.
@@ -14134,7 +14138,11 @@ def _discover_same_origin_contexts(root_ctx: TargetContext, max_pages: int = 137
     commons_added = False
     contexts: list[TargetContext] = [root_ctx]
     scripts_seen: set[str] = set()
-    max_pages = max(1, min(int(os.getenv("SATRIA_MAX_DISCOVERY_PAGES", str(max_pages))), 137))
+    try:
+        _discovery_limit = int(os.getenv("SATRIA_MAX_DISCOVERY_PAGES", str(max_pages)))
+    except (TypeError, ValueError):
+        _discovery_limit = 3
+    max_pages = max(1, min(_discovery_limit, 3))
     max_scripts = max(0, min(int(os.getenv("SATRIA_MAX_DISCOVERY_SCRIPTS", "24")), 40))
     blocked = re.compile(r"(?:^|/)(?:logout|log-out|signout|sign-out|delete|remove|unsubscribe|deactivate|purchase|checkout|transfer|payment)(?:/|$)", re.I)
     static_ext = re.compile(r"\.(?:png|jpe?g|gif|svg|ico|css|woff2?|ttf|eot|mp[34]|pdf|zip)(?:$|\?)", re.I)
