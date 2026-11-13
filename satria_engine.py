@@ -707,6 +707,7 @@ class SatriaBaruScanner:
         self.timeout = max(3.0, min(timeout, 30.0))
         self.time_delay = max(1.0, min(time_delay, 8.0))
         self.request_count = 0
+        self._scan_progress: dict[str, Any] | None = None
         self.started = time.monotonic()
         try:
             self.deadline_seconds = float(globals().get("SCAN_DEADLINE_SECONDS") or 600.0)
@@ -777,6 +778,18 @@ class SatriaBaruScanner:
     def _within_budget(self) -> bool:
         return self.request_count < self.max_requests and (time.monotonic() - self.started) < self.deadline_seconds
 
+    def _scan_progress_event(self, message: str) -> None:
+        """Cetak progres probe hanya selama kategori pemindaian aktif."""
+        state = getattr(self, "_scan_progress", None)
+        if not state:
+            return
+        state["event_seq"] = int(state.get("event_seq", 0)) + 1
+        print(
+            f"[SCAN] [{state['index']:02d}/{state['total']:02d}] "
+            f"PROBE {state['event_seq']:04d} {state['label']}: {message}",
+            flush=True,
+        )
+
     # ------------------------------------------------------------------
     # OOB setup
     # ------------------------------------------------------------------
@@ -821,6 +834,8 @@ class SatriaBaruScanner:
         if not self._within_budget():
             return Response(None, url, "", {}, 0.0, error="budget_exhausted")
         started = time.monotonic()
+        safe_path = urlparse(url).path or "/"
+        self._scan_progress_event(f"KIRIM HTTP {method.upper()} {safe_path}")
         try:
             resp = (session or self.session).request(
                 method,
@@ -834,6 +849,9 @@ class SatriaBaruScanner:
             elapsed = time.monotonic() - started
             self.request_count += 1
             self.stats["requests"] = self.request_count
+            self._scan_progress_event(
+                f"TERIMA HTTP {resp.status_code} {safe_path} ({elapsed:.2f} dtk)"
+            )
             return Response(
                 status=resp.status_code,
                 url=resp.url,
@@ -845,11 +863,17 @@ class SatriaBaruScanner:
             elapsed = time.monotonic() - started
             self.request_count += 1
             self.stats["requests"] = self.request_count
+            self._scan_progress_event(
+                f"GAGAL HTTP {method.upper()} {safe_path} ({elapsed:.2f} dtk): {type(exc).__name__}"
+            )
             return Response(None, url, "", {}, elapsed, error=f"{type(exc).__name__}: {str(exc)[:160]}")
         except Exception as exc:
             elapsed = time.monotonic() - started
             self.request_count += 1
             self.stats["requests"] = self.request_count
+            self._scan_progress_event(
+                f"GAGAL HTTP {method.upper()} {safe_path} ({elapsed:.2f} dtk): {type(exc).__name__}"
+            )
             return Response(None, url, "", {}, elapsed, error=f"{type(exc).__name__}: {str(exc)[:160]}")
 
     def _cookie_header(self, name: str | None = None, override: str | None = None) -> str:
@@ -1863,6 +1887,9 @@ class SatriaBaruScanner:
         total_categories = len(category_phases)
         for index, (start, end, label, phases) in enumerate(category_phases, 1):
             criteria_total = sum(1 for item in CATALOG if start <= int(item[0]) <= end)
+            self._scan_progress = {
+                "index": index, "total": total_categories, "label": label, "event_seq": 0
+            }
             print(
                 f"[SCAN] [{index:02d}/{total_categories:02d}] MULAI: {label} "
                 f"({criteria_total} kriteria; nomor {start}-{end})",
@@ -1875,6 +1902,7 @@ class SatriaBaruScanner:
             except Exception as exc:
                 elapsed = time.monotonic() - phase_started
                 confirmed = sum(1 for number in self._confirmed if start <= number <= end)
+                self._scan_progress = None
                 print(
                     f"[SCAN] [{index:02d}/{total_categories:02d}] GAGAL: {label} "
                     f"({confirmed}/{criteria_total} terkonfirmasi; {elapsed:.1f} dtk; "
@@ -1884,6 +1912,7 @@ class SatriaBaruScanner:
                 raise
             confirmed = sum(1 for number in self._confirmed if start <= number <= end)
             elapsed = time.monotonic() - phase_started
+            self._scan_progress = None
             print(
                 f"[SCAN] [{index:02d}/{total_categories:02d}] SELESAI: {label} — "
                 f"{confirmed}/{criteria_total} terkonfirmasi; {elapsed:.1f} dtk",
@@ -7231,6 +7260,11 @@ class SatriaBaruScanner:
                 ctx = _ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = _ssl.CERT_NONE
+                # Raw scanner constructs HTTP/1.1 framing; explicitly negotiate HTTP/1.1.
+                try:
+                    ctx.set_alpn_protocols(["http/1.1"])
+                except Exception:
+                    pass
                 s = ctx.wrap_socket(s, server_hostname=host)
             except Exception:
                 try:
@@ -7287,7 +7321,9 @@ class SatriaBaruScanner:
                     k, v = line.split(b":", 1)
                     headers[k.decode("latin-1", "ignore").strip().lower()] = v.decode("latin-1", "ignore").strip()
             body = b""
-            if "chunked" in headers.get("transfer-encoding", "").lower():
+            if 100 <= status < 200 or status in (204, 304):
+                data = rest
+            elif "chunked" in headers.get("transfer-encoding", "").lower():
                 body, used = self._smug_dechunk(rest)
                 if body is None:
                     break
@@ -7308,6 +7344,8 @@ class SatriaBaruScanner:
         """Kirim beberapa request mentah pada satu koneksi, baca hingga `expect` respons."""
         import socket, time as _time
         t = timeout if timeout is not None else max(4.0, min(12.0, float(getattr(self, "timeout", 8.0) or 8.0)))
+        if not self._within_budget():
+            return [], 0.0, "budget_exhausted"
         s = self._smug_connect(timeout=t)
         if s is None:
             return [], 0.0, "connect_failed"
@@ -7317,6 +7355,17 @@ class SatriaBaruScanner:
         err: str | None = None
         try:
             for i, raw in enumerate(requests_list):
+                if not self._within_budget():
+                    err = "budget_exhausted"
+                    break
+                self.request_count += 1
+                self.stats["requests"] = self.request_count
+                request_line = raw.split(b"\\r\\n", 1)[0].decode("latin-1", "replace")
+                request_parts = request_line.split()
+                safe_request = " ".join(
+                    request_parts[:1] + ([request_parts[1].split("?", 1)[0]] if len(request_parts) > 1 else [])
+                )
+                self._scan_progress_event(f"KIRIM RAW HTTP/1 {safe_request}")
                 s.sendall(raw)
                 if pause and i == 0:
                     _time.sleep(pause)
@@ -7348,6 +7397,10 @@ class SatriaBaruScanner:
                 pass
         if not responses:
             responses = self._smug_parse_responses(buf)
+        self._scan_progress_event(
+            f"RAW HTTP/1 selesai: {len(responses)} respons diterima"
+            + (f"; {err}" if err else "")
+        )
         return responses, _time.time() - start, err
 
     def _smug_build(self, start_line: str, headers: list[tuple[str, str]], body: bytes = b"") -> bytes:
@@ -7387,23 +7440,39 @@ class SatriaBaruScanner:
         return res[0]["status"], res[0].get("body", ""), elapsed, err
 
     def _smug_desync_once(self, smuggle: bytes, follow_path: str = "/") -> tuple[bool, str]:
-        """Kirim [smuggle, follow-up] pada satu koneksi; desync = respons kedua malformed."""
-        b_status, _, _, _ = self._smug_normal_status(follow_path)
+        """Bandingkan respons kedua pada koneksi yang sama dengan baseline independen."""
+        b_status, b_body, _, b_err = self._smug_normal_status(follow_path)
         if b_status is None:
             return False, ""
         res, elapsed, err = self._smug_exchange([smuggle, self._smug_get(follow_path, close=True)], 2)
         if not res or len(res) < 2:
             return False, ""
         second = res[1]
-        low = (second.get("body") or "")[:400].lower()
-        bad = second["status"] in (400, 404, 405, 501)
-        signal = second["status"] in (400, 405, 501) or any(tok in low for tok in (
-            "unrecognized method", "invalid method", "gpost", "bad request", "invalid request"))
-        if bad and signal and b_status not in (400, 404, 405, 501):
-            return True, (f"pipeline: baseline GET {follow_path} -> {b_status}, respons kedua setelah "
-                          f"smuggle+follow -> {second['status']} "
-                          f"({(second.get('body') or '')[:100]!r}), {elapsed:.2f}s"
-                          + (f", err={err}" if err else ""))
+        second_body = (second.get("body") or "")[:1200]
+        low = second_body.lower()
+        parser_error = (
+            second["status"] in (400, 405, 501)
+            and bool(re.search(
+                r"unrecognized method|invalid method|method not allowed|gpost|gget|bad request",
+                low,
+                re.I,
+            ))
+        )
+        unique_404_path = bool(re.search(rb"/404-[A-Za-z0-9_-]+", smuggle))
+        not_found_differential = (
+            second["status"] == 404
+            and b_status != 404
+            and unique_404_path
+        )
+        if parser_error or not_found_differential:
+            signal = "parser rejection" if parser_error else "404 pada path smuggled yang unik"
+            return True, (
+                f"pipeline: baseline GET {follow_path} -> {b_status}, respons kedua setelah "
+                f"smuggle+follow -> {second['status']} ({signal}); "
+                f"{second_body[:100]!r}, {elapsed:.2f}s"
+                + (f", err={err}" if err else "")
+                + (f", baseline_err={b_err}" if b_err else "")
+            )
         return False, ""
 
     def _smug_desync(self, smuggle: bytes, follow_path: str = "/", trials: int = 2) -> tuple[bool, str]:
@@ -7455,12 +7524,12 @@ class SatriaBaruScanner:
         # ---------- 92/105: TE.CL ----------
         tecl_seen = False
         if 92 not in self._confirmed and self._within_budget() and self._smug_te_frontend():
-            inner = f"GPOST / HTTP/1.1\r\nHost: {cluster_host}\r\nContent-Length: 15\r\n\r\nx="
-            hexlen = format(len(inner), "x")
-            chunked = f"{hexlen}\r\n{inner}\r\n0\r\n\r\n"
+            # TE.CL canonical: front-end decodes the GPOST chunk, while a backend
+            # honoring Content-Length consumes only the three-byte chunk-size line.
+            chunked = "5\\r\\nGPOST\\r\\n0\\r\\n\\r\\n"
             smuggle = self._smug_build(
                 f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", str(len(hexlen) + 2)),
+                [("Host", cluster_host), ("Content-Length", "3"),
                  ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
                 chunked.encode())
             ok, ev = self._smug_desync(smuggle, "/")
@@ -7473,7 +7542,7 @@ class SatriaBaruScanner:
 
         # ---------- 91/104: CL.TE ----------
         clte_seen = False
-        if 91 not in self._confirmed and 92 not in self._confirmed and self._within_budget():
+        if 91 not in self._confirmed and self._within_budget():
             bodies = ["0\r\n\r\nG", "0\r\n\r\nGET /404-smug HTTP/1.1\r\nX: y\r\n\r\n"]
             for body in bodies:
                 if 91 in self._confirmed or not self._within_budget():
