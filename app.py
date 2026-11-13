@@ -338,25 +338,12 @@ with st.sidebar:
         st.image(str(logo_path), width=240)
     else:
         st.markdown("## 🛡️ SATRIA WebSec")
-    st.caption("Evidence-driven website security assessment")
-    st.markdown("---")
-    st.markdown("**Integrasi layanan**")
+    # Kredensial tetap dimuat untuk kebutuhan backend; status integrasi dan mode scan
+    # sengaja tidak ditampilkan di sidebar.
     geekflare_key = _secret("GEEKFLARE_API_KEY")
     kiosapi_key = _secret("KIOSAPI_API_KEY")
     censys_token = _secret("CENSYS_API_TOKEN")
     nvd_key = _secret("NVD_API_KEY")
-    st.write(f"Geekflare: {'Terhubung' if geekflare_key else 'Fallback HTTP statis'}")
-    st.write(f"KiosAPI: {'Aktif' if kiosapi_key else 'Tidak dikonfigurasi (opsional)'}")
-    st.write(f"Censys: {'Aktif' if censys_token else 'Tidak dikonfigurasi (opsional)'}")
-    st.write(f"NVD API key: {'Tersedia' if nvd_key else 'Tidak ada (public rate limit)'}")
-    st.markdown("---")
-    st.markdown("**Mode pemeriksaan**")
-    st.write("Passive reconnaissance: ON")
-    st.write("Technology & CVE lookup: ON")
-    st.write("Active scanning: ON setelah persetujuan")
-    st.caption("Tool CLI eksternal hanya berjalan jika tersedia pada host deployment.")
-    st.markdown("---")
-    st.markdown("<div class='small-note'>Jangan mengunggah API key ke GitHub. Simpan di Streamlit Secrets.</div>", unsafe_allow_html=True)
     if not APP_ACCESS_PASSWORD:
         st.warning("SATRIA_ACCESS_PASSWORD belum diatur. Atur password sebelum membagikan aplikasi ke publik.")
 
