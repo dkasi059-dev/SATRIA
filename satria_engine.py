@@ -5790,12 +5790,46 @@ class SatriaBaruScanner:
         def url_of(*paths: str) -> list[str]:
             return [urljoin(origin + "/", p.lstrip("/")) for p in paths]
 
-        # ---- 168: limit overrun pada kupon (burst pertama; batas dibuktikan oleh respons "already") ----
+        def discovered_forms(*field_terms: str, action_terms: tuple[str, ...] = ()) -> list[FormSpec]:
+            candidates: list[FormSpec] = []
+            seen_actions: set[str] = set()
+            for page in pages[:40]:
+                for form in (getattr(page, "forms", []) or []):
+                    action = urljoin(getattr(page, "url", origin + "/"), form.action or "")
+                    if not self._same_origin(action) or action in seen_actions:
+                        continue
+                    names = [str(name).lower() for name, _value, _kind in (form.fields or ())]
+                    action_path = urlparse(action).path.lower()
+                    if not any(term in name for term in field_terms for name in names) and not any(
+                        term in action_path for term in action_terms
+                    ):
+                        continue
+                    seen_actions.add(action)
+                    candidates.append(form)
+            return candidates[:12]
+
+        # ---- 168: limit overrun kupon: utamakan action/form yang benar-benar ditemukan ----
         if 168 not in self._confirmed and session is not None and self._within_budget():
-            for coupon_url in url_of("cart/coupon", "coupon", "apply-coupon"):
+            coupon_candidates: list[tuple[str, dict[str, str]]] = [
+                (u, {"coupon": "NEWCUST20"}) for u in url_of("cart/coupon", "coupon", "apply-coupon")
+            ]
+            for form in discovered_forms("coupon", "promo", "discount", action_terms=("coupon", "promo", "discount")):
+                body = {name: value for name, value, _kind in form.fields}
+                coupon_field = next((name for name in body if any(
+                    term in name.lower() for term in ("coupon", "promo", "discount")
+                )), "coupon")
+                body[coupon_field] = "NEWCUST20"
+                action = urljoin(form.page_url, form.action)
+                coupon_candidates.append((action, body))
+            unique_coupon_candidates = []
+            seen_coupon_candidates = set()
+            for candidate in coupon_candidates:
+                if candidate[0] not in seen_coupon_candidates:
+                    seen_coupon_candidates.add(candidate[0])
+                    unique_coupon_candidates.append(candidate)
+            for coupon_url, body in unique_coupon_candidates:
                 if not self._race_endpoint_exists(coupon_url, session):
                     continue
-                body = {"coupon": "NEWCUST20"}
                 burst = self._race_burst(session, "POST", coupon_url, [body] * 12, n=12)
                 applied = [r for r in burst if self._race_ok(r) and self._race_has(r, "coupon applied", "applied", "discount")
                            and not self._race_rejected(r)]
