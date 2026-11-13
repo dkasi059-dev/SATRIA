@@ -845,6 +845,7 @@ class SatriaBaruScanner:
         params: Any = None,
         data: Any = None,
         headers: dict[str, str] | None = None,
+        files: Any = None,
         allow_redirects: bool = False,
         timeout: float | None = None,
     ) -> Response:
@@ -860,6 +861,7 @@ class SatriaBaruScanner:
                 params=params,
                 data=data,
                 headers=headers,
+                files=files,
                 timeout=timeout or self.timeout,
                 allow_redirects=allow_redirects,
             )
@@ -1927,6 +1929,10 @@ class SatriaBaruScanner:
             except Exception as exc:
                 elapsed = time.monotonic() - phase_started
                 confirmed = sum(1 for number in self._confirmed if start <= number <= end)
+                self.stats["errors"].append(
+                    f"Kategori {label} ({start}-{end}) gagal: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
                 self._scan_progress = None
                 print(
                     f"[SCAN] [{index:02d}/{total_categories:02d}] GAGAL: {label} "
@@ -1934,7 +1940,7 @@ class SatriaBaruScanner:
                     f"{type(exc).__name__}: {str(exc)[:160]})",
                     flush=True,
                 )
-                raise
+                continue
             confirmed = sum(1 for number in self._confirmed if start <= number <= end)
             elapsed = time.monotonic() - phase_started
             self._scan_progress = None
@@ -6476,6 +6482,8 @@ class SatriaBaruScanner:
                 if not has_file:
                     continue
                 action = urljoin(page_url, form.get("action") or page_url)
+                if not self._same_origin(action):
+                    continue
                 method = (form.get("method") or "POST").upper()
                 key = (action, method, tuple(sorted(name for name, _value, _typ in fields)))
                 if key in seen:
@@ -6712,7 +6720,7 @@ class SatriaBaruScanner:
         seen = set()
         def add(u):
             if not u or u in seen: return
-            if not self._same_host(u): return
+            if not self._same_origin(u): return
             seen.add(u); cand.append(u)
         add(target)
         for pg in pages[:25]:
@@ -6792,7 +6800,7 @@ class SatriaBaruScanner:
         json_endpoints = []
         seenj=set()
         def addj(u):
-            if u and u not in seenj and self._same_host(u): seenj.add(u); json_endpoints.append(u)
+            if u and u not in seenj and self._same_origin(u): seenj.add(u); json_endpoints.append(u)
         for pg in pages[:30]:
             u=getattr(pg,'url','') or ''
             if re.search(r'/api/|/user|/profile|/settings|/admin|/update|/merge|/config', u, re.I): addj(u)
@@ -8850,7 +8858,7 @@ class SatriaBaruScanner:
             "version": __version__,
             "target": self.target_url,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "catalog_scope": "18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM + 3 CORS + 9 XXE + 7 SSRF labs (90 total)",
+            "catalog_scope": "18 SQLi + 30 XSS + 11 CSRF + 5 Clickjacking + 7 DOM + 3 CORS + 9 XXE + 7 SSRF + 22 HTTP request smuggling + 5 OS command injection + 13 Web cache poisoning + 5 Information disclosure + 7 HTTP Host header attacks + 4 NoSQL injection + 8 JWT + 13 Access control + 6 Race conditions + 8 Web LLM attacks + 5 Web cache deception + 7 File upload + 10 Prototype pollution + 10 Insecure deserialization + 14 Authentication (227 total)",
             "summary": (lambda confirmed_labs: {
                 "confirmed": len(confirmed_labs),
                 "confirmed_manual": len(confirmed_labs),
