@@ -11454,8 +11454,7 @@ def extract_tech_versions_deterministic(
     """Fingerprint teknologi dari HTML, asset, meta, header HTTP, dan cookie.
 
     Versi hanya diisi bila benar-benar terlihat pada respons. Fingerprint tanpa
-    versi dicatat sebagai "unknown" agar teknologi tidak hilang dari laporan
-    hanya karena aplikasi menyembunyikan nomor versinya.
+    versi dicatat sebagai "unknown", bukan diberi versi hasil tebakan.
     """
     html = str(html or "")
     headers = headers if isinstance(headers, dict) else {}
@@ -11463,7 +11462,7 @@ def extract_tech_versions_deterministic(
     found: dict[str, dict] = {}
 
     def add(name: str, version: str = "unknown", source: str = "HTML fingerprint") -> None:
-        clean_name = re.sub(r"\\s+", " ", str(name or "")).strip()
+        clean_name = re.sub(r"\s+", " ", str(name or "")).strip()
         clean_version = str(version or "unknown").strip() or "unknown"
         if not clean_name:
             return
@@ -11479,14 +11478,14 @@ def extract_tech_versions_deterministic(
         if not value:
             return
         patterns = [
-            (r"\\bnginx(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "Nginx"),
-            (r"\\bApache(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "Apache HTTP Server"),
-            (r"\\bOpenResty(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "OpenResty"),
-            (r"\\bLiteSpeed(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "LiteSpeed"),
-            (r"\\bMicrosoft-IIS(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "Microsoft IIS"),
-            (r"\\bCaddy(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "Caddy"),
-            (r"\\bPHP(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "PHP"),
-            (r"\\b(?:ASP\\.NET|ASP.NET Core)(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "ASP.NET"),
+            (r"\bnginx(?:/|\s+)([0-9][0-9A-Za-z._+-]*)", "Nginx"),
+            (r"\bApache(?:/|\s+)([0-9][0-9A-Za-z._+-]*)", "Apache HTTP Server"),
+            (r"\bOpenResty(?:/|\s+)([0-9][0-9A-Za-z._+-]*)", "OpenResty"),
+            (r"\bLiteSpeed(?:/|\s+)([0-9][0-9A-Za-z._+-]*)", "LiteSpeed"),
+            (r"\bMicrosoft-IIS(?:/|\s+)([0-9][0-9A-Za-z._+-]*)", "Microsoft IIS"),
+            (r"\bCaddy(?:/|\s+)([0-9][0-9A-Za-z._+-]*)", "Caddy"),
+            (r"\bPHP(?:/|\s+)([0-9][0-9A-Za-z._+-]*)", "PHP"),
+            (r"\bASP\.NET(?: Core)?(?:/|\s+)([0-9][0-9A-Za-z._+-]*)", "ASP.NET"),
         ]
         for pattern, name in patterns:
             match = re.search(pattern, value, re.I)
@@ -11513,56 +11512,56 @@ def extract_tech_versions_deterministic(
     if header_map.get("x-aspnet-version"):
         add("ASP.NET", header_map["x-aspnet-version"], "HTTP x-aspnet-version")
 
-    # Parse markup attributes independently of their order and quote style.
     try:
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
         soup = None
+
+    asset_urls: list[str] = []
     if soup is not None:
         for meta in soup.find_all("meta"):
             generator = str(meta.get("content") or "").strip()
             meta_name = str(meta.get("name") or meta.get("property") or "").lower()
-            if meta_name == "generator" and generator:
-                matched = False
-                for pattern, tech_name in (
-                    (r"WordPress\\s*([0-9][0-9A-Za-z._+-]*)", "WordPress"),
-                    (r"Drupal\\s*([0-9][0-9A-Za-z._+-]*)", "Drupal"),
-                    (r"Joomla!?\\s*([0-9][0-9A-Za-z._+-]*)", "Joomla"),
-                    (r"PrestaShop\\s*([0-9][0-9A-Za-z._+-]*)", "PrestaShop"),
-                    (r"Magento\\s*([0-9][0-9A-Za-z._+-]*)", "Magento"),
-                    (r"Ghost\\s*([0-9][0-9A-Za-z._+-]*)", "Ghost"),
-                ):
-                    match = re.search(pattern, generator, re.I)
-                    if match:
-                        add(tech_name, match.group(1), "Meta generator")
-                        matched = True
-                        break
-                if not matched:
-                    for token, tech_name in (
-                        ("wordpress", "WordPress"), ("drupal", "Drupal"),
-                        ("joomla", "Joomla"), ("prestashop", "PrestaShop"),
-                        ("magento", "Magento"), ("shopify", "Shopify"),
-                        ("ghost", "Ghost"), ("hugo", "Hugo"),
-                        ("jekyll", "Jekyll"), ("webflow", "Webflow"),
-                        ("wix", "Wix"), ("squarespace", "Squarespace"),
-                    ):
-                        if token in generator.lower():
-                            add(tech_name, "unknown", "Meta generator")
-                            break
+            if meta_name != "generator" or not generator:
+                continue
 
-        asset_urls = []
+            generator_patterns = [
+                (r"\bWordPress\s*([0-9][0-9A-Za-z._+-]*)", "WordPress"),
+                (r"\bDrupal\s*([0-9][0-9A-Za-z._+-]*)", "Drupal"),
+                (r"\bJoomla!?\s*([0-9][0-9A-Za-z._+-]*)", "Joomla"),
+                (r"\bPrestaShop\s*([0-9][0-9A-Za-z._+-]*)", "PrestaShop"),
+                (r"\bMagento\s*([0-9][0-9A-Za-z._+-]*)", "Magento"),
+                (r"\bGhost\s*([0-9][0-9A-Za-z._+-]*)", "Ghost"),
+            ]
+            matched = False
+            for pattern, tech_name in generator_patterns:
+                match = re.search(pattern, generator, re.I)
+                if match:
+                    add(tech_name, match.group(1), "Meta generator")
+                    matched = True
+                    break
+            if not matched:
+                for token, tech_name in (
+                    ("wordpress", "WordPress"), ("drupal", "Drupal"),
+                    ("joomla", "Joomla"), ("prestashop", "PrestaShop"),
+                    ("magento", "Magento"), ("shopify", "Shopify"),
+                    ("ghost", "Ghost"), ("hugo", "Hugo"),
+                    ("jekyll", "Jekyll"), ("webflow", "Webflow"),
+                    ("wix", "Wix"), ("squarespace", "Squarespace"),
+                ):
+                    if token in generator.lower():
+                        add(tech_name, "unknown", "Meta generator")
+                        break
+
         for element in soup.find_all(["script", "link"]):
             asset_url = element.get("src") or element.get("href")
             if asset_url:
                 asset_urls.append(str(asset_url))
-        # Include inline markup text / data markers as well as external asset URLs.
-        asset_text = "\\n".join(asset_urls) + "\\n" + html
-    else:
-        asset_text = html
-        asset_urls = []
 
-    # Frameworks/CMS with reliable, recognizable DOM or resource markers.
+    asset_text = "\n".join(asset_urls) + "\n" + html
     low_html = html.lower()
+
+    # Frameworks and CMS with distinctive, directly observable markers.
     marker_rules = [
         (("/wp-content/", "/wp-includes/", "wp-json"), "WordPress"),
         (("/core/misc/drupal.js", "drupalsettings", "/sites/default/files/"), "Drupal"),
@@ -11571,7 +11570,7 @@ def extract_tech_versions_deterministic(
         (("cdn.shopify.com", "shopify.theme", "shopify-features"), "Shopify"),
         (("/_next/static/", "__next_data__"), "Next.js"),
         (("/_nuxt/", "__nuxt__"), "Nuxt"),
-        (("ng-version=", "ng-app=", "ng-version ="), "Angular"),
+        (("ng-version=", "ng-app="), "Angular"),
         (("data-reactroot", "__react", "react-dom"), "React"),
         (("data-v-app", "__vue__", "vue.runtime"), "Vue.js"),
         (("cdn.tailwindcss.com", "tailwindcss"), "Tailwind CSS"),
@@ -11582,39 +11581,43 @@ def extract_tech_versions_deterministic(
         if any(marker in low_html for marker in markers):
             add(name, "unknown", "HTML/resource marker")
 
-    angular_version = re.search(r"\\bng-version\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]", html, re.I)
+    angular_version = re.search(r"\bng-version\s*=\s*['\"]([^'\"]+)['\"]", html, re.I)
     if angular_version:
         add("Angular", angular_version.group(1), "ng-version attribute")
 
     alias = {"wordpress-seo": "Yoast SEO"}
-    for m in re.finditer(r"/wp-content/plugins/([a-zA-Z0-9_\\-]+)/[^\\\"']*?[?&]ver="
-                         r"([0-9][0-9A-Za-z.\\-]*)", html, re.I):
-        slug, ver = m.group(1), m.group(2)
-        add(alias.get(slug.lower(), slug), ver, "WordPress plugin asset")
+    for match in re.finditer(
+        r"/wp-content/plugins/([a-zA-Z0-9_-]+)/[^\"']*?[?&]ver=([0-9][0-9A-Za-z.-]*)",
+        html, re.I,
+    ):
+        slug, version = match.group(1), match.group(2)
+        add(alias.get(slug.lower(), slug), version, "WordPress plugin asset")
 
-    for m in re.finditer(r"/wp-content/themes/([a-zA-Z0-9_\\-]+)/[^\\\"']*?[?&]ver="
-                         r"([0-9][0-9A-Za-z.\\-]*)", html, re.I):
-        add(m.group(1), m.group(2), "WordPress theme asset")
+    for match in re.finditer(
+        r"/wp-content/themes/([a-zA-Z0-9_-]+)/[^\"']*?[?&]ver=([0-9][0-9A-Za-z.-]*)",
+        html, re.I,
+    ):
+        add(match.group(1), match.group(2), "WordPress theme asset")
 
-    js_libs = [
-        (r"jquery[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.js", "jQuery"),
-        (r"jquery[-.]([0-9]+(?:\\.[0-9]+){1,3})", "jQuery"),
-        (r"bootstrap[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.(?:css|js)", "Bootstrap"),
-        (r"bootstrap[-.]([0-9]+(?:\\.[0-9]+){1,3})", "Bootstrap"),
-        (r"vue[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.js", "Vue.js"),
-        (r"react[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.js", "React"),
-        (r"angular[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.js", "AngularJS"),
+    versioned_assets = [
+        (r"jquery[-.]([0-9]+(?:\.[0-9]+){1,3})", "jQuery"),
+        (r"bootstrap[-.]([0-9]+(?:\.[0-9]+){1,3})", "Bootstrap"),
+        (r"vue[-.]([0-9]+(?:\.[0-9]+){1,3})", "Vue.js"),
+        (r"react(?:-dom)?[-.]([0-9]+(?:\.[0-9]+){1,3})", "React"),
+        (r"angular[-.]([0-9]+(?:\.[0-9]+){1,3})", "AngularJS"),
+        (r"/react(?:-dom)?/([0-9]+(?:\.[0-9]+){1,3})/", "React"),
+        (r"/vue@([0-9]+(?:\.[0-9]+){1,3})/", "Vue.js"),
     ]
-    normalized_asset_text = re.sub(r"\\s+", " ", asset_text)
-    for pattern, name in js_libs:
-        for match in re.finditer(pattern, normalized_asset_text, re.I):
+    for pattern, name in versioned_assets:
+        for match in re.finditer(pattern, asset_text, re.I):
             add(name, match.group(1), "Versioned asset")
 
-    # CDN URL patterns commonly expose package/version explicitly.
-    for match in re.finditer(r"cdn\\.jsdelivr\\.net/npm/([a-zA-Z0-9_@/-]+)@([0-9][0-9A-Za-z._+-]*)", asset_text, re.I):
+    for match in re.finditer(
+        r"cdn\.jsdelivr\.net/npm/([a-zA-Z0-9_@/-]+)@([0-9][0-9A-Za-z._+-]*)",
+        asset_text, re.I,
+    ):
         add(match.group(1).split("/")[-1], match.group(2), "jsDelivr package URL")
 
-    # Cookie names are useful indicators, but never invent a version from them.
     cookie_names = {
         str(item.get("name") or "").lower()
         for item in (cookies or [])
@@ -11631,7 +11634,6 @@ def extract_tech_versions_deterministic(
                 add(tech_name, "unknown", "Session cookie fingerprint")
 
     return list(found.values())
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX #11 — Temuan kode deterministik
