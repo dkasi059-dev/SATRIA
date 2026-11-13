@@ -5880,21 +5880,43 @@ class SatriaBaruScanner:
 
         # ---- 171: single-endpoint (dua nilai berbeda pada endpoint sama) ----
         if 171 not in self._confirmed and session is not None and self._within_budget():
-            for email_url in url_of("my-account/change-email", "account/email", "change-email"):
-                page = self._request("GET", urljoin(origin + "/", "my-account"), session=session, allow_redirects=True)
+            email_forms = discovered_forms("email", action_terms=("change-email", "email", "profile"))
+            email_candidates = [
+                (urljoin(form.page_url, form.action), form)
+                for form in email_forms
+                if any("email" in str(name).lower() for name, _value, _kind in form.fields)
+            ]
+            if not email_candidates:
+                email_candidates = [(u, None) for u in url_of(
+                    "my-account/change-email", "account/email", "change-email"
+                )]
+            for email_url, email_form in email_candidates[:8]:
+                page_url = email_form.page_url if email_form is not None else urljoin(origin + "/", "my-account")
+                page = self._request("GET", page_url, session=session, allow_redirects=True)
                 if page.error or page.status != 200:
                     continue
                 csrf = self._ac_csrf(page.text or "")
                 a_email = f"satria-race-a-{uuid.uuid4().hex[:6]}@example.com"
                 b_email = f"satria-race-b-{uuid.uuid4().hex[:6]}@example.com"
+                base_data = (
+                    {name: value for name, value, _kind in email_form.fields}
+                    if email_form is not None else {}
+                )
+                email_field = next(
+                    (name for name in base_data if "email" in name.lower()), "email"
+                )
                 payloads = []
                 for i in range(8):
-                    data = {"email": a_email if i % 2 == 0 else b_email}
+                    data = dict(base_data)
                     data.update(csrf)
+                    data[email_field] = a_email if i % 2 == 0 else b_email
                     payloads.append(data)
-                burst = self._race_burst(session, "POST", email_url, payloads, n=8)
+                burst = self._race_burst(
+                    session, email_form.method.upper() if email_form else "POST",
+                    email_url, payloads, n=8
+                )
                 accepted = [r for r in burst if self._race_ok(r) and not self._race_rejected(r)]
-                after = self._request("GET", urljoin(origin + "/", "my-account"), session=session, allow_redirects=True)
+                after = self._request("GET", page_url, session=session, allow_redirects=True)
                 if len(accepted) >= 2 and (a_email in (after.text or "") or b_email in (after.text or "")):
                     self._race_mark(171, email_url,
                                     f"Single-endpoint race condition terverifikasi: {len(accepted)}/8 perubahan email "
