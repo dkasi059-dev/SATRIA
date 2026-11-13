@@ -6440,18 +6440,48 @@ class SatriaBaruScanner:
         self._mark(num, point, ev, method_name)
 
     def _find_upload_forms(self, pages: list[Page]):
+        """Temukan form upload dari HTML asli; FormSpec sengaja tidak menyimpan input file."""
         forms = []
         seen = set()
         for pg in pages[:30]:
-            for f in getattr(pg, 'forms', [])[:12]:
-                has_file = any(str(fld.get('type','')).lower() == 'file' for fld in getattr(f, 'fields', []))
+            page_url = getattr(pg, "url", "") or self.target_url
+            page_text = getattr(pg, "text", "") or ""
+            if not page_text:
+                continue
+            try:
+                soup = BeautifulSoup(page_text, "html.parser")
+            except Exception:
+                continue
+            for form in soup.find_all("form")[:12]:
+                fields = []
+                has_file = False
+                for element in form.find_all(["input", "select", "textarea"]):
+                    name = element.get("name")
+                    if not name or element.has_attr("disabled"):
+                        continue
+                    typ = (element.get("type") or "").lower() or element.name
+                    if typ == "file":
+                        has_file = True
+                        value = ""
+                    elif typ in {"submit", "button", "image", "reset"}:
+                        continue
+                    elif element.name == "textarea":
+                        value = element.text or ""
+                    elif element.name == "select":
+                        selected = element.find("option", selected=True) or element.find("option")
+                        value = str(selected.get("value") or selected.text or "") if selected else ""
+                    else:
+                        value = str(element.get("value") or "")
+                    fields.append((str(name), str(value)[:500], typ))
                 if not has_file:
                     continue
-                action = getattr(f, 'action', '') or getattr(pg, 'url', '')
-                key = (action, tuple(sorted([fld.get('name','') for fld in getattr(f,'fields',[])])))
-                if key in seen: continue
+                action = urljoin(page_url, form.get("action") or page_url)
+                method = (form.get("method") or "POST").upper()
+                key = (action, method, tuple(sorted(name for name, _value, _typ in fields)))
+                if key in seen:
+                    continue
                 seen.add(key)
-                forms.append((action, getattr(f,'method','POST') or 'POST', getattr(f,'fields',[]), getattr(pg,'url','')))
+                forms.append((action, method, tuple(fields), page_url))
         return forms[:6]
 
     def phase_file_upload_vulnerabilities(self, pages: list[Page], points: list[Point]) -> None:
@@ -6465,20 +6495,34 @@ class SatriaBaruScanner:
         if not forms:
             return
 
+        def field_parts(field):
+            if isinstance(field, dict):
+                return (
+                    str(field.get("name") or ""),
+                    str(field.get("value") or ""),
+                    str(field.get("type") or "").lower(),
+                )
+            if isinstance(field, (tuple, list)) and len(field) >= 3:
+                name, value, typ = field[0], field[1], field[2]
+                return str(name or ""), str(value or ""), str(typ or "").lower()
+            return "", "", ""
+
         def file_field(fields):
             for fld in fields:
-                if str(fld.get('type','')).lower() == 'file':
-                    return fld.get('name') or 'file'
-            return 'file'
+                name, _value, typ = field_parts(fld)
+                if typ == "file":
+                    return name or "file"
+            return "file"
 
         def build_data(fields, exclude_name):
             data = {}
             for fld in fields:
-                n = fld.get('name')
-                if not n or n == exclude_name: continue
-                t = str(fld.get('type','')).lower()
-                if t in ('submit','button','image','file'): continue
-                data[n] = fld.get('value') or 'test'
+                name, value, typ = field_parts(fld)
+                if not name or name == exclude_name:
+                    continue
+                if typ in ("submit", "button", "image", "reset", "file"):
+                    continue
+                data[name] = value or "test"
             return data
 
         def extract_links(text, base):
@@ -6869,9 +6913,17 @@ class SatriaBaruScanner:
             for form in getattr(pg,'forms',[])[:8]:
                 action = getattr(form,'action','') or u
                 for fld in getattr(form,'fields',[]):
-                    v = str(fld.get('value') or '')
+                    if isinstance(fld, dict):
+                        field_name = fld.get('name') or 'data'
+                        field_value = fld.get('value') or ''
+                    elif isinstance(fld, (tuple, list)) and len(fld) >= 2:
+                        field_name = fld[0] or 'data'
+                        field_value = fld[1] or ''
+                    else:
+                        continue
+                    v = str(field_value)
                     if ser_re.search(v) or (len(v)>20 and self._b64d(v) and ser_re.search(self._b64d(v).decode('latin1','ignore'))):
-                        addc(action,(getattr(form,'method','POST') or 'POST').upper(),'form', fld.get('name') or 'data', v)
+                        addc(action,(getattr(form,'method','POST') or 'POST').upper(),'form', str(field_name), v)
 
         # try common endpoints/params
         for path in ('/','/profile','/account','/session','/api','/api/profile'):
