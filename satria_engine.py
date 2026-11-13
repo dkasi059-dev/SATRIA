@@ -7664,7 +7664,7 @@ class SatriaBaruScanner:
                     txt = r.get("body") or ""
                     if re.search(
                         r"(?:X-Forwarded-(?:For|Host|Proto)|X-Real-IP|X-Client-IP|CF-Connecting-IP)"
-                        r"\\s*:\\s*(?:https?://)?[A-Za-z0-9*._:-]{3,}",
+                        r"\s*:\s*(?:https?://)?[A-Za-z0-9*._:-]{3,}",
                         txt,
                         re.I,
                     ):
@@ -8518,6 +8518,7 @@ class SatriaBaruScanner:
                         if resp is not None and not resp.error:
                             sent_to.append(url)
                 if sent_to:
+                    self._scan_progress_event("XXE 77: polling OOB untuk tag unik")
                     got = self._poll_oob()
                     if _oob_tag_seen(got, tag):
                         mark(
@@ -8554,6 +8555,7 @@ class SatriaBaruScanner:
                         if resp is not None and not resp.error:
                             sent_to.append(url)
                 if sent_to:
+                    self._scan_progress_event("XXE 78: polling OOB untuk parameter entity")
                     got = self._poll_oob()
                     if _oob_tag_seen(got, tag):
                         mark(
@@ -8569,6 +8571,7 @@ class SatriaBaruScanner:
         dtd_template_valid = bool(
             dtd_template_parsed and dtd_template_parsed.scheme in ("http", "https")
             and dtd_template_parsed.netloc
+            and not re.search(r'[\r\n"<> ]', dtd_template)
         )
         if 79 not in self._confirmed and self._within_budget():
             if not (dtd_template_valid and oob_ready):
@@ -8595,6 +8598,7 @@ class SatriaBaruScanner:
                     if resp is not None and not resp.error:
                         sent_to.append(url)
                 if sent_to:
+                    self._scan_progress_event("XXE 79: polling OOB, validasi nilai exfil terpisah dari callback")
                     got = self._poll_oob()
                     got_values = _oob_exfil_data(got, tag)
                     if got_values:
@@ -8616,6 +8620,7 @@ class SatriaBaruScanner:
         error_parsed = urlparse(error_template) if error_template else None
         error_template_valid = bool(
             error_parsed and error_parsed.scheme in ("http", "https") and error_parsed.netloc
+            and not re.search(r'[\r\n"<> ]', error_template)
         )
         if 80 not in self._confirmed and self._within_budget():
             if not error_template_valid:
