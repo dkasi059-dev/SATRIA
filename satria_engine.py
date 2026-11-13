@@ -1802,63 +1802,94 @@ class SatriaBaruScanner:
     # ------------------------------------------------------------------
     def scan(self) -> dict[str, Any]:
         self.crawl()
-        self.phase_visible_error(self.points)
-        self.phase_where_hidden(self.points)
-        self.phase_login_bypass()
-        self.phase_conditional_errors(self.points)
-        self.phase_conditional_responses(self.points)
-        self.phase_union_column_count(self.points)
-        self.phase_union_text_column(self.points)
-        self.phase_db_versions(self.points)
-        self.phase_listings(self.points)
-        self.phase_other_tables(self.points)
-        self.phase_time_delay(self.points)
-        self.phase_time_information(self.points)
-        self.phase_xml(self.points)
-        self.phase_oob(self.points)
-        # XSS scanning phases (30 tambahan)
-        self.phase_xss_reflected_html(self.points)
-        self.phase_xss_stored_html(self.points)
-        self.phase_xss_dom(self.points)
-        self.phase_xss_attribute(self.points)
-        self.phase_xss_javascript(self.points)
-        self.phase_xss_angularjs(self.points)
-        self.phase_xss_template_literal(self.points)
-        self.phase_xss_csp_bypass(self.points)
-        self.phase_xss_exploitation(self.points)
-        self.phase_xss_advanced(self.points)
-        # CSRF & Clickjacking (konservatif, berbasis bukti HTTP)
-        self.phase_csrf_defenses(self.pages)
-        self.phase_csrf_referer(self.pages)
-        self.phase_clickjacking(self.pages)
-        # DOM-based vulnerabilities (konservatif, analisis statis JS/HTML; tanpa eksekusi browser)
-        self.phase_dom_based(self.pages)
-        # CORS & XXE (konservatif, berbasis bukti respons/probe terkontrol; anti false positive)
-        self.phase_cors(self.pages)
-        self.phase_xxe(self.pages, self.points)
-        # HTTP request smuggling (konservatif, bukti diferensial/desync terverifikasi; anti false positive)
-        self.phase_smuggling(self.pages, self.points)
-        # SSRF (konservatif, bukti in-band/OOB terverifikasi; anti false positive)
-        self.phase_ssrf(self.pages, self.points)
-        # OS command injection & Web cache poisoning (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_os_command_injection(self.pages, self.points)
-        self.phase_web_cache_poisoning(self.pages, self.points)
-        # Information disclosure & HTTP Host header attacks (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_information_disclosure(self.pages, self.points)
-        self.phase_http_host_header_attacks(self.pages, self.points)
-        # NoSQL injection & JWT (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_nosql_injection(self.pages, self.points)
-        self.phase_jwt(self.pages, self.points)
-        # Access control vulnerabilities & Race conditions (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_access_control(self.pages, self.points)
-        self.phase_race_conditions(self.pages, self.points)
-        # Web LLM attacks & Web cache deception (konservatif, bukti terverifikasi; anti false positive)
-        self.phase_web_llm_attacks(self.pages, self.points)
-        self.phase_web_cache_deception(self.pages, self.points)
-        self.phase_file_upload_vulnerabilities(self.pages, self.points)
-        self.phase_prototype_pollution(self.pages, self.points)
-        self.phase_insecure_deserialization(self.pages, self.points)
-        self.phase_authentication(self.pages, self.points)
+
+        # Log per kategori mengikuti rentang yang sama dengan rekapitulasi PDF.
+        # Fase pemindaian asli dan urutannya tetap dipertahankan.
+        category_phases = [
+            (1,  18, "SQL injection", [
+                lambda: self.phase_visible_error(self.points),
+                lambda: self.phase_where_hidden(self.points),
+                lambda: self.phase_login_bypass(),
+                lambda: self.phase_conditional_errors(self.points),
+                lambda: self.phase_conditional_responses(self.points),
+                lambda: self.phase_union_column_count(self.points),
+                lambda: self.phase_union_text_column(self.points),
+                lambda: self.phase_db_versions(self.points),
+                lambda: self.phase_listings(self.points),
+                lambda: self.phase_other_tables(self.points),
+                lambda: self.phase_time_delay(self.points),
+                lambda: self.phase_time_information(self.points),
+                lambda: self.phase_xml(self.points),
+                lambda: self.phase_oob(self.points),
+            ]),
+            (19, 48, "Cross-site scripting (XSS)", [
+                lambda: self.phase_xss_reflected_html(self.points),
+                lambda: self.phase_xss_stored_html(self.points),
+                lambda: self.phase_xss_dom(self.points),
+                lambda: self.phase_xss_attribute(self.points),
+                lambda: self.phase_xss_javascript(self.points),
+                lambda: self.phase_xss_angularjs(self.points),
+                lambda: self.phase_xss_template_literal(self.points),
+                lambda: self.phase_xss_csp_bypass(self.points),
+                lambda: self.phase_xss_exploitation(self.points),
+                lambda: self.phase_xss_advanced(self.points),
+            ]),
+            (49, 59, "Cross-site request forgery (CSRF)", [
+                lambda: self.phase_csrf_defenses(self.pages),
+                lambda: self.phase_csrf_referer(self.pages),
+            ]),
+            (60, 64, "Clickjacking", [lambda: self.phase_clickjacking(self.pages)]),
+            (65, 71, "DOM-based vulnerabilities", [lambda: self.phase_dom_based(self.pages)]),
+            (72, 74, "Cross-origin resource sharing (CORS)", [lambda: self.phase_cors(self.pages)]),
+            (75, 83, "XML external entity (XXE) injection", [lambda: self.phase_xxe(self.pages, self.points)]),
+            (84, 90, "Server-side request forgery (SSRF)", [lambda: self.phase_ssrf(self.pages, self.points)]),
+            (91, 112, "HTTP request smuggling", [lambda: self.phase_smuggling(self.pages, self.points)]),
+            (113, 117, "OS command injection", [lambda: self.phase_os_command_injection(self.pages, self.points)]),
+            (118, 130, "Web cache poisoning", [lambda: self.phase_web_cache_poisoning(self.pages, self.points)]),
+            (131, 135, "Information disclosure", [lambda: self.phase_information_disclosure(self.pages, self.points)]),
+            (136, 142, "HTTP Host header attacks", [lambda: self.phase_http_host_header_attacks(self.pages, self.points)]),
+            (143, 146, "NoSQL injection", [lambda: self.phase_nosql_injection(self.pages, self.points)]),
+            (147, 154, "JWT", [lambda: self.phase_jwt(self.pages, self.points)]),
+            (155, 167, "Access control vulnerabilities", [lambda: self.phase_access_control(self.pages, self.points)]),
+            (168, 173, "Race conditions", [lambda: self.phase_race_conditions(self.pages, self.points)]),
+            (174, 181, "Web LLM attacks", [lambda: self.phase_web_llm_attacks(self.pages, self.points)]),
+            (182, 186, "Web cache deception", [lambda: self.phase_web_cache_deception(self.pages, self.points)]),
+            (187, 193, "File upload vulnerabilities", [lambda: self.phase_file_upload_vulnerabilities(self.pages, self.points)]),
+            (194, 203, "Prototype pollution", [lambda: self.phase_prototype_pollution(self.pages, self.points)]),
+            (204, 213, "Insecure deserialization", [lambda: self.phase_insecure_deserialization(self.pages, self.points)]),
+            (214, 227, "Authentication", [lambda: self.phase_authentication(self.pages, self.points)]),
+        ]
+
+        total_categories = len(category_phases)
+        for index, (start, end, label, phases) in enumerate(category_phases, 1):
+            criteria_total = sum(1 for item in CATALOG if start <= int(item[0]) <= end)
+            print(
+                f"[SCAN] [{index:02d}/{total_categories:02d}] MULAI: {label} "
+                f"({criteria_total} kriteria; nomor {start}-{end})",
+                flush=True,
+            )
+            phase_started = time.monotonic()
+            try:
+                for phase in phases:
+                    phase()
+            except Exception as exc:
+                elapsed = time.monotonic() - phase_started
+                confirmed = sum(1 for number in self._confirmed if start <= number <= end)
+                print(
+                    f"[SCAN] [{index:02d}/{total_categories:02d}] GAGAL: {label} "
+                    f"({confirmed}/{criteria_total} terkonfirmasi; {elapsed:.1f} dtk; "
+                    f"{type(exc).__name__}: {str(exc)[:160]})",
+                    flush=True,
+                )
+                raise
+            confirmed = sum(1 for number in self._confirmed if start <= number <= end)
+            elapsed = time.monotonic() - phase_started
+            print(
+                f"[SCAN] [{index:02d}/{total_categories:02d}] SELESAI: {label} — "
+                f"{confirmed}/{criteria_total} terkonfirmasi; {elapsed:.1f} dtk",
+                flush=True,
+            )
+
         return self.report()
 
     # ======================== XSS SCANNING PHASES (30 LABS) ========================
@@ -7907,33 +7938,52 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _xxe_file_marker(text: str):
-        """Marker isi file yang spesifik (bukan kata umum) untuk mengurangi false positive."""
+        """Kenali fingerprint file lokal yang cukup khas; hindari section/kata umum."""
         if not text:
             return None
-        checks = (
-            (re.compile(r"\broot:[^:\r\n]{0,40}:0:0:"), "/etc/passwd (root:x:0:0)"),
-            (re.compile(r"\bdaemon:[^:\r\n]{0,40}:1:1:"), "/etc/passwd (daemon)"),
-            (re.compile(r"for 16-bit app support", re.I), "Windows win.ini"),
-            (re.compile(r"(?im)^\s*\[(?:fonts|mci extensions)\]\s*$"), "Windows win.ini"),
+
+        # Baris root lengkap dari /etc/passwd; daemon saja tidak cukup spesifik.
+        root_line = re.search(
+            r"(?m)^root:[^:\r\n]*:0:0:[^:\r\n]*:/root:/[^:\r\n]+\s*$",
+            text,
         )
-        for pat, label in checks:
-            m = pat.search(text)
-            if m:
-                return label, m.group(0)
+        if root_line:
+            return "/etc/passwd (baris root UID/GID 0)", root_line.group(0).strip()
+
+        # win.ini: komentar khas atau kombinasi beberapa section, bukan [fonts] tunggal.
+        win_header = re.search(r"(?i)for 16-bit app support", text)
+        if win_header:
+            return "Windows win.ini", win_header.group(0)
+        sections = {
+            value.lower()
+            for value in re.findall(r"(?im)^\s*\[([^\]\r\n]+)\]\s*$", text)
+        }
+        if {"fonts", "mci extensions"}.issubset(sections):
+            return "Windows win.ini (section fonts + mci extensions)", "[fonts] + [mci extensions]"
         return None
 
     @staticmethod
     def _xxe_metadata_marker(text: str):
+        """Marker metadata cloud harus memuat format nilai yang khas, bukan nama field/path saja."""
         if not text:
             return None
+
+        access_key = re.search(r'"AccessKeyId"\s*:\s*"[^"\s]{8,}"', text, re.I)
+        secret_key = re.search(r'"SecretAccessKey"\s*:\s*"[^"\s]{12,}"', text, re.I)
+        if access_key and secret_key:
+            return "kredensial metadata IAM (AccessKeyId + SecretAccessKey)", (
+                access_key.group(0) + " | " + secret_key.group(0)
+            )
+
         checks = (
-            (re.compile(r'"(?:AccessKeyId|SecretAccessKey)"\s*:'), "kredensial metadata IAM"),
-            (re.compile(r"\b(?:ami-id|instance-id|placement/availability-zone)\b"), "metadata instance"),
+            (re.compile(r'''(?i)["']?(?:ami-id|imageId)["']?\s*[:=]\s*["']?ami-[0-9a-f]{8,}'''), "AMI instance metadata"),
+            (re.compile(r'''(?i)["']?(?:instance-id|instanceId)["']?\s*[:=]\s*["']?i-[0-9a-f]{8,}'''), "instance metadata"),
+            (re.compile(r'''(?i)["']?(?:placement/availability-zone|availabilityZone)["']?\s*[:=]\s*["']?[a-z]{2}(?:-gov)?-[a-z]+-[0-9][a-z]'''), "availability-zone metadata"),
         )
         for pat, label in checks:
-            m = pat.search(text)
-            if m:
-                return label, m.group(0)
+            match = pat.search(text)
+            if match:
+                return label, match.group(0)
         return None
 
     def _xxe_endpoints(self, pages: list[Page]) -> list[str]:
@@ -8176,7 +8226,9 @@ class SatriaBaruScanner:
                         body = raw.text or ""
                     except Exception:
                         continue
-                    if self._xxe_file_marker(body):
+                    upload_marker = self._xxe_file_marker(body)
+                    # Jangan anggap marker yang sudah ada pada halaman upload sebagai bukti XXE.
+                    if upload_marker and upload_marker[1] not in (page_resp.text or ""):
                         return action, str(fname), body
                     candidates: list[str] = [raw.url]
                     try:
@@ -8195,7 +8247,8 @@ class SatriaBaruScanner:
                         r2 = self._request("GET", cand, allow_redirects=True)
                         if r2.error or not r2.text:
                             continue
-                        if self._xxe_file_marker(r2.text):
+                        resource_marker = self._xxe_file_marker(r2.text)
+                        if resource_marker and resource_marker[1] not in (page_resp.text or ""):
                             return cand, str(fname), r2.text
         return None
 
