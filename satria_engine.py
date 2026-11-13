@@ -5894,19 +5894,65 @@ class SatriaBaruScanner:
 
         # ---- 170: multi-endpoint (tambah keranjang + kupon bersamaan) ----
         if 170 not in self._confirmed and session is not None and self._within_budget():
-            cart_url = urljoin(origin + "/", "cart")
-            coupon_url = urljoin(origin + "/", "cart/coupon")
-            if self._race_endpoint_exists(cart_url, session) and self._race_endpoint_exists(coupon_url, session):
-                add = {"productId": "1", "redir": "product", "quantity": "1"}
-                apply = {"coupon": "NEWCUST20"}
-                burst = self._race_burst(session, "POST", cart_url, [add] * 8, n=8)
-                burst += self._race_burst(session, "POST", coupon_url, [apply] * 4, n=4)
-                cart = self._request("GET", cart_url, session=session, allow_redirects=True)
-                low = (cart.text or "").lower()
-                if not cart.error and ("coupon" in low) and (("$0.00" in low) or ("total: $0" in low) or ("-$" in low)):
-                    self._race_mark(170, cart_url,
-                                    f"Multi-endpoint race condition terverifikasi: penambahan item dan kupon paralel "
-                                    f"menghasilkan total keranjang nol/negatif pada {cart_url}.", "race_multi_endpoint")
+            cart_forms = discovered_forms(
+                "product", "item", "quantity", action_terms=("cart/add", "add-to-cart", "basket/add")
+            )
+            coupon_forms = discovered_forms(
+                "coupon", "promo", "discount", action_terms=("coupon", "promo", "discount")
+            )
+            cart_candidates = [
+                (urljoin(form.page_url, form.action), form)
+                for form in cart_forms
+            ] or [(urljoin(origin + "/", "cart"), None)]
+            coupon_candidates = [
+                (urljoin(form.page_url, form.action), form)
+                for form in coupon_forms
+            ] or [(urljoin(origin + "/", "cart/coupon"), None)]
+            for cart_url, cart_form in cart_candidates[:3]:
+                for coupon_url, coupon_form in coupon_candidates[:3]:
+                    if not self._within_budget():
+                        break
+                    if not self._race_endpoint_exists(cart_url, session) or not self._race_endpoint_exists(coupon_url, session):
+                        continue
+                    add = (
+                        {name: value for name, value, _kind in cart_form.fields}
+                        if cart_form is not None else
+                        {"productId": "1", "redir": "product", "quantity": "1"}
+                    )
+                    if not any(any(k in name.lower() for k in ("product", "item", "id")) for name in add):
+                        add["productId"] = "1"
+                    if "quantity" in add:
+                        add["quantity"] = "1"
+                    apply = (
+                        {name: value for name, value, _kind in coupon_form.fields}
+                        if coupon_form is not None else {"coupon": "NEWCUST20"}
+                    )
+                    coupon_field = next(
+                        (name for name in apply if any(k in name.lower() for k in ("coupon", "promo", "discount"))),
+                        "coupon",
+                    )
+                    apply[coupon_field] = "NEWCUST20"
+                    burst = self._race_burst(
+                        session, cart_form.method.upper() if cart_form else "POST",
+                        cart_url, [add] * 8, n=8
+                    )
+                    burst += self._race_burst(
+                        session, coupon_form.method.upper() if coupon_form else "POST",
+                        coupon_url, [apply] * 4, n=4
+                    )
+                    cart_view = self._request(
+                        "GET", urljoin(origin + "/", "cart"), session=session, allow_redirects=True
+                    )
+                    low = (cart_view.text or "").lower()
+                    if not cart_view.error and "coupon" in low and (
+                        "$0.00" in low or "total: $0" in low or "-$" in low
+                    ):
+                        self._race_mark(170, cart_url,
+                                        f"Multi-endpoint race condition terverifikasi: penambahan item dan kupon paralel "
+                                        f"menghasilkan total keranjang nol/negatif pada {cart_url}.", "race_multi_endpoint")
+                        break
+                if 170 in self._confirmed:
+                    break
 
         # ---- 171: single-endpoint (dua nilai berbeda pada endpoint sama) ----
         if 171 not in self._confirmed and session is not None and self._within_budget():
