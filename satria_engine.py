@@ -4826,6 +4826,7 @@ class SatriaBaruScanner:
         pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
         forms: list[FormSpec] = []
+        self._jwt_login_artifacts = []
         for pg in pages[:40]:
             for form in getattr(pg, "forms", []) or []:
                 names = [str(n).lower() for n, _v, _t in getattr(form, "fields", ())]
@@ -4849,6 +4850,7 @@ class SatriaBaruScanner:
                               data=data, allow_redirects=True)
             if r.error:
                 continue
+            self._jwt_login_artifacts.append({"url": form.action, "text": r.text or "", "headers": dict(r.headers or {})})
             if any(self._jwt_decode(c.value) for c in sess.cookies if c.value):
                 return sess
             low = (r.text or "").lower()
@@ -5689,13 +5691,24 @@ class SatriaBaruScanner:
         import concurrent.futures
         import threading
         payloads = list(payloads) or [None]
-        total = n or len(payloads)
+        total = max(1, min(int(n or len(payloads)), 12))
+        if not self._same_origin(url):
+            return [Response(None, url, "", {}, 0.0, error="out_of_scope") for _ in range(total)]
         barrier = threading.Barrier(total)
+        budget_lock = threading.Lock()
         base_headers = dict(self.session.headers)
         if headers:
             base_headers.update(headers)
         base_headers.pop("Cache-Control", None)
         cookies = list(session.cookies) if session is not None else []
+
+        def reserve_request() -> bool:
+            with budget_lock:
+                if not self._within_budget():
+                    return False
+                self.request_count += 1
+                self.stats["requests"] = self.request_count
+                return True
 
         def worker(index: int) -> Response:
             sess = requests.Session()
@@ -5711,7 +5724,7 @@ class SatriaBaruScanner:
             except Exception:
                 pass
             started = time.monotonic()
-            if not self._within_budget():
+            if not reserve_request():
                 return Response(None, url, "", {}, 0.0, error="budget_exhausted")
             try:
                 kwargs: dict[str, Any] = {}
@@ -5720,13 +5733,9 @@ class SatriaBaruScanner:
                 else:
                     kwargs["data"] = payload
                 resp = sess.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
-                self.request_count += 1
-                self.stats["requests"] = self.request_count
                 return Response(resp.status_code, resp.url, resp.text or "", dict(resp.headers),
                                 time.monotonic() - started)
             except Exception as exc:
-                self.request_count += 1
-                self.stats["requests"] = self.request_count
                 return Response(None, url, "", {}, time.monotonic() - started,
                                 error=f"{type(exc).__name__}: {str(exc)[:120]}")
 
