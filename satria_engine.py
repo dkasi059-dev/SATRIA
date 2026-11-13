@@ -5958,20 +5958,44 @@ class SatriaBaruScanner:
             token_forms: list[FormSpec] = []
             for pg in pages[:30]:
                 for form in (getattr(pg, "forms", []) or []):
+                    if str(form.method).lower() != "post" or not self._same_origin(form.action):
+                        continue
                     if any("token" in str(n).lower() for n, _v, _t in form.fields):
                         token_forms.append(form)
             for form in token_forms[:4]:
                 if not self._within_budget():
                     break
-                data = {n: v for n, v, _t in form.fields}
-                token_field = next((n for n in data if "token" in n.lower()), "token")
-                data[token_field] = "satria" + uuid.uuid4().hex[:8]
-                burst = self._race_burst(session, form.method.upper() or "POST", form.action, [data] * 8, n=8)
-                accepted = [r for r in burst if self._race_ok(r) and not self._race_rejected(r)]
+                form_page = self._request("GET", form.page_url, session=session, allow_redirects=True)
+                if form_page.error or form_page.status != 200:
+                    continue
+                refreshed_forms = self._parse_forms(
+                    form.page_url, BeautifulSoup(form_page.text or "", "html.parser")
+                )
+                refreshed = next(
+                    (candidate for candidate in refreshed_forms
+                     if urljoin(candidate.page_url, candidate.action) == urljoin(form.page_url, form.action)),
+                    form,
+                )
+                data = {name: value for name, value, _kind in refreshed.fields}
+                token_field = next((name for name in data if "token" in name.lower()), None)
+                if not token_field or not data.get(token_field):
+                    continue
+                # Gunakan token valid yang benar-benar diterbitkan aplikasi; token acak
+                # akan menguji validasi token, bukan race pada pemakaian token.
+                burst = self._race_burst(
+                    session, refreshed.method.upper() or "POST",
+                    urljoin(refreshed.page_url, refreshed.action), [data] * 8, n=8
+                )
+                accepted = [
+                    r for r in burst
+                    if self._race_ok(r) and not self._race_rejected(r)
+                    and (r.status in (201, 202, 302, 303)
+                         or self._race_has(r, "success", "verified", "confirmed", "completed", "updated"))
+                ]
                 if len(accepted) >= 2:
-                    self._race_mark(172, form.action,
-                                    f"Time-sensitive race window terverifikasi: token yang sama diterima "
-                                    f"{len(accepted)}/8 kali pada {form.action}.", "race_time_sensitive")
+                    self._race_mark(172, refreshed.action,
+                                    f"Time-sensitive race window terverifikasi: token valid yang sama diterima "
+                                    f"{len(accepted)}/8 kali pada {refreshed.action}.", "race_time_sensitive")
                     break
 
         # ---- 173: partial construction pada registrasi (akun terbentuk dengan state parsial) ----
