@@ -11612,6 +11612,25 @@ def extract_tech_versions_deterministic(
         for match in re.finditer(pattern, asset_text, re.I):
             add(name, match.group(1), "Versioned asset")
 
+    # Banyak CDN/CMS menaruh versi di query string, bukan nama file.
+    query_version_pattern = re.compile(r"[?&](?:ver|version)=([0-9][0-9A-Za-z._+-]*)", re.I)
+    asset_name_rules = [
+        (r"(?:^|[/_.-])jquery(?:[./_-]|$)", "jQuery"),
+        (r"(?:^|[/_.-])bootstrap(?:[./_-]|$)", "Bootstrap"),
+        (r"(?:^|[/_.-])vue(?:[./_-]|$)", "Vue.js"),
+        (r"(?:^|[/_.-])react(?:-dom)?(?:[./_-]|$)", "React"),
+        (r"(?:^|[/_.-])angular(?:[./_-]|$)", "AngularJS"),
+    ]
+    for asset_url in asset_urls:
+        version_match = query_version_pattern.search(asset_url)
+        if not version_match:
+            continue
+        asset_path = urlparse(asset_url).path.lower()
+        for asset_pattern, tech_name in asset_name_rules:
+            if re.search(asset_pattern, asset_path, re.I):
+                add(tech_name, version_match.group(1), "Versioned asset query")
+                break
+
     for match in re.finditer(
         r"cdn\.jsdelivr\.net/npm/([a-zA-Z0-9_@/-]+)@([0-9][0-9A-Za-z._+-]*)",
         asset_text, re.I,
