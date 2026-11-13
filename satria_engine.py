@@ -7035,12 +7035,36 @@ class SatriaBaruScanner:
                       url=url, name="authentication", original="", page_url=url, method="POST", interest=7)
         self._mark(num, point, ev, method_name)
 
+    @staticmethod
+    def _auth_form_fields(form) -> dict[str, dict[str, str]]:
+        """Normalisasi field form autentikasi: FormSpec memakai tuple (name, value, type)."""
+        normalized: dict[str, dict[str, str]] = {}
+        for field_item in getattr(form, "fields", []) or []:
+            if isinstance(field_item, dict):
+                name = field_item.get("name")
+                value = field_item.get("value", "")
+                field_type = field_item.get("type", "")
+            elif isinstance(field_item, (tuple, list)) and len(field_item) >= 3:
+                name, value, field_type = field_item[0], field_item[1], field_item[2]
+            else:
+                continue
+            if not name:
+                continue
+            field_name = str(name)
+            normalized[field_name] = {
+                "name": field_name,
+                "value": str(value or ""),
+                "type": str(field_type or "").lower(),
+            }
+        return normalized
+
     def _find_login_forms(self, pages: list[Page]):
         forms = []
         seen = set()
         for pg in pages[:30]:
             for f in getattr(pg,'forms',[])[:10]:
-                names = [str(x.get('name','')).lower() for x in getattr(f,'fields',[])]
+                fields = self._auth_form_fields(f)
+                names = [name.lower() for name in fields]
                 if not any(n in names for n in ('username','user','email','login')):
                     continue
                 if not any(n in names for n in ('password','pass','pwd')):
@@ -7048,7 +7072,6 @@ class SatriaBaruScanner:
                 action = getattr(f,'action','') or getattr(pg,'url','')
                 if action in seen: continue
                 seen.add(action)
-                fields = {x.get('name'): x for x in getattr(f,'fields',[]) if x.get('name')}
                 forms.append((action, getattr(f,'method','POST') or 'POST', fields, getattr(pg,'url','')))
         return forms[:4]
 
@@ -7058,13 +7081,13 @@ class SatriaBaruScanner:
         for pg in pages[:30]:
             u = getattr(pg,'url','') or ''
             for f in getattr(pg,'forms',[])[:10]:
-                names = [str(x.get('name','')).lower() for x in getattr(f,'fields',[])]
+                fields = self._auth_form_fields(f)
+                names = [name.lower() for name in fields]
                 txt = (u + ' ' + (getattr(f,'action','') or '')).lower()
                 if 'reset' in txt or 'forgot' in txt or any('reset' in n or 'token' in n for n in names):
                     action = getattr(f,'action','') or u
                     if action in seen: continue
                     seen.add(action)
-                    fields = {x.get('name'): x for x in getattr(f,'fields',[]) if x.get('name')}
                     forms.append((action, getattr(f,'method','POST') or 'POST', fields, u))
         return forms[:4]
 
@@ -7222,11 +7245,12 @@ class SatriaBaruScanner:
                 u=(getattr(pg,'url','') or '')
                 if '2fa' not in u.lower() and 'verify' not in u.lower(): continue
                 for f in getattr(pg,'forms',[])[:6]:
-                    names=[x.get('name','') for x in getattr(f,'fields',[])]
-                    if not any('code' in (n or '').lower() or 'otp' in (n or '').lower() or 'mfa' in (n or '').lower() for n in names):
+                    form_fields = self._auth_form_fields(f)
+                    names = list(form_fields)
+                    if not any('code' in n.lower() or 'otp' in n.lower() or 'mfa' in n.lower() for n in names):
                         continue
                     action = getattr(f,'action','') or u
-                    data = {n:(f.get('value') if False else '0000') for n in names if n}
+                    data = {n: '0000' for n in names}
                     for n in names:
                         if n and ('user' in n.lower() or 'account' in n.lower()): data[n]='carlos'
                     try: r=self._request('POST', action, data=data, allow_redirects=False)
@@ -7260,11 +7284,12 @@ class SatriaBaruScanner:
                 u=(getattr(pg,'url','') or '')
                 if 'change' not in u.lower() and 'password' not in u.lower(): continue
                 for f in getattr(pg,'forms',[])[:6]:
-                    names=[(x.get('name') or '').lower() for x in getattr(f,'fields',[])]
+                    form_fields = self._auth_form_fields(f)
+                    names = [name.lower() for name in form_fields]
                     if not any('current' in n or 'old' in n for n in names): continue
                     action=getattr(f,'action','') or u
-                    curf=pick({x.get('name'):x for x in getattr(f,'fields',[]) if x.get('name')}, ['current','current-password','old','password'])
-                    nf=pick({x.get('name'):x for x in getattr(f,'fields',[]) if x.get('name')}, ['new-password','new_password','new'])
+                    curf=pick(form_fields, ['current','current-password','old','password'])
+                    nf=pick(form_fields, ['new-password','new_password','new'])
                     if not curf or not nf: continue
                     try:
                         r1=self._request('POST', action, data={curf:'wrong'+token, nf:'Aa1!'+token}, allow_redirects=False)
@@ -7295,7 +7320,8 @@ class SatriaBaruScanner:
                 u=(getattr(pg,'url','') or '')
                 if '2fa' not in u.lower() and 'verify' not in u.lower(): continue
                 for f in getattr(pg,'forms',[])[:6]:
-                    names=[x.get('name','') for x in getattr(f,'fields',[])]
+                    form_fields = self._auth_form_fields(f)
+                    names = list(form_fields)
                     codef = None
                     for n in names:
                         if n and ('code' in n.lower() or 'otp' in n.lower() or 'mfa' in n.lower()): codef=n; break
@@ -10492,7 +10518,11 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
                 if not page_ct and isinstance(page_http, dict):
                     page_http.setdefault("content_type", "-")
 
-                page_tech = extract_tech_versions_deterministic(page_html) or []
+                page_tech = extract_tech_versions_deterministic(
+                    page_html,
+                    headers=(page_http or {}).get("headers") or {},
+                    cookies=(page_http or {}).get("cookies") or [],
+                ) or []
                 ht = (page_http or {}).get("technologies") or []
                 if isinstance(ht, list):
                     for t in ht:
@@ -10595,6 +10625,35 @@ def run_pipeline(scrape_data: dict[str, Any] | None = None, *, url: str | None =
             engine_scan["per_page_main_scans"] = per_page_main
             engine_scan["per_page_full_reports"] = per_page_full
             engine_scan["site_wide_findings"] = site_wide_findings
+
+            # Gabungkan fingerprint teknologi dari fetch awal dan hasil analisis
+            # halaman utama; PDF membaca daftar ini dari engine_scan.technology.
+            tech_by_name: dict[str, dict] = {}
+            for tech in list(engine_scan.get("technologies") or []) + [
+                item
+                for page_item in per_page_main
+                for item in (page_item.get("technologies") or [])
+            ]:
+                if isinstance(tech, dict):
+                    tech_name = str(tech.get("name") or "").strip()
+                    tech_version = str(tech.get("version") or "unknown").strip() or "unknown"
+                    tech_source = str(tech.get("source") or "Fingerprint")
+                elif tech:
+                    tech_name, tech_version, tech_source = str(tech).strip(), "unknown", "Fingerprint"
+                else:
+                    continue
+                if not tech_name:
+                    continue
+                tech_key = tech_name.casefold()
+                current = tech_by_name.get(tech_key)
+                candidate = {"name": tech_name, "version": tech_version, "source": tech_source}
+                if current is None or (
+                    current.get("version", "unknown").lower() == "unknown"
+                    and tech_version.lower() != "unknown"
+                ):
+                    tech_by_name[tech_key] = candidate
+            engine_scan["technologies"] = list(tech_by_name.values())
+
             agg_cves=[]; seen_c=set()
             for pe in per_page_main:
                 for c in (pe.get("cves") or []):
@@ -11387,39 +11446,189 @@ def repair_json(json_str: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX #12 — Deteksi teknologi deterministik
 # ══════════════════════════════════════════════════════════════════════════════
-def extract_tech_versions_deterministic(html: str) -> list[dict]:
+def extract_tech_versions_deterministic(
+    html: str,
+    headers: dict | None = None,
+    cookies: list | None = None,
+) -> list[dict]:
+    """Fingerprint teknologi dari HTML, asset, meta, header HTTP, dan cookie.
+
+    Versi hanya diisi bila benar-benar terlihat pada respons. Fingerprint tanpa
+    versi dicatat sebagai "unknown" agar teknologi tidak hilang dari laporan
+    hanya karena aplikasi menyembunyikan nomor versinya.
+    """
+    html = str(html or "")
+    headers = headers if isinstance(headers, dict) else {}
+    header_map = {str(k).lower(): str(v or "") for k, v in headers.items()}
     found: dict[str, dict] = {}
 
-    def add(name: str, version: str, source: str = "Regex") -> None:
-        if name and version and name not in found:
-            found[name] = {"name": name, "version": version, "source": source}
+    def add(name: str, version: str = "unknown", source: str = "HTML fingerprint") -> None:
+        clean_name = re.sub(r"\\s+", " ", str(name or "")).strip()
+        clean_version = str(version or "unknown").strip() or "unknown"
+        if not clean_name:
+            return
+        key = clean_name.casefold()
+        current = found.get(key)
+        candidate = {"name": clean_name, "version": clean_version, "source": source}
+        if current is None or (
+            current.get("version") == "unknown" and clean_version.lower() != "unknown"
+        ):
+            found[key] = candidate
 
-    for m in re.finditer(r'<meta name="generator" content="WordPress ([\d.]+)"', html, re.I):
-        add("WordPress", m.group(1))
+    def add_from_header(header_name: str, value: str) -> None:
+        if not value:
+            return
+        patterns = [
+            (r"\\bnginx(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "Nginx"),
+            (r"\\bApache(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "Apache HTTP Server"),
+            (r"\\bOpenResty(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "OpenResty"),
+            (r"\\bLiteSpeed(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "LiteSpeed"),
+            (r"\\bMicrosoft-IIS(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "Microsoft IIS"),
+            (r"\\bCaddy(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "Caddy"),
+            (r"\\bPHP(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "PHP"),
+            (r"\\b(?:ASP\\.NET|ASP.NET Core)(?:/|\\s+)([0-9][0-9A-Za-z._+-]*)", "ASP.NET"),
+        ]
+        for pattern, name in patterns:
+            match = re.search(pattern, value, re.I)
+            if match:
+                add(name, match.group(1), f"HTTP {header_name}")
+
+        low = value.lower()
+        for token, name in (
+            ("nginx", "Nginx"), ("apache", "Apache HTTP Server"),
+            ("openresty", "OpenResty"), ("litespeed", "LiteSpeed"),
+            ("microsoft-iis", "Microsoft IIS"), ("caddy", "Caddy"),
+            ("cloudflare", "Cloudflare"), ("envoy", "Envoy"),
+            ("express", "Express.js"), ("asp.net", "ASP.NET"),
+            ("next.js", "Next.js"),
+        ):
+            if token in low:
+                add(name, "unknown", f"HTTP {header_name}")
+
+    for header_name in ("server", "x-powered-by", "x-aspnet-version", "x-generator",
+                        "x-drupal-cache", "x-shopify-stage"):
+        value = header_map.get(header_name, "")
+        if value:
+            add_from_header(header_name, value)
+    if header_map.get("x-aspnet-version"):
+        add("ASP.NET", header_map["x-aspnet-version"], "HTTP x-aspnet-version")
+
+    # Parse markup attributes independently of their order and quote style.
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        soup = None
+    if soup is not None:
+        for meta in soup.find_all("meta"):
+            generator = str(meta.get("content") or "").strip()
+            meta_name = str(meta.get("name") or meta.get("property") or "").lower()
+            if meta_name == "generator" and generator:
+                matched = False
+                for pattern, tech_name in (
+                    (r"WordPress\\s*([0-9][0-9A-Za-z._+-]*)", "WordPress"),
+                    (r"Drupal\\s*([0-9][0-9A-Za-z._+-]*)", "Drupal"),
+                    (r"Joomla!?\\s*([0-9][0-9A-Za-z._+-]*)", "Joomla"),
+                    (r"PrestaShop\\s*([0-9][0-9A-Za-z._+-]*)", "PrestaShop"),
+                    (r"Magento\\s*([0-9][0-9A-Za-z._+-]*)", "Magento"),
+                    (r"Ghost\\s*([0-9][0-9A-Za-z._+-]*)", "Ghost"),
+                ):
+                    match = re.search(pattern, generator, re.I)
+                    if match:
+                        add(tech_name, match.group(1), "Meta generator")
+                        matched = True
+                        break
+                if not matched:
+                    for token, tech_name in (
+                        ("wordpress", "WordPress"), ("drupal", "Drupal"),
+                        ("joomla", "Joomla"), ("prestashop", "PrestaShop"),
+                        ("magento", "Magento"), ("shopify", "Shopify"),
+                        ("ghost", "Ghost"), ("hugo", "Hugo"),
+                        ("jekyll", "Jekyll"), ("webflow", "Webflow"),
+                        ("wix", "Wix"), ("squarespace", "Squarespace"),
+                    ):
+                        if token in generator.lower():
+                            add(tech_name, "unknown", "Meta generator")
+                            break
+
+        asset_urls = []
+        for element in soup.find_all(["script", "link"]):
+            asset_url = element.get("src") or element.get("href")
+            if asset_url:
+                asset_urls.append(str(asset_url))
+        # Include inline markup text / data markers as well as external asset URLs.
+        asset_text = "\\n".join(asset_urls) + "\\n" + html
+    else:
+        asset_text = html
+        asset_urls = []
+
+    # Frameworks/CMS with reliable, recognizable DOM or resource markers.
+    low_html = html.lower()
+    marker_rules = [
+        (("/wp-content/", "/wp-includes/", "wp-json"), "WordPress"),
+        (("/core/misc/drupal.js", "drupalsettings", "/sites/default/files/"), "Drupal"),
+        (("/media/system/js/", "/components/com_", "joomla!"), "Joomla"),
+        (("mage/cookies", "magento_", "/static/version"), "Magento"),
+        (("cdn.shopify.com", "shopify.theme", "shopify-features"), "Shopify"),
+        (("/_next/static/", "__next_data__"), "Next.js"),
+        (("/_nuxt/", "__nuxt__"), "Nuxt"),
+        (("ng-version=", "ng-app=", "ng-version ="), "Angular"),
+        (("data-reactroot", "__react", "react-dom"), "React"),
+        (("data-v-app", "__vue__", "vue.runtime"), "Vue.js"),
+        (("cdn.tailwindcss.com", "tailwindcss"), "Tailwind CSS"),
+        (("bootstrap.min.css", "bootstrap.bundle", "bootstrap.min.js"), "Bootstrap"),
+        (("jquery.min.js", "jquery-", "jquery.js"), "jQuery"),
+    ]
+    for markers, name in marker_rules:
+        if any(marker in low_html for marker in markers):
+            add(name, "unknown", "HTML/resource marker")
+
+    angular_version = re.search(r"\\bng-version\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]", html, re.I)
+    if angular_version:
+        add("Angular", angular_version.group(1), "ng-version attribute")
 
     alias = {"wordpress-seo": "Yoast SEO"}
-    for m in re.finditer(r"/wp-content/plugins/([a-zA-Z0-9_\-]+)/[^\"']*?[?&]ver="
-                         r"([0-9][0-9A-Za-z.\-]*)", html, re.I):
+    for m in re.finditer(r"/wp-content/plugins/([a-zA-Z0-9_\\-]+)/[^\\\"']*?[?&]ver="
+                         r"([0-9][0-9A-Za-z.\\-]*)", html, re.I):
         slug, ver = m.group(1), m.group(2)
-        add(alias.get(slug.lower(), slug), ver)
+        add(alias.get(slug.lower(), slug), ver, "WordPress plugin asset")
 
-    for m in re.finditer(r"/wp-content/themes/([a-zA-Z0-9_\-]+)/[^\"']*?[?&]ver="
-                         r"([0-9][0-9A-Za-z.\-]*)", html, re.I):
-        add(m.group(1), m.group(2))
+    for m in re.finditer(r"/wp-content/themes/([a-zA-Z0-9_\\-]+)/[^\\\"']*?[?&]ver="
+                         r"([0-9][0-9A-Za-z.\\-]*)", html, re.I):
+        add(m.group(1), m.group(2), "WordPress theme asset")
 
     js_libs = [
-        (r"jquery[.-]?([\d.]+)(?:\.min)?\.js", "jQuery"),
-        (r"bootstrap[.-]?([\d.]+)(?:\.min)?\.(?:css|js)", "Bootstrap"),
-        (r"vue[.-]?([\d.]+)(?:\.min)?\.js", "Vue.js"),
-        (r"react[.-]?([\d.]+)(?:\.min)?\.js", "React"),
-        (r"angular[.-]?([\d.]+)(?:\.min)?\.js", "AngularJS"),
+        (r"jquery[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.js", "jQuery"),
+        (r"jquery[-.]([0-9]+(?:\\.[0-9]+){1,3})", "jQuery"),
+        (r"bootstrap[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.(?:css|js)", "Bootstrap"),
+        (r"bootstrap[-.]([0-9]+(?:\\.[0-9]+){1,3})", "Bootstrap"),
+        (r"vue[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.js", "Vue.js"),
+        (r"react[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.js", "React"),
+        (r"angular[.-]?([0-9][0-9A-Za-z.]*) (?:\\.min)?\\.js", "AngularJS"),
     ]
+    normalized_asset_text = re.sub(r"\\s+", " ", asset_text)
     for pattern, name in js_libs:
-        for m in re.finditer(pattern, html, re.I):
-            add(name, m.group(1))
+        for match in re.finditer(pattern, normalized_asset_text, re.I):
+            add(name, match.group(1), "Versioned asset")
 
-    for m in re.finditer(r"cdn\.jsdelivr\.net/npm/([a-zA-Z0-9_-]+)@([\d.]+)", html, re.I):
-        add(m.group(1), m.group(2), source="Regex-NPM")
+    # CDN URL patterns commonly expose package/version explicitly.
+    for match in re.finditer(r"cdn\\.jsdelivr\\.net/npm/([a-zA-Z0-9_@/-]+)@([0-9][0-9A-Za-z._+-]*)", asset_text, re.I):
+        add(match.group(1).split("/")[-1], match.group(2), "jsDelivr package URL")
+
+    # Cookie names are useful indicators, but never invent a version from them.
+    cookie_names = {
+        str(item.get("name") or "").lower()
+        for item in (cookies or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    cookie_rules = [
+        ("laravel_session", "Laravel"), ("symfony", "Symfony"),
+        ("django_session", "Django"), ("csrftoken", "Django"),
+        ("asp.net_sessionid", "ASP.NET"), ("phpsessid", "PHP"),
+    ]
+    for cookie_name in cookie_names:
+        for marker, tech_name in cookie_rules:
+            if marker in cookie_name:
+                add(tech_name, "unknown", "Session cookie fingerprint")
 
     return list(found.values())
 
@@ -17038,7 +17247,11 @@ def _run_pipeline_impl(scrape_data: Optional[dict] = None, *, url: Optional[str]
 
     # ── Section 4: teknologi & CVE (opsional) ────────────────────────────────
     print("[5/10] Mengidentifikasi teknologi dan mencari CVE ...", flush=True)
-    technologies = extract_tech_versions_deterministic(page_html)
+    technologies = extract_tech_versions_deterministic(
+        page_html,
+        headers=(http_result or {}).get("headers") or {},
+        cookies=(http_result or {}).get("cookies") or [],
+    )
     cves: list[dict] = []
     if RUN_NVD or RUN_CENSYS:
         for tech_idx, tech in enumerate(technologies[:10], start=1):
@@ -21018,7 +21231,11 @@ def _collect_engine_scan_results(target_url: str, html: str = "", http_result: d
 
     try:
         if fetched_html:
-            out["technologies"] = extract_tech_versions_deterministic(fetched_html) or []
+            out["technologies"] = extract_tech_versions_deterministic(
+                fetched_html,
+                headers=(out.get("engine_http") or {}).get("headers") or {},
+                cookies=(out.get("engine_http") or {}).get("cookies") or [],
+            ) or []
     except Exception as e:
         out["engine_errors"].append(f"extract_tech_versions_deterministic: {type(e).__name__}: {e}")
 
