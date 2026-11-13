@@ -7321,8 +7321,13 @@ class SatriaBaruScanner:
                     k, v = line.split(b":", 1)
                     headers[k.decode("latin-1", "ignore").strip().lower()] = v.decode("latin-1", "ignore").strip()
             body = b""
-            if 100 <= status < 200 or status in (204, 304):
+            if 100 <= status < 200 and status != 101:
+                # Interim response (mis. 100 Continue) bukan respons request final;
+                # jangan dihitung sebagai slot respons kedua pada tes desync.
                 data = rest
+                continue
+            if status in (101, 204, 304):
+                data = b""
             elif "chunked" in headers.get("transfer-encoding", "").lower():
                 body, used = self._smug_dechunk(rest)
                 if body is None:
