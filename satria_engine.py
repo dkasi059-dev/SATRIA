@@ -704,6 +704,10 @@ class SatriaBaruScanner:
         self.max_pages = max(1, min(max_pages, 40))
         self.max_points = max(4, min(max_points, 60))
         self.max_requests = max(100, min(max_requests, 1200))
+        # SQL Injection tetap memakai kuota global lama. Setiap kategori
+        # non-SQL memperoleh kuota sendiri agar SQL tidak menghabiskan
+        # seluruh request budget sebelum kategori lain sempat berjalan.
+        self.non_sql_category_request_limit = max(16, min(32, self.max_requests // 22))
         self.timeout = max(3.0, min(timeout, 30.0))
         self.time_delay = max(1.0, min(time_delay, 8.0))
         self.request_count = 0
@@ -776,7 +780,20 @@ class SatriaBaruScanner:
         return is_same_origin(url, self.target_url)
 
     def _within_budget(self) -> bool:
-        return self.request_count < self.max_requests and (time.monotonic() - self.started) < self.deadline_seconds
+        category = self._scan_progress
+        if category and int(category.get("index", 1)) > 1:
+            # Kuota kategori dihitung dari awal kategori ini, bukan dari total
+            # request yang sudah dipakai discovery dan SQL Injection.
+            category_start = int(category.get("request_start", self.request_count))
+            category_limit = int(category.get(
+                "request_limit", self.non_sql_category_request_limit
+            ))
+            request_budget_ok = (self.request_count - category_start) < category_limit
+        else:
+            # Discovery dan SQL Injection mempertahankan anggaran global lama.
+            request_budget_ok = self.request_count < self.max_requests
+        time_budget_ok = (time.monotonic() - self.started) < self.deadline_seconds
+        return request_budget_ok and time_budget_ok
 
     def _scan_progress_event(self, message: str) -> None:
         """Cetak progres probe hanya selama kategori pemindaian aktif."""
@@ -1888,7 +1905,15 @@ class SatriaBaruScanner:
         for index, (start, end, label, phases) in enumerate(category_phases, 1):
             criteria_total = sum(1 for item in CATALOG if start <= int(item[0]) <= end)
             self._scan_progress = {
-                "index": index, "total": total_categories, "label": label, "event_seq": 0
+                "index": index,
+                "total": total_categories,
+                "label": label,
+                "event_seq": 0,
+                "request_start": self.request_count,
+                "request_limit": (
+                    self.max_requests if index == 1
+                    else self.non_sql_category_request_limit
+                ),
             }
             print(
                 f"[SCAN] [{index:02d}/{total_categories:02d}] MULAI: {label} "
