@@ -4829,14 +4829,19 @@ class SatriaBaruScanner:
         self._jwt_login_artifacts = []
         for pg in pages[:40]:
             for form in getattr(pg, "forms", []) or []:
+                action = urljoin(getattr(form, "page_url", getattr(pg, "url", "")), getattr(form, "action", "") or "")
+                # Jangan kirim kredensial ke form GET atau endpoint di luar origin.
+                if str(getattr(form, "method", "")).lower() != "post" or not self._same_origin(action):
+                    continue
                 names = [str(n).lower() for n, _v, _t in getattr(form, "fields", ())]
                 if any(n in names for n in ("username", "user", "email", "login")) and \
                    any(n in names for n in ("password", "pass", "pwd")):
-                    forms.append(form)
+                    forms.append(FormSpec(form.page_url, action, form.method, form.fields, form.has_password))
         forms.append(FormSpec(urljoin(origin + "/", "login"), urljoin(origin + "/", "login"), "POST", (), False))
         for form in forms[:5]:
             sess = self._jwt_anon_session()
-            page = self._request("GET", form.action, session=sess, allow_redirects=True)
+            # Ambil halaman tempat form dirender (bukan endpoint POST-nya).
+            page = self._request("GET", form.page_url, session=sess, allow_redirects=True)
             if page.error:
                 continue
             names = [str(n) for n, _v, _t in form.fields]
@@ -5381,12 +5386,16 @@ class SatriaBaruScanner:
         seen: set[str] = set()
         for pg in pages[:40]:
             for form in getattr(pg, "forms", []) or []:
+                action = urljoin(getattr(form, "page_url", getattr(pg, "url", "")), getattr(form, "action", "") or "")
+                # Jangan kirim kredensial ke form GET atau endpoint di luar origin.
+                if str(getattr(form, "method", "")).lower() != "post" or not self._same_origin(action):
+                    continue
                 names = [str(n).lower() for n, _v, _t in getattr(form, "fields", ())]
                 if any(n in names for n in ("username", "user", "email", "login")) and \
                    any(n in names for n in ("password", "pass", "pwd")):
-                    if form.action not in seen:
-                        seen.add(form.action)
-                        forms.append(form)
+                    if action not in seen:
+                        seen.add(action)
+                        forms.append(FormSpec(form.page_url, action, form.method, form.fields, form.has_password))
         for path in ("/login", "/signin", "/account/login"):
             u = urljoin(origin + "/", path.lstrip("/"))
             if u not in seen:
@@ -5401,7 +5410,8 @@ class SatriaBaruScanner:
                 if not hasattr(self, "_wcp_clone_session"):
                     sess.headers.update(dict(self.session.headers))
                 try:
-                    page = self._request("GET", form.action, session=sess, allow_redirects=True)
+                    # Ambil halaman form agar token CSRF dan hidden field berasal dari sumbernya.
+                    page = self._request("GET", form.page_url, session=sess, allow_redirects=True)
                 except Exception:
                     continue
                 if page.error:
