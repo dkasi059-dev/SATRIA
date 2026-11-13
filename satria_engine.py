@@ -5796,6 +5796,8 @@ class SatriaBaruScanner:
             for page in pages[:40]:
                 for form in (getattr(page, "forms", []) or []):
                     action = urljoin(getattr(page, "url", origin + "/"), form.action or "")
+                    if str(form.method).lower() != "post":
+                        continue
                     if not self._same_origin(action) or action in seen_actions:
                         continue
                     names = [str(name).lower() for name, _value, _kind in (form.fields or ())]
