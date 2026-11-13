@@ -4872,9 +4872,12 @@ class SatriaBaruScanner:
             add(cookie.value, "cookie", cookie.name)
         for cookie in self.session.cookies:
             add(cookie.value, "cookie", cookie.name)
+        # Kompak JWT tidak selalu diawali "eyJ"; seluruh kandidat divalidasi
+        # dengan decoder JSON header/payload sebelum dipakai.
+        token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
         targets = [self.target_url]
         targets += [getattr(p, "url", "") for p in pages[:10] if getattr(p, "url", "")]
-        for u in targets[:6]:
+        for u in targets[:8]:
             if not self._within_budget():
                 break
             r = self._request("GET", u, session=sess or self.session, allow_redirects=True)
@@ -4883,8 +4886,9 @@ class SatriaBaruScanner:
             blob = str(r.headers.get("Set-Cookie", "") or "") + "\n" + str(r.headers.get("set-cookie", "") or "")
             for m in re.finditer(r'([A-Za-z0-9_\-]+)=([A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)', blob):
                 add(m.group(2), "cookie", m.group(1))
+            for m in re.finditer(token_pattern, r.text or ""):
+                add(m.group(1), "response", "session")
         # Snapshot cookie, HTML, JavaScript, dan header dari crawler.
-        token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
         for pg in pages[:30]:
             for cookie_name, cookie_value in (getattr(pg, "cookie_names", {}) or {}).items():
                 add(cookie_value, "cookie", cookie_name)
@@ -6166,7 +6170,16 @@ class SatriaBaruScanner:
                 probe = self._request(
                     "POST", login_url, session=session, data=login_data, allow_redirects=False
                 )
-                if probe.status in (200, 302) and not self._race_has(
+                probe_location = str((probe.headers or {}).get("Location", "")).lower()
+                login_success = (
+                    probe.status in (302, 303)
+                    and bool(probe_location)
+                    and not any(word in probe_location for word in ("login", "signin", "sign-in"))
+                ) or (
+                    probe.status == 200
+                    and self._race_has(probe, "log out", "logout", "my account", "welcome", "your account")
+                )
+                if login_success and not self._race_has(
                     probe, "invalid", "incorrect", "failed", "password required", "unauthorized"
                 ):
                     self._race_mark(173, reg,
