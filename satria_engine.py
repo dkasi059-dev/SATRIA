@@ -4858,6 +4858,18 @@ class SatriaBaruScanner:
             self._jwt_login_artifacts.append({"url": form.action, "text": r.text or "", "headers": dict(r.headers or {})})
             if any(self._jwt_decode(c.value) for c in sess.cookies if c.value):
                 return sess
+            token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{2,}\\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
+            token = next((candidate for candidate in re.findall(token_pattern, r.text or "")
+                          if self._jwt_decode(candidate)), None)
+            if token:
+                sess.headers["Authorization"] = "Bearer " + token
+                return sess
+            for header_name, header_value in (r.headers or {}).items():
+                if str(header_name).lower() == "authorization":
+                    match = re.search(token_pattern, str(header_value or ""))
+                    if match and self._jwt_decode(match.group(1)):
+                        sess.headers["Authorization"] = "Bearer " + match.group(1)
+                        return sess
             low = (r.text or "").lower()
             if "log out" in low or "logout" in low or "my account" in low:
                 return sess
@@ -4980,6 +4992,12 @@ class SatriaBaruScanner:
     def phase_jwt(self, pages: list[Page], points: list[Point]) -> None:
         if not self._within_budget():
             return
+        # JWT needs login, token discovery, anonymous baselines and several
+        # independent validation requests. Keep this allowance local to JWT.
+        if isinstance(self._scan_progress, dict):
+            self._scan_progress["request_limit"] = max(
+                int(self._scan_progress.get("request_limit", self.non_sql_category_request_limit)), 80
+            )
         pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
         auth = self._jwt_login(pages)
@@ -5091,8 +5109,6 @@ class SatriaBaruScanner:
             dec = self._jwt_decode(token)
             if not dec or not self._within_budget():
                 continue
-            if len(self._confirmed) >= 2:
-                break
             header = dict(dec["header"] or {})
             payload = dict(dec["payload"] or {})
             parts = dec["parts"]
@@ -5402,10 +5418,14 @@ class SatriaBaruScanner:
                 seen.add(u)
                 forms.append(FormSpec(u, u, "POST", (), False))
         for form in forms[:6]:
+            if not self._within_budget():
+                break
             names = [str(n) for n, _v, _t in form.fields]
             uf = next((n for n in names if n.lower() in ("username", "user", "email", "login")), "username")
             pf = next((n for n in names if n.lower() in ("password", "pass", "pwd")), "password")
             for user, pw in (("wiener", "peter"), ("carlos", "hunter2")):
+                if not self._within_budget():
+                    break
                 sess = self._wcp_clone_session() if hasattr(self, "_wcp_clone_session") else requests.Session()
                 if not hasattr(self, "_wcp_clone_session"):
                     sess.headers.update(dict(self.session.headers))
@@ -5424,6 +5444,13 @@ class SatriaBaruScanner:
                                   data=data, allow_redirects=True)
                 if r.error:
                     continue
+                token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{2,}\\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
+                token = next((candidate for candidate in re.findall(token_pattern, r.text or "")
+                              if self._jwt_decode(candidate)), None)
+                if token:
+                    sess.headers["Authorization"] = "Bearer " + token
+                    self._ac_session_cache = sess
+                    return sess
                 low = (r.text or "").lower()
                 if any(k in low for k in ("log out", "logout", "my account", "your account",
                                           "welcome back", "admin panel", "update email")):
@@ -5727,6 +5754,8 @@ class SatriaBaruScanner:
         barrier = threading.Barrier(total)
         budget_lock = threading.Lock()
         base_headers = dict(self.session.headers)
+        if session is not None:
+            base_headers.update(dict(session.headers))
         if headers:
             base_headers.update(headers)
         base_headers.pop("Cache-Control", None)
@@ -5793,6 +5822,8 @@ class SatriaBaruScanner:
         barrier = threading.Barrier(len(specs))
         budget_lock = threading.Lock()
         base_headers = dict(self.session.headers)
+        if session is not None:
+            base_headers.update(dict(session.headers))
         base_headers.pop("Cache-Control", None)
         cookies = list(session.cookies) if session is not None else []
 
@@ -5837,31 +5868,53 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _race_ok(resp: Response | None) -> bool:
-        return bool(resp) and not resp.error and resp.status in (200, 201, 202, 302, 303)
+        return bool(resp) and not resp.error and resp.status in (
+            200, 201, 202, 203, 204, 205, 206, 301, 302, 303, 307, 308
+        )
 
     @staticmethod
     def _race_has(resp: Response | None, *needles: str) -> bool:
-        low = (getattr(resp, "text", "") or "").lower()
+        body = getattr(resp, "text", "") or ""
+        headers = getattr(resp, "headers", {}) or {}
+        header_text = " ".join(f"{key}: {value}" for key, value in headers.items())
+        low = (body + " " + header_text).lower()
         return any(n.lower() in low for n in needles)
 
     @staticmethod
     def _race_rejected(resp: Response | None) -> bool:
-        low = (getattr(resp, "text", "") or "").lower()
-        return bool(resp) and (resp.status in (400, 403, 409, 422, 429) or any(
+        body = getattr(resp, "text", "") or ""
+        headers = getattr(resp, "headers", {}) or {}
+        low = (body + " " + " ".join(f"{key}: {value}" for key, value in headers.items())).lower()
+        return bool(resp) and (resp.status in (400, 401, 403, 404, 409, 410, 422, 429) or any(
             k in low for k in ("already", "invalid", "expired", "too many", "not allowed",
-                               "only one", "error", "failed", "used")))
+                               "only one", "error", "failed", "used", "/login", "signin", "sign-in",
+                               "unauthorized", "access denied")))
 
     def _race_endpoint_exists(self, url: str, session: requests.Session | None) -> bool:
         r = self._request("GET", url, session=session, allow_redirects=False)
-        return not r.error and r.status not in (404, 410)
+        if r.error or r.status in (404, 410):
+            return False
+        low = (r.text or "").lower()
+        return not any(marker in low for marker in (
+            "404 not found", "page not found", "the requested url was not found",
+            "cannot get /", "does not exist"
+        ))
 
     def phase_race_conditions(self, pages: list[Page], points: list[Point]) -> None:
         """168-173: konfirmasi hanya bila kontrol sekuensial membuktikan batas, lalu burst paralel melewatinya."""
         if not self._within_budget():
             return
+        # Race verification needs authenticated setup, a synchronized burst and
+        # post-burst state checks. Expand only this category's request allowance.
+        if isinstance(self._scan_progress, dict):
+            self._scan_progress["request_limit"] = max(
+                int(self._scan_progress.get("request_limit", self.non_sql_category_request_limit)), 80
+            )
         pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
         session = self._ac_login(pages)
+        if session is None and self._within_budget():
+            session = self._jwt_login(pages)
 
         def url_of(*paths: str) -> list[str]:
             return [urljoin(origin + "/", p.lstrip("/")) for p in paths]
@@ -5909,10 +5962,16 @@ class SatriaBaruScanner:
                 if not self._race_endpoint_exists(coupon_url, session):
                     continue
                 burst = self._race_burst(session, "POST", coupon_url, [body] * 12, n=12)
-                applied = [r for r in burst if self._race_ok(r) and self._race_has(r, "coupon applied", "applied", "discount")
-                           and not self._race_rejected(r)]
+                applied = [
+                    r for r in burst
+                    if self._race_ok(r) and not self._race_rejected(r)
+                    and (
+                        self._race_has(r, "coupon applied", "applied", "discount", "success")
+                        or (r.status in (301, 302, 303) and self._race_has(r, "/cart", "cart"))
+                    )
+                ]
                 refused = [r for r in burst if self._race_rejected(r) and self._race_has(r, "already", "only one", "used", "not allowed")]
-                after = self._request("POST", coupon_url, session=session, data=body, allow_redirects=True)
+                after = self._request("POST", coupon_url, session=session, data=body, allow_redirects=False)
                 limit_exists = self._race_rejected(after) and self._race_has(after, "already", "only one", "used", "not allowed")
                 if len(applied) >= 2 and (bool(refused) or limit_exists):
                     self._race_mark(168, coupon_url,

@@ -8,3 +8,4 @@ dnspython>=2.6,<3
 sslyze>=6,<7
 wapiti3>=3.1,<4
 geekflare-api==0.3.2
+PyJWT[crypto]>=2.8,<3
