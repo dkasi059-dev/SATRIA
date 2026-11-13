@@ -4858,7 +4858,7 @@ class SatriaBaruScanner:
             self._jwt_login_artifacts.append({"url": form.action, "text": r.text or "", "headers": dict(r.headers or {})})
             if any(self._jwt_decode(c.value) for c in sess.cookies if c.value):
                 return sess
-            token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{2,}\\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
+            token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
             token = next((candidate for candidate in re.findall(token_pattern, r.text or "")
                           if self._jwt_decode(candidate)), None)
             if token:
@@ -5444,7 +5444,7 @@ class SatriaBaruScanner:
                                   data=data, allow_redirects=True)
                 if r.error:
                     continue
-                token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{2,}\\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
+                token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
                 token = next((candidate for candidate in re.findall(token_pattern, r.text or "")
                               if self._jwt_decode(candidate)), None)
                 if token:
