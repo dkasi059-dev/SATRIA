@@ -4883,10 +4883,26 @@ class SatriaBaruScanner:
             blob = str(r.headers.get("Set-Cookie", "") or "") + "\n" + str(r.headers.get("set-cookie", "") or "")
             for m in re.finditer(r'([A-Za-z0-9_\-]+)=([A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)', blob):
                 add(m.group(2), "cookie", m.group(1))
-        for pg in pages[:20]:
+        # Snapshot cookie, HTML, JavaScript, dan header dari crawler.
+        token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
+        for pg in pages[:30]:
+            for cookie_name, cookie_value in (getattr(pg, "cookie_names", {}) or {}).items():
+                add(cookie_value, "cookie", cookie_name)
             blob = (getattr(pg, "text", "") or "") + "\n" + (getattr(pg, "js_text", "") or "")
-            for m in re.finditer(r'eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]*', blob):
-                add(m.group(0), "page", "session")
+            for m in re.finditer(token_pattern, blob):
+                add(m.group(1), "page", "session")
+            for header_name, header_value in (getattr(pg, "headers", {}) or {}).items():
+                if str(header_name).lower() in ("authorization", "set-cookie"):
+                    for m in re.finditer(token_pattern, str(header_value or "")):
+                        add(m.group(1), "header", str(header_name))
+        for artifact in getattr(self, "_jwt_login_artifacts", []) or []:
+            blob = str(artifact.get("text") or "")
+            for m in re.finditer(token_pattern, blob):
+                add(m.group(1), "login-response", "login")
+            for header_name, header_value in (artifact.get("headers") or {}).items():
+                if str(header_name).lower() in ("authorization", "set-cookie"):
+                    for m in re.finditer(token_pattern, str(header_value or "")):
+                        add(m.group(1), "header", str(header_name))
         return found
 
     @classmethod
