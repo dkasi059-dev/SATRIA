@@ -431,7 +431,7 @@ if submitted:
         try:
             status_box.info(
                 f"Memvalidasi target publik dan menyiapkan scraper ... "
-                f"(batas scan: {float(os.getenv('SATRIA_SCAN_DEADLINE_SECONDS', '1800') or 1800):.0f} detik)")
+                f"(batas scan: {float(os.getenv('SATRIA_SCAN_DEADLINE_SECONDS', '600') or 600) * 3:.0f} detik)")
             progress_bar.progress(0.08)
             scrape_data, source_mode = scrape_target(target_url, geekflare_key)
             st.session_state["satria_source_mode"] = source_mode
@@ -463,7 +463,7 @@ if submitted:
             # scan bisa berjalan puluhan menit tanpa progres yang terlihat).
             try:
                 engine.SCAN_DEADLINE_SECONDS = float(
-                    os.getenv("SATRIA_SCAN_DEADLINE_SECONDS", "1800") or 1800)
+                    os.getenv("SATRIA_SCAN_DEADLINE_SECONDS", "600") or 600) * 3
             except ValueError:
                 engine.SCAN_DEADLINE_SECONDS = 1800.0
             engine._load_kiosapi_api_key = lambda: kiosapi_key
