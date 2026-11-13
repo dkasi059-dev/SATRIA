@@ -4826,6 +4826,7 @@ class SatriaBaruScanner:
         pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
         forms: list[FormSpec] = []
+        self._jwt_login_artifacts = []
         for pg in pages[:40]:
             for form in getattr(pg, "forms", []) or []:
                 names = [str(n).lower() for n, _v, _t in getattr(form, "fields", ())]
@@ -4849,6 +4850,7 @@ class SatriaBaruScanner:
                               data=data, allow_redirects=True)
             if r.error:
                 continue
+            self._jwt_login_artifacts.append({"url": form.action, "text": r.text or "", "headers": dict(r.headers or {})})
             if any(self._jwt_decode(c.value) for c in sess.cookies if c.value):
                 return sess
             low = (r.text or "").lower()
@@ -4870,9 +4872,12 @@ class SatriaBaruScanner:
             add(cookie.value, "cookie", cookie.name)
         for cookie in self.session.cookies:
             add(cookie.value, "cookie", cookie.name)
+        # Kompak JWT tidak selalu diawali "eyJ"; seluruh kandidat divalidasi
+        # dengan decoder JSON header/payload sebelum dipakai.
+        token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
         targets = [self.target_url]
         targets += [getattr(p, "url", "") for p in pages[:10] if getattr(p, "url", "")]
-        for u in targets[:6]:
+        for u in targets[:8]:
             if not self._within_budget():
                 break
             r = self._request("GET", u, session=sess or self.session, allow_redirects=True)
@@ -4881,10 +4886,27 @@ class SatriaBaruScanner:
             blob = str(r.headers.get("Set-Cookie", "") or "") + "\n" + str(r.headers.get("set-cookie", "") or "")
             for m in re.finditer(r'([A-Za-z0-9_\-]+)=([A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)', blob):
                 add(m.group(2), "cookie", m.group(1))
-        for pg in pages[:20]:
+            for m in re.finditer(token_pattern, r.text or ""):
+                add(m.group(1), "response", "session")
+        # Snapshot cookie, HTML, JavaScript, dan header dari crawler.
+        for pg in pages[:30]:
+            for cookie_name, cookie_value in (getattr(pg, "cookie_names", {}) or {}).items():
+                add(cookie_value, "cookie", cookie_name)
             blob = (getattr(pg, "text", "") or "") + "\n" + (getattr(pg, "js_text", "") or "")
-            for m in re.finditer(r'eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]*', blob):
-                add(m.group(0), "page", "session")
+            for m in re.finditer(token_pattern, blob):
+                add(m.group(1), "page", "session")
+            for header_name, header_value in (getattr(pg, "headers", {}) or {}).items():
+                if str(header_name).lower() in ("authorization", "set-cookie"):
+                    for m in re.finditer(token_pattern, str(header_value or "")):
+                        add(m.group(1), "header", str(header_name))
+        for artifact in getattr(self, "_jwt_login_artifacts", []) or []:
+            blob = str(artifact.get("text") or "")
+            for m in re.finditer(token_pattern, blob):
+                add(m.group(1), "login-response", "login")
+            for header_name, header_value in (artifact.get("headers") or {}).items():
+                if str(header_name).lower() in ("authorization", "set-cookie"):
+                    for m in re.finditer(token_pattern, str(header_value or "")):
+                        add(m.group(1), "header", str(header_name))
         return found
 
     @classmethod
@@ -5689,13 +5711,24 @@ class SatriaBaruScanner:
         import concurrent.futures
         import threading
         payloads = list(payloads) or [None]
-        total = n or len(payloads)
+        total = max(1, min(int(n or len(payloads)), 12))
+        if not self._same_origin(url):
+            return [Response(None, url, "", {}, 0.0, error="out_of_scope") for _ in range(total)]
         barrier = threading.Barrier(total)
+        budget_lock = threading.Lock()
         base_headers = dict(self.session.headers)
         if headers:
             base_headers.update(headers)
         base_headers.pop("Cache-Control", None)
         cookies = list(session.cookies) if session is not None else []
+
+        def reserve_request() -> bool:
+            with budget_lock:
+                if not self._within_budget():
+                    return False
+                self.request_count += 1
+                self.stats["requests"] = self.request_count
+                return True
 
         def worker(index: int) -> Response:
             sess = requests.Session()
@@ -5711,7 +5744,7 @@ class SatriaBaruScanner:
             except Exception:
                 pass
             started = time.monotonic()
-            if not self._within_budget():
+            if not reserve_request():
                 return Response(None, url, "", {}, 0.0, error="budget_exhausted")
             try:
                 kwargs: dict[str, Any] = {}
@@ -5720,19 +5753,77 @@ class SatriaBaruScanner:
                 else:
                     kwargs["data"] = payload
                 resp = sess.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
-                self.request_count += 1
-                self.stats["requests"] = self.request_count
                 return Response(resp.status_code, resp.url, resp.text or "", dict(resp.headers),
                                 time.monotonic() - started)
             except Exception as exc:
-                self.request_count += 1
-                self.stats["requests"] = self.request_count
                 return Response(None, url, "", {}, time.monotonic() - started,
                                 error=f"{type(exc).__name__}: {str(exc)[:120]}")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=total) as pool:
             futures = [pool.submit(worker, i) for i in range(total)]
             return [f.result() for f in futures]
+
+    def _race_multi_burst(
+        self,
+        session: requests.Session | None,
+        requests_spec: list[tuple[str, str, Any]],
+    ) -> list[Response]:
+        """Kirim operasi ke beberapa endpoint berbeda pada satu barrier paralel."""
+        import concurrent.futures
+        import threading
+
+        specs = list(requests_spec)[:12]
+        if not specs:
+            return []
+        if any(not self._same_origin(url) for _method, url, _payload in specs):
+            return [
+                Response(None, url, "", {}, 0.0, error="out_of_scope")
+                for _method, url, _payload in specs
+            ]
+        barrier = threading.Barrier(len(specs))
+        budget_lock = threading.Lock()
+        base_headers = dict(self.session.headers)
+        base_headers.pop("Cache-Control", None)
+        cookies = list(session.cookies) if session is not None else []
+
+        def worker(spec: tuple[str, str, Any]) -> Response:
+            method, url, payload = spec
+            local_session = requests.Session()
+            local_session.headers.update(base_headers)
+            for cookie in cookies:
+                try:
+                    local_session.cookies.set(
+                        cookie.name, cookie.value, domain=cookie.domain, path=cookie.path
+                    )
+                except Exception:
+                    pass
+            try:
+                barrier.wait(timeout=5)
+            except Exception:
+                pass
+            started = time.monotonic()
+            with budget_lock:
+                if not self._within_budget():
+                    return Response(None, url, "", {}, 0.0, error="budget_exhausted")
+                self.request_count += 1
+                self.stats["requests"] = self.request_count
+            try:
+                response = local_session.request(
+                    method, url, data=payload, timeout=self.timeout, allow_redirects=False
+                )
+                return Response(
+                    response.status_code, response.url, response.text or "",
+                    dict(response.headers), time.monotonic() - started
+                )
+            except Exception as exc:
+                return Response(
+                    None, url, "", {}, time.monotonic() - started,
+                    error=f"{type(exc).__name__}: {str(exc)[:120]}"
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as pool:
+            futures = [pool.submit(worker, spec) for spec in specs]
+            return [future.result() for future in futures]
 
     @staticmethod
     def _race_ok(resp: Response | None) -> bool:
@@ -5765,12 +5856,48 @@ class SatriaBaruScanner:
         def url_of(*paths: str) -> list[str]:
             return [urljoin(origin + "/", p.lstrip("/")) for p in paths]
 
-        # ---- 168: limit overrun pada kupon (burst pertama; batas dibuktikan oleh respons "already") ----
+        def discovered_forms(*field_terms: str, action_terms: tuple[str, ...] = ()) -> list[FormSpec]:
+            candidates: list[FormSpec] = []
+            seen_actions: set[str] = set()
+            for page in pages[:40]:
+                for form in (getattr(page, "forms", []) or []):
+                    action = urljoin(getattr(page, "url", origin + "/"), form.action or "")
+                    if str(form.method).lower() != "post":
+                        continue
+                    if not self._same_origin(action) or action in seen_actions:
+                        continue
+                    names = [str(name).lower() for name, _value, _kind in (form.fields or ())]
+                    action_path = urlparse(action).path.lower()
+                    if not any(term in name for term in field_terms for name in names) and not any(
+                        term in action_path for term in action_terms
+                    ):
+                        continue
+                    seen_actions.add(action)
+                    candidates.append(form)
+            return candidates[:12]
+
+        # ---- 168: limit overrun kupon: utamakan action/form yang benar-benar ditemukan ----
         if 168 not in self._confirmed and session is not None and self._within_budget():
-            for coupon_url in url_of("cart/coupon", "coupon", "apply-coupon"):
+            coupon_candidates: list[tuple[str, dict[str, str]]] = [
+                (u, {"coupon": "NEWCUST20"}) for u in url_of("cart/coupon", "coupon", "apply-coupon")
+            ]
+            for form in discovered_forms("coupon", "promo", "discount", action_terms=("coupon", "promo", "discount")):
+                body = {name: value for name, value, _kind in form.fields}
+                coupon_field = next((name for name in body if any(
+                    term in name.lower() for term in ("coupon", "promo", "discount")
+                )), "coupon")
+                body[coupon_field] = "NEWCUST20"
+                action = urljoin(form.page_url, form.action)
+                coupon_candidates.append((action, body))
+            unique_coupon_candidates = []
+            seen_coupon_candidates = set()
+            for candidate in coupon_candidates:
+                if candidate[0] not in seen_coupon_candidates:
+                    seen_coupon_candidates.add(candidate[0])
+                    unique_coupon_candidates.append(candidate)
+            for coupon_url, body in unique_coupon_candidates:
                 if not self._race_endpoint_exists(coupon_url, session):
                     continue
-                body = {"coupon": "NEWCUST20"}
                 burst = self._race_burst(session, "POST", coupon_url, [body] * 12, n=12)
                 applied = [r for r in burst if self._race_ok(r) and self._race_has(r, "coupon applied", "applied", "discount")
                            and not self._race_rejected(r)]
@@ -5786,16 +5913,44 @@ class SatriaBaruScanner:
 
         # ---- 169: rate limit dilewati burst paralel (limit dibuktikan setelah burst) ----
         if 169 not in self._confirmed and self._within_budget():
-            login_url = next((f.action for pg in pages[:20] for f in (getattr(pg, "forms", []) or [])
-                              if getattr(f, "has_password", False)), urljoin(origin + "/", "login"))
+            login_form = next(
+                (form for page in pages[:30] for form in (getattr(page, "forms", []) or [])
+                 if getattr(form, "has_password", False) and str(form.method).lower() == "post"
+                 and self._same_origin(form.action)),
+                None,
+            )
+            login_url = login_form.action if login_form is not None else urljoin(origin + "/", "login")
             if self._race_endpoint_exists(login_url, None):
-                burst = self._race_burst(None, "POST", login_url,
-                                         [{"username": "carlos", "password": f"burst{i}"} for i in range(10)], n=10)
+                login_page_url = login_form.page_url if login_form is not None else login_url
+                login_page = self._request("GET", login_page_url, allow_redirects=True)
+                base_data = (
+                    {name: value for name, value, _kind in login_form.fields}
+                    if login_form is not None else {}
+                )
+                user_field = next(
+                    (name for name in base_data if name.lower() in ("username", "user", "email", "login")),
+                    "username",
+                )
+                pass_field = next(
+                    (name for name in base_data if "pass" in name.lower() or name.lower() == "pwd"),
+                    "password",
+                )
+                csrf = self._ac_csrf(login_page.text or "") if not login_page.error else {}
+                burst_data = []
+                for i in range(10):
+                    data = dict(base_data)
+                    data.update(csrf)
+                    data[user_field] = "carlos"
+                    data[pass_field] = f"burst{i}"
+                    burst_data.append(data)
+                burst = self._race_burst(None, "POST", login_url, burst_data, n=10)
                 processed = [r for r in burst if not r.error and r.status != 429
                              and not self._race_has(r, "too many", "rate limit")]
-                probe = self._request("POST", login_url,
-                                      data={"username": "carlos", "password": "probe-after-burst"},
-                                      allow_redirects=True)
+                probe_data = dict(base_data)
+                probe_data.update(csrf)
+                probe_data[user_field] = "carlos"
+                probe_data[pass_field] = "probe-after-burst"
+                probe = self._request("POST", login_url, data=probe_data, allow_redirects=True)
                 limited = probe.status == 429 or self._race_has(probe, "too many", "rate limit", "blocked")
                 if len(processed) >= 8 and limited:
                     self._race_mark(169, login_url,
@@ -5805,37 +5960,102 @@ class SatriaBaruScanner:
 
         # ---- 170: multi-endpoint (tambah keranjang + kupon bersamaan) ----
         if 170 not in self._confirmed and session is not None and self._within_budget():
-            cart_url = urljoin(origin + "/", "cart")
-            coupon_url = urljoin(origin + "/", "cart/coupon")
-            if self._race_endpoint_exists(cart_url, session) and self._race_endpoint_exists(coupon_url, session):
-                add = {"productId": "1", "redir": "product", "quantity": "1"}
-                apply = {"coupon": "NEWCUST20"}
-                burst = self._race_burst(session, "POST", cart_url, [add] * 8, n=8)
-                burst += self._race_burst(session, "POST", coupon_url, [apply] * 4, n=4)
-                cart = self._request("GET", cart_url, session=session, allow_redirects=True)
-                low = (cart.text or "").lower()
-                if not cart.error and ("coupon" in low) and (("$0.00" in low) or ("total: $0" in low) or ("-$" in low)):
-                    self._race_mark(170, cart_url,
-                                    f"Multi-endpoint race condition terverifikasi: penambahan item dan kupon paralel "
-                                    f"menghasilkan total keranjang nol/negatif pada {cart_url}.", "race_multi_endpoint")
+            cart_forms = discovered_forms(
+                "product", "item", "quantity", action_terms=("cart/add", "add-to-cart", "basket/add")
+            )
+            coupon_forms = discovered_forms(
+                "coupon", "promo", "discount", action_terms=("coupon", "promo", "discount")
+            )
+            cart_candidates = [
+                (urljoin(form.page_url, form.action), form)
+                for form in cart_forms
+            ] or [(urljoin(origin + "/", "cart"), None)]
+            coupon_candidates = [
+                (urljoin(form.page_url, form.action), form)
+                for form in coupon_forms
+            ] or [(urljoin(origin + "/", "cart/coupon"), None)]
+            for cart_url, cart_form in cart_candidates[:3]:
+                for coupon_url, coupon_form in coupon_candidates[:3]:
+                    if not self._within_budget():
+                        break
+                    if not self._race_endpoint_exists(cart_url, session) or not self._race_endpoint_exists(coupon_url, session):
+                        continue
+                    add = (
+                        {name: value for name, value, _kind in cart_form.fields}
+                        if cart_form is not None else
+                        {"productId": "1", "redir": "product", "quantity": "1"}
+                    )
+                    if not any(any(k in name.lower() for k in ("product", "item", "id")) for name in add):
+                        add["productId"] = "1"
+                    if "quantity" in add:
+                        add["quantity"] = "1"
+                    apply = (
+                        {name: value for name, value, _kind in coupon_form.fields}
+                        if coupon_form is not None else {"coupon": "NEWCUST20"}
+                    )
+                    coupon_field = next(
+                        (name for name in apply if any(k in name.lower() for k in ("coupon", "promo", "discount"))),
+                        "coupon",
+                    )
+                    apply[coupon_field] = "NEWCUST20"
+                    mixed_requests = (
+                        [(cart_form.method.upper() if cart_form else "POST", cart_url, add)] * 8
+                        + [(coupon_form.method.upper() if coupon_form else "POST", coupon_url, apply)] * 4
+                    )
+                    burst = self._race_multi_burst(session, mixed_requests)
+                    cart_view = self._request(
+                        "GET", urljoin(origin + "/", "cart"), session=session, allow_redirects=True
+                    )
+                    low = (cart_view.text or "").lower()
+                    if not cart_view.error and "coupon" in low and (
+                        "$0.00" in low or "total: $0" in low or "-$" in low
+                    ):
+                        self._race_mark(170, cart_url,
+                                        f"Multi-endpoint race condition terverifikasi: penambahan item dan kupon paralel "
+                                        f"menghasilkan total keranjang nol/negatif pada {cart_url}.", "race_multi_endpoint")
+                        break
+                if 170 in self._confirmed:
+                    break
 
         # ---- 171: single-endpoint (dua nilai berbeda pada endpoint sama) ----
         if 171 not in self._confirmed and session is not None and self._within_budget():
-            for email_url in url_of("my-account/change-email", "account/email", "change-email"):
-                page = self._request("GET", urljoin(origin + "/", "my-account"), session=session, allow_redirects=True)
+            email_forms = discovered_forms("email", action_terms=("change-email", "email", "profile"))
+            email_candidates = [
+                (urljoin(form.page_url, form.action), form)
+                for form in email_forms
+                if any("email" in str(name).lower() for name, _value, _kind in form.fields)
+            ]
+            if not email_candidates:
+                email_candidates = [(u, None) for u in url_of(
+                    "my-account/change-email", "account/email", "change-email"
+                )]
+            for email_url, email_form in email_candidates[:8]:
+                page_url = email_form.page_url if email_form is not None else urljoin(origin + "/", "my-account")
+                page = self._request("GET", page_url, session=session, allow_redirects=True)
                 if page.error or page.status != 200:
                     continue
                 csrf = self._ac_csrf(page.text or "")
                 a_email = f"satria-race-a-{uuid.uuid4().hex[:6]}@example.com"
                 b_email = f"satria-race-b-{uuid.uuid4().hex[:6]}@example.com"
+                base_data = (
+                    {name: value for name, value, _kind in email_form.fields}
+                    if email_form is not None else {}
+                )
+                email_field = next(
+                    (name for name in base_data if "email" in name.lower()), "email"
+                )
                 payloads = []
                 for i in range(8):
-                    data = {"email": a_email if i % 2 == 0 else b_email}
+                    data = dict(base_data)
                     data.update(csrf)
+                    data[email_field] = a_email if i % 2 == 0 else b_email
                     payloads.append(data)
-                burst = self._race_burst(session, "POST", email_url, payloads, n=8)
+                burst = self._race_burst(
+                    session, email_form.method.upper() if email_form else "POST",
+                    email_url, payloads, n=8
+                )
                 accepted = [r for r in burst if self._race_ok(r) and not self._race_rejected(r)]
-                after = self._request("GET", urljoin(origin + "/", "my-account"), session=session, allow_redirects=True)
+                after = self._request("GET", page_url, session=session, allow_redirects=True)
                 if len(accepted) >= 2 and (a_email in (after.text or "") or b_email in (after.text or "")):
                     self._race_mark(171, email_url,
                                     f"Single-endpoint race condition terverifikasi: {len(accepted)}/8 perubahan email "
@@ -5847,40 +6067,121 @@ class SatriaBaruScanner:
             token_forms: list[FormSpec] = []
             for pg in pages[:30]:
                 for form in (getattr(pg, "forms", []) or []):
+                    if str(form.method).lower() != "post" or not self._same_origin(form.action):
+                        continue
                     if any("token" in str(n).lower() for n, _v, _t in form.fields):
                         token_forms.append(form)
             for form in token_forms[:4]:
                 if not self._within_budget():
                     break
-                data = {n: v for n, v, _t in form.fields}
-                token_field = next((n for n in data if "token" in n.lower()), "token")
-                data[token_field] = "satria" + uuid.uuid4().hex[:8]
-                burst = self._race_burst(session, form.method.upper() or "POST", form.action, [data] * 8, n=8)
-                accepted = [r for r in burst if self._race_ok(r) and not self._race_rejected(r)]
+                form_page = self._request("GET", form.page_url, session=session, allow_redirects=True)
+                if form_page.error or form_page.status != 200:
+                    continue
+                refreshed_forms = self._parse_forms(
+                    form.page_url, BeautifulSoup(form_page.text or "", "html.parser")
+                )
+                refreshed = next(
+                    (candidate for candidate in refreshed_forms
+                     if urljoin(candidate.page_url, candidate.action) == urljoin(form.page_url, form.action)),
+                    form,
+                )
+                data = {name: value for name, value, _kind in refreshed.fields}
+                token_field = next((name for name in data if "token" in name.lower()), None)
+                if not token_field or not data.get(token_field):
+                    continue
+                # Gunakan token valid yang benar-benar diterbitkan aplikasi; token acak
+                # akan menguji validasi token, bukan race pada pemakaian token.
+                burst = self._race_burst(
+                    session, refreshed.method.upper() or "POST",
+                    urljoin(refreshed.page_url, refreshed.action), [data] * 8, n=8
+                )
+                accepted = [
+                    r for r in burst
+                    if self._race_ok(r) and not self._race_rejected(r)
+                    and (r.status in (201, 202, 302, 303)
+                         or self._race_has(r, "success", "verified", "confirmed", "completed", "updated"))
+                ]
                 if len(accepted) >= 2:
-                    self._race_mark(172, form.action,
-                                    f"Time-sensitive race window terverifikasi: token yang sama diterima "
-                                    f"{len(accepted)}/8 kali pada {form.action}.", "race_time_sensitive")
+                    self._race_mark(172, refreshed.action,
+                                    f"Time-sensitive race window terverifikasi: token valid yang sama diterima "
+                                    f"{len(accepted)}/8 kali pada {refreshed.action}.", "race_time_sensitive")
                     break
 
         # ---- 173: partial construction pada registrasi (akun terbentuk dengan state parsial) ----
         if 173 not in self._confirmed and self._within_budget():
-            register_urls = url_of("register", "signup", "register.php")
-            for reg in register_urls:
+            register_forms = discovered_forms(
+                "username", "email", "password", action_terms=("register", "signup", "sign-up")
+            )
+            register_candidates = [
+                (urljoin(form.page_url, form.action), form)
+                for form in register_forms
+                if getattr(form, "has_password", False)
+            ] or [(u, None) for u in url_of("register", "signup", "register.php")]
+            for reg, register_form in register_candidates[:6]:
                 if not self._race_endpoint_exists(reg, session):
                     continue
                 user = f"satria{uuid.uuid4().hex[:6]}"
-                body = {"username": user, "email": f"{user}@example.com", "password": "Passw0rd!23"}
-                burst = self._race_burst(session, "POST", reg, [body] * 8, n=8)
+                body = (
+                    {name: value for name, value, _kind in register_form.fields}
+                    if register_form is not None else {}
+                )
+                username_field = next(
+                    (name for name in body if name.lower() in ("username", "user", "login")), "username"
+                )
+                email_field = next((name for name in body if "email" in name.lower()), "email")
+                password_field = next(
+                    (name for name in body if "pass" in name.lower() or name.lower() == "pwd"), "password"
+                )
+                body[username_field] = user
+                body[email_field] = f"{user}@example.com"
+                body[password_field] = "Passw0rd!23"
+                if register_form is not None:
+                    reg_page = self._request("GET", register_form.page_url, session=session, allow_redirects=True)
+                    if reg_page.error:
+                        continue
+                    body.update(self._ac_csrf(reg_page.text or ""))
+                burst = self._race_burst(
+                    session, register_form.method.upper() if register_form else "POST",
+                    reg, [body] * 8, n=8
+                )
                 accepted = [r for r in burst if self._race_ok(r) and not self._race_rejected(r)]
                 if len(accepted) < 2:
                     continue
-                # Akun dengan konstruksi parsial biasanya bisa login dengan password kosong.
-                login_url = next((f.action for pg in pages[:20] for f in (getattr(pg, "forms", []) or [])
-                                  if getattr(f, "has_password", False)), urljoin(origin + "/", "login"))
-                probe = self._request("POST", login_url,
-                                      data={"username": user, "password": ""}, allow_redirects=False)
-                if probe.status in (200, 302) and not self._race_has(probe, "invalid", "incorrect", "failed"):
+                login_form = next(
+                    (form for page in pages[:30] for form in (getattr(page, "forms", []) or [])
+                     if getattr(form, "has_password", False) and str(form.method).lower() == "post"),
+                    None,
+                )
+                login_url = login_form.action if login_form is not None else urljoin(origin + "/", "login")
+                login_data = (
+                    {name: value for name, value, _kind in login_form.fields}
+                    if login_form is not None else {}
+                )
+                login_user_field = next(
+                    (name for name in login_data if name.lower() in ("username", "user", "email", "login")),
+                    "username",
+                )
+                login_pass_field = next(
+                    (name for name in login_data if "pass" in name.lower() or name.lower() == "pwd"),
+                    "password",
+                )
+                login_data[login_user_field] = user
+                login_data[login_pass_field] = ""
+                probe = self._request(
+                    "POST", login_url, session=session, data=login_data, allow_redirects=False
+                )
+                probe_location = str((probe.headers or {}).get("Location", "")).lower()
+                login_success = (
+                    probe.status in (302, 303)
+                    and bool(probe_location)
+                    and not any(word in probe_location for word in ("login", "signin", "sign-in"))
+                ) or (
+                    probe.status == 200
+                    and self._race_has(probe, "log out", "logout", "my account", "welcome", "your account")
+                )
+                if login_success and not self._race_has(
+                    probe, "invalid", "incorrect", "failed", "password required", "unauthorized"
+                ):
                     self._race_mark(173, reg,
                                     f"Partial construction race condition terverifikasi: registrasi paralel "
                                     f"{user} diterima {len(accepted)}/8 kali dan login password kosong berhasil.",
