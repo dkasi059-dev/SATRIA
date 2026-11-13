@@ -5847,16 +5847,44 @@ class SatriaBaruScanner:
 
         # ---- 169: rate limit dilewati burst paralel (limit dibuktikan setelah burst) ----
         if 169 not in self._confirmed and self._within_budget():
-            login_url = next((f.action for pg in pages[:20] for f in (getattr(pg, "forms", []) or [])
-                              if getattr(f, "has_password", False)), urljoin(origin + "/", "login"))
+            login_form = next(
+                (form for page in pages[:30] for form in (getattr(page, "forms", []) or [])
+                 if getattr(form, "has_password", False) and str(form.method).lower() == "post"
+                 and self._same_origin(form.action)),
+                None,
+            )
+            login_url = login_form.action if login_form is not None else urljoin(origin + "/", "login")
             if self._race_endpoint_exists(login_url, None):
-                burst = self._race_burst(None, "POST", login_url,
-                                         [{"username": "carlos", "password": f"burst{i}"} for i in range(10)], n=10)
+                login_page_url = login_form.page_url if login_form is not None else login_url
+                login_page = self._request("GET", login_page_url, allow_redirects=True)
+                base_data = (
+                    {name: value for name, value, _kind in login_form.fields}
+                    if login_form is not None else {}
+                )
+                user_field = next(
+                    (name for name in base_data if name.lower() in ("username", "user", "email", "login")),
+                    "username",
+                )
+                pass_field = next(
+                    (name for name in base_data if "pass" in name.lower() or name.lower() == "pwd"),
+                    "password",
+                )
+                csrf = self._ac_csrf(login_page.text or "") if not login_page.error else {}
+                burst_data = []
+                for i in range(10):
+                    data = dict(base_data)
+                    data.update(csrf)
+                    data[user_field] = "carlos"
+                    data[pass_field] = f"burst{i}"
+                    burst_data.append(data)
+                burst = self._race_burst(None, "POST", login_url, burst_data, n=10)
                 processed = [r for r in burst if not r.error and r.status != 429
                              and not self._race_has(r, "too many", "rate limit")]
-                probe = self._request("POST", login_url,
-                                      data={"username": "carlos", "password": "probe-after-burst"},
-                                      allow_redirects=True)
+                probe_data = dict(base_data)
+                probe_data.update(csrf)
+                probe_data[user_field] = "carlos"
+                probe_data[pass_field] = "probe-after-burst"
+                probe = self._request("POST", login_url, data=probe_data, allow_redirects=True)
                 limited = probe.status == 429 or self._race_has(probe, "too many", "rate limit", "blocked")
                 if len(processed) >= 8 and limited:
                     self._race_mark(169, login_url,
