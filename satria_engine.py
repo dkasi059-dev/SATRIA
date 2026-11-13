@@ -5759,6 +5759,68 @@ class SatriaBaruScanner:
             futures = [pool.submit(worker, i) for i in range(total)]
             return [f.result() for f in futures]
 
+    def _race_multi_burst(
+        self,
+        session: requests.Session | None,
+        requests_spec: list[tuple[str, str, Any]],
+    ) -> list[Response]:
+        """Kirim operasi ke beberapa endpoint berbeda pada satu barrier paralel."""
+        import concurrent.futures
+        import threading
+
+        specs = list(requests_spec)[:12]
+        if not specs:
+            return []
+        if any(not self._same_origin(url) for _method, url, _payload in specs):
+            return [
+                Response(None, url, "", {}, 0.0, error="out_of_scope")
+                for _method, url, _payload in specs
+            ]
+        barrier = threading.Barrier(len(specs))
+        budget_lock = threading.Lock()
+        base_headers = dict(self.session.headers)
+        base_headers.pop("Cache-Control", None)
+        cookies = list(session.cookies) if session is not None else []
+
+        def worker(spec: tuple[str, str, Any]) -> Response:
+            method, url, payload = spec
+            local_session = requests.Session()
+            local_session.headers.update(base_headers)
+            for cookie in cookies:
+                try:
+                    local_session.cookies.set(
+                        cookie.name, cookie.value, domain=cookie.domain, path=cookie.path
+                    )
+                except Exception:
+                    pass
+            try:
+                barrier.wait(timeout=5)
+            except Exception:
+                pass
+            started = time.monotonic()
+            with budget_lock:
+                if not self._within_budget():
+                    return Response(None, url, "", {}, 0.0, error="budget_exhausted")
+                self.request_count += 1
+                self.stats["requests"] = self.request_count
+            try:
+                response = local_session.request(
+                    method, url, data=payload, timeout=self.timeout, allow_redirects=False
+                )
+                return Response(
+                    response.status_code, response.url, response.text or "",
+                    dict(response.headers), time.monotonic() - started
+                )
+            except Exception as exc:
+                return Response(
+                    None, url, "", {}, time.monotonic() - started,
+                    error=f"{type(exc).__name__}: {str(exc)[:120]}"
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as pool:
+            futures = [pool.submit(worker, spec) for spec in specs]
+            return [future.result() for future in futures]
+
     @staticmethod
     def _race_ok(resp: Response | None) -> bool:
         return bool(resp) and not resp.error and resp.status in (200, 201, 202, 302, 303)
@@ -5932,14 +5994,11 @@ class SatriaBaruScanner:
                         "coupon",
                     )
                     apply[coupon_field] = "NEWCUST20"
-                    burst = self._race_burst(
-                        session, cart_form.method.upper() if cart_form else "POST",
-                        cart_url, [add] * 8, n=8
+                    mixed_requests = (
+                        [(cart_form.method.upper() if cart_form else "POST", cart_url, add)] * 8
+                        + [(coupon_form.method.upper() if coupon_form else "POST", coupon_url, apply)] * 4
                     )
-                    burst += self._race_burst(
-                        session, coupon_form.method.upper() if coupon_form else "POST",
-                        coupon_url, [apply] * 4, n=4
-                    )
+                    burst = self._race_multi_burst(session, mixed_requests)
                     cart_view = self._request(
                         "GET", urljoin(origin + "/", "cart"), session=session, allow_redirects=True
                     )
