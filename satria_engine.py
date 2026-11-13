@@ -6536,11 +6536,11 @@ class SatriaBaruScanner:
         def extract_links(text, base):
             links = set()
             for mm in re.finditer(r'(?:href|src|action)=["\']([^"\']+)["\']', text or '', re.I):
-                u = self._abs(base, mm.group(1))
-                if u: links.add(u)
+                u = urljoin(base, mm.group(1))
+                if self._same_origin(u): links.add(u)
             for mm in re.finditer(r'(https?://[^\s"\'<>]+|/[A-Za-z0-9_\-./%]+)', text or ''):
-                u = self._abs(base, mm.group(1))
-                if u: links.add(u)
+                u = urljoin(base, mm.group(1))
+                if self._same_origin(u): links.add(u)
             return links
 
         def try_fetch(url):
