@@ -714,9 +714,9 @@ class SatriaBaruScanner:
         self._scan_progress: dict[str, Any] | None = None
         self.started = time.monotonic()
         try:
-            self.deadline_seconds = float(globals().get("SCAN_DEADLINE_SECONDS") or 600.0)
+            self.deadline_seconds = float(globals().get("SCAN_DEADLINE_SECONDS") or 1800.0)
         except (TypeError, ValueError):
-            self.deadline_seconds = 600.0
+            self.deadline_seconds = 1800.0
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
