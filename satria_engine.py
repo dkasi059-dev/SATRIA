@@ -6046,22 +6046,70 @@ class SatriaBaruScanner:
 
         # ---- 173: partial construction pada registrasi (akun terbentuk dengan state parsial) ----
         if 173 not in self._confirmed and self._within_budget():
-            register_urls = url_of("register", "signup", "register.php")
-            for reg in register_urls:
+            register_forms = discovered_forms(
+                "username", "email", "password", action_terms=("register", "signup", "sign-up")
+            )
+            register_candidates = [
+                (urljoin(form.page_url, form.action), form)
+                for form in register_forms
+                if getattr(form, "has_password", False)
+            ] or [(u, None) for u in url_of("register", "signup", "register.php")]
+            for reg, register_form in register_candidates[:6]:
                 if not self._race_endpoint_exists(reg, session):
                     continue
                 user = f"satria{uuid.uuid4().hex[:6]}"
-                body = {"username": user, "email": f"{user}@example.com", "password": "Passw0rd!23"}
-                burst = self._race_burst(session, "POST", reg, [body] * 8, n=8)
+                body = (
+                    {name: value for name, value, _kind in register_form.fields}
+                    if register_form is not None else {}
+                )
+                username_field = next(
+                    (name for name in body if name.lower() in ("username", "user", "login")), "username"
+                )
+                email_field = next((name for name in body if "email" in name.lower()), "email")
+                password_field = next(
+                    (name for name in body if "pass" in name.lower() or name.lower() == "pwd"), "password"
+                )
+                body[username_field] = user
+                body[email_field] = f"{user}@example.com"
+                body[password_field] = "Passw0rd!23"
+                if register_form is not None:
+                    reg_page = self._request("GET", register_form.page_url, session=session, allow_redirects=True)
+                    if reg_page.error:
+                        continue
+                    body.update(self._ac_csrf(reg_page.text or ""))
+                burst = self._race_burst(
+                    session, register_form.method.upper() if register_form else "POST",
+                    reg, [body] * 8, n=8
+                )
                 accepted = [r for r in burst if self._race_ok(r) and not self._race_rejected(r)]
                 if len(accepted) < 2:
                     continue
-                # Akun dengan konstruksi parsial biasanya bisa login dengan password kosong.
-                login_url = next((f.action for pg in pages[:20] for f in (getattr(pg, "forms", []) or [])
-                                  if getattr(f, "has_password", False)), urljoin(origin + "/", "login"))
-                probe = self._request("POST", login_url,
-                                      data={"username": user, "password": ""}, allow_redirects=False)
-                if probe.status in (200, 302) and not self._race_has(probe, "invalid", "incorrect", "failed"):
+                login_form = next(
+                    (form for page in pages[:30] for form in (getattr(page, "forms", []) or [])
+                     if getattr(form, "has_password", False) and str(form.method).lower() == "post"),
+                    None,
+                )
+                login_url = login_form.action if login_form is not None else urljoin(origin + "/", "login")
+                login_data = (
+                    {name: value for name, value, _kind in login_form.fields}
+                    if login_form is not None else {}
+                )
+                login_user_field = next(
+                    (name for name in login_data if name.lower() in ("username", "user", "email", "login")),
+                    "username",
+                )
+                login_pass_field = next(
+                    (name for name in login_data if "pass" in name.lower() or name.lower() == "pwd"),
+                    "password",
+                )
+                login_data[login_user_field] = user
+                login_data[login_pass_field] = ""
+                probe = self._request(
+                    "POST", login_url, session=session, data=login_data, allow_redirects=False
+                )
+                if probe.status in (200, 302) and not self._race_has(
+                    probe, "invalid", "incorrect", "failed", "password required", "unauthorized"
+                ):
                     self._race_mark(173, reg,
                                     f"Partial construction race condition terverifikasi: registrasi paralel "
                                     f"{user} diterima {len(accepted)}/8 kali dan login password kosong berhasil.",
