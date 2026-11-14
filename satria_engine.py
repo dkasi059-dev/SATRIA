@@ -7055,7 +7055,11 @@ class SatriaBaruScanner:
                 if not page.error:
                     ep["csrf"] = self._ac_csrf(page.text or "")
             marker = f"SATRIA-LLM-CANARY-{uuid.uuid4().hex[:12]}"
-            probe = f"Reply with exactly this random canary token and no other text: {marker}"
+            expected = marker[::-1]
+            probe = (
+                "Reverse the following random string character by character. "
+                f"Return only the reversed string, without explanation: {marker}"
+            )
             variants: list[tuple[str, str]] = []
             if ep.get("kind") == "form":
                 variants.append(("form", ep.get("field", "message")))
@@ -7076,8 +7080,8 @@ class SatriaBaruScanner:
                 if response.error or (response.status or 0) >= 400:
                     continue
                 output = self._llm_text(response).strip()
-                # A plain echo endpoint returns the full prompt, not the canary response.
-                if marker not in output or probe in output:
+                # A plain echo endpoint cannot pass this transformation challenge.
+                if expected.lower() not in output.lower() or marker.lower() in output.lower():
                     continue
                 validated = dict(ep)
                 validated["kind"] = "form" if ep.get("kind") == "form" else "json"
