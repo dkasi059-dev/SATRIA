@@ -179,6 +179,192 @@ jobs:
               server.server_close()
               thread.join(timeout=2)
           PY
+
+      - name: JWT weak-key, JWK, kid and algorithm-confusion regression
+        run: |
+          python - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import importlib.util
+          import json
+          import sys
+          import time
+          import threading
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          import jwt
+          import requests
+          from cryptography.hazmat.primitives.asymmetric import rsa
+          from cryptography.hazmat.primitives import serialization
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          server_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+          server_private_pem = server_key.private_bytes(
+              serialization.Encoding.PEM,
+              serialization.PrivateFormat.PKCS8,
+              serialization.NoEncryption(),
+          )
+          server_public_pem = server_key.public_key().public_bytes(
+              serialization.Encoding.PEM,
+              serialization.PublicFormat.SubjectPublicKeyInfo,
+          )
+          numbers = server_key.public_key().public_numbers()
+          def b64u_int(value):
+              return base64.urlsafe_b64encode(
+                  value.to_bytes((value.bit_length() + 7) // 8, "big")
+              ).rstrip(b"=").decode()
+          jwks = {"keys": [{
+              "kty": "RSA", "kid": "server-key", "use": "sig", "alg": "RS256",
+              "n": b64u_int(numbers.n), "e": b64u_int(numbers.e),
+          }]}
+
+          state = {"mode": "weak"}
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path.startswith("/.well-known/jwks.json") and state["mode"] == "confusion":
+                      body = json.dumps(jwks).encode()
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                      return
+                  token = ""
+                  auth = self.headers.get("Authorization", "")
+                  if auth.lower().startswith("bearer "):
+                      token = auth.split(None, 1)[1]
+                  if not token:
+                      for part in self.headers.get("Cookie", "").split(";"):
+                          if part.strip().startswith("session="):
+                              token = part.strip().split("=", 1)[1]
+                  decoded = Scanner._jwt_decode(token) if token else None
+                  accepted = False
+                  username = ""
+                  if decoded:
+                      header, payload, parts = decoded["header"], decoded["payload"], decoded["parts"]
+                      username = str(payload.get("sub", ""))
+                      signing_input = f"{parts[0]}.{parts[1]}".encode()
+                      try:
+                          signature = Scanner._jwt_b64d(parts[2])
+                      except Exception:
+                          signature = b""
+                      if state["mode"] == "weak" and header.get("alg") == "HS256":
+                          expected = hmac.new(b"secret1", signing_input, hashlib.sha256).digest()
+                          accepted = hmac.compare_digest(expected, signature)
+                      elif state["mode"] == "jwk" and header.get("alg") == "RS256" and isinstance(header.get("jwk"), dict):
+                          try:
+                              key = header["jwk"]
+                              n = int.from_bytes(base64.urlsafe_b64decode(key["n"] + "=" * (-len(key["n"]) % 4)), "big")
+                              e = int.from_bytes(base64.urlsafe_b64decode(key["e"] + "=" * (-len(key["e"]) % 4)), "big")
+                              public = rsa.RSAPublicNumbers(e, n).public_key()
+                              jwt.decode(token, public, algorithms=["RS256"], options={"verify_exp": False})
+                              accepted = True
+                          except Exception:
+                              accepted = False
+                      elif state["mode"] == "kid" and header.get("alg") == "HS256" and "dev/null" in str(header.get("kid", "")):
+                          expected = hmac.new(b"", signing_input, hashlib.sha256).digest()
+                          accepted = hmac.compare_digest(expected, signature)
+                      elif state["mode"] == "confusion":
+                          if header.get("alg") == "RS256":
+                              try:
+                                  jwt.decode(token, server_public_pem, algorithms=["RS256"], options={"verify_exp": False})
+                                  accepted = True
+                              except Exception:
+                                  accepted = False
+                          elif header.get("alg") == "HS256":
+                              expected = hmac.new(server_public_pem, signing_input, hashlib.sha256).digest()
+                              accepted = hmac.compare_digest(expected, signature)
+                  if accepted and username == "administrator":
+                      body = b"<html><h1>Admin panel</h1>User management <a>Log out</a></html>"
+                      self.send_response(200)
+                  elif accepted:
+                      body = f"<html>Your username is: {username} <a>Log out</a></html>".encode()
+                      self.send_response(200)
+                  else:
+                      body = b"<html>Please log in</html>"
+                      self.send_response(302)
+                      self.send_header("Location", "/login")
+                  self.send_header("Content-Type", "text/html")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *_args):
+                  pass
+
+          server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+          thread = threading.Thread(target=server.serve_forever, daemon=True)
+          thread.start()
+          base = f"http://127.0.0.1:{server.server_port}"
+
+          def make_scanner(token, confirmed):
+              scanner = Scanner.__new__(Scanner)
+              scanner.target_url = base + "/"
+              scanner.session = requests.Session()
+              scanner.session.cookies.set("session", token)
+              scanner.timeout = 2.0
+              scanner.started = time.monotonic()
+              scanner.deadline_seconds = 30.0
+              scanner.max_requests = 500
+              scanner.non_sql_category_request_limit = 32
+              scanner.request_count = 0
+              scanner._scan_progress = {
+                  "index": 17, "total": 23, "label": "JWT", "event_seq": 0,
+                  "request_start": 0, "request_limit": 180,
+              }
+              scanner.stats = {"requests": 0, "errors": []}
+              scanner._confirmed = set(confirmed)
+              scanner._jwt_login_artifacts = []
+              scanner._jwt_mark = lambda number, url, evidence, method: scanner._confirmed.add(number)
+              return scanner
+
+          page = module.Page(url=base + "/my-account", text="<title>My account</title>")
+          try:
+              weak_token = Scanner._jwt_sign(
+                  {"alg": "HS256", "typ": "JWT"},
+                  {"sub": "wiener", "exp": int(time.time()) + 3600},
+                  key="secret1",
+              )
+              state["mode"] = "weak"
+              scanner = make_scanner(weak_token, {147, 148})
+              scanner.phase_jwt([page], [])
+              assert 149 in scanner._confirmed, scanner._confirmed
+
+              rsa_source = jwt.encode(
+                  {"sub": "wiener", "exp": int(time.time()) + 3600},
+                  server_private_pem, algorithm="RS256",
+              )
+              state["mode"] = "jwk"
+              scanner = make_scanner(rsa_source, {147, 148, 149})
+              scanner.phase_jwt([page], [])
+              assert 150 in scanner._confirmed, scanner._confirmed
+
+              kid_source = Scanner._jwt_sign(
+                  {"alg": "HS256", "typ": "JWT", "kid": "session"},
+                  {"sub": "wiener", "exp": int(time.time()) + 3600},
+                  key="not-empty",
+              )
+              state["mode"] = "kid"
+              scanner = make_scanner(kid_source, {147, 148, 149, 150, 151})
+              scanner.phase_jwt([page], [])
+              assert 152 in scanner._confirmed, scanner._confirmed
+
+              state["mode"] = "confusion"
+              scanner = make_scanner(rsa_source, {147, 148, 149, 150, 151, 152})
+              scanner.phase_jwt([page], [])
+              assert 153 in scanner._confirmed, scanner._confirmed
+
+              print("PASS: JWT weak HMAC, embedded JWK, kid traversal, RS->HS confusion")
+          finally:
+              server.shutdown()
+              server.server_close()
+              thread.join(timeout=2)
+          PY
+
       - name: Web LLM discovery, JSON and SSE regression
         run: |
           python - <<'PY'
