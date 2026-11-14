@@ -6828,9 +6828,9 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _llm_strings(node: Any, out: list[str]) -> None:
-        """Ekstrak teks respons model tanpa mencampur role, ID, dan metadata transport."""
+        """Ekstrak fragmen teks assistant/tool dari JSON tanpa metadata transport."""
         if isinstance(node, str):
-            if node.strip():
+            if node:
                 out.append(node)
             return
         if isinstance(node, dict):
@@ -6843,11 +6843,13 @@ class SatriaBaruScanner:
                 if key in node:
                     SatriaBaruScanner._llm_strings(node[key], out)
                     visited.add(key)
+            ignored = {
+                "role", "id", "model", "created", "created_at", "object",
+                "index", "finish_reason", "usage", "metadata", "tool_calls",
+                "function_call", "prompt_tokens", "completion_tokens",
+            }
             for key, value in node.items():
-                if key not in visited and key not in (
-                    "role", "id", "model", "created", "created_at", "object",
-                    "index", "finish_reason", "usage", "metadata",
-                ):
+                if key not in visited and key not in ignored:
                     SatriaBaruScanner._llm_strings(value, out)
         elif isinstance(node, (list, tuple)):
             for value in node:
@@ -6855,45 +6857,66 @@ class SatriaBaruScanner:
 
     @classmethod
     def _llm_text(cls, resp: Response | None) -> str:
-        """Baca JSON chat umum, OpenAI/Anthropic, dan event-stream/SSE."""
+        """Ambil jawaban dari JSON, OpenAI/Anthropic/Gemini, SSE, dan NDJSON."""
         if resp is None:
             return ""
         raw = str(getattr(resp, "text", "") or "")
         if not raw.strip():
             return ""
         stripped = raw.strip()
-        data_events: list[str] = []
-        if "data:" in stripped:
+
+        # Streaming frames are incremental deltas. Keep their order and exact
+        # adjacency: joining with newlines or dict.fromkeys corrupts canary tokens.
+        if any(line.lstrip().startswith("data:") for line in stripped.splitlines()):
+            fragments: list[str] = []
+            raw_frames: list[str] = []
             for line in stripped.splitlines():
                 line = line.strip()
                 if not line.startswith("data:"):
                     continue
-                item = line[5:].strip()
-                if item and item != "[DONE]":
-                    data_events.append(item)
+                frame = line[5:].strip()
+                if not frame or frame == "[DONE]":
+                    continue
+                raw_frames.append(frame)
+                try:
+                    parsed = json.loads(frame)
+                except Exception:
+                    if frame:
+                        fragments.append(frame)
+                    continue
+                frame_fragments: list[str] = []
+                cls._llm_strings(parsed, frame_fragments)
+                if frame_fragments:
+                    fragments.extend(frame_fragments)
+            if fragments:
+                return "".join(fragments)
+            if raw_frames:
+                return "".join(raw_frames)
 
-        parsed_candidates: list[Any] = []
-        for candidate in [stripped, *data_events]:
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            extracted: list[str] = []
+            cls._llm_strings(parsed, extracted)
+            if extracted:
+                return "".join(extracted)
+
+        # NDJSON: one complete JSON message per line.
+        ndjson_fragments: list[str] = []
+        for line in stripped.splitlines():
+            candidate = line.strip()
             if not candidate:
                 continue
             try:
-                parsed_candidates.append(json.loads(candidate))
+                parsed_line = json.loads(candidate)
             except Exception:
                 continue
+            cls._llm_strings(parsed_line, ndjson_fragments)
+        if ndjson_fragments:
+            return "".join(ndjson_fragments)
 
-        extracted: list[str] = []
-        for parsed in parsed_candidates:
-            cls._llm_strings(parsed, extracted)
-        if extracted:
-            # Remove repeated fragments emitted by streaming transports while
-            # preserving chunk order (delta tokens must remain concatenated).
-            joined = "\n".join(dict.fromkeys(item.strip() for item in extracted if item.strip()))
-            if joined.strip():
-                return joined
-
-        # Fallback for plain text, HTML wrappers, and non-standard SSE frames.
-        if data_events:
-            return "\n".join(item for item in data_events if item.strip())
         if "<" in raw and ">" in raw:
             return re.sub(r"<[^>]+>", " ", raw)
         return raw
@@ -6909,18 +6932,20 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _llm_tool_evidence(resp: Response | None, marker: str) -> bool:
-        """Pastikan canary berasal dari hasil eksekusi tool, bukan permintaan tool-call."""
+        """Buktikan canary berasal dari hasil tool, bukan sekadar tool-call."""
         if resp is None or not marker:
             return False
         raw = str(getattr(resp, "text", "") or "")
-        if marker not in raw:
+        combined = SatriaBaruScanner._llm_text(resp)
+        if marker not in raw and marker not in combined:
             return False
+
         candidates: list[Any] = []
         try:
             candidates.append(json.loads(raw))
         except Exception:
             pass
-        if "data:" in raw:
+        if any(line.lstrip().startswith("data:") for line in raw.splitlines()):
             for line in raw.splitlines():
                 line = line.strip()
                 if not line.startswith("data:"):
@@ -6933,27 +6958,43 @@ class SatriaBaruScanner:
                 except Exception:
                     continue
 
+        result_keys = {
+            "tool_result", "tool_output", "function_result", "execution_result",
+            "stdout", "stderr", "query_result", "result_text",
+        }
+
+        def contains_marker(node: Any) -> bool:
+            if isinstance(node, str):
+                return marker in node
+            if isinstance(node, dict):
+                return any(contains_marker(value) for value in node.values())
+            if isinstance(node, (list, tuple)):
+                return any(contains_marker(value) for value in node)
+            return False
+
         def has_tool_result(node: Any) -> bool:
             if isinstance(node, dict):
                 role = str(node.get("role", "")).lower()
-                if role in ("tool", "function") and marker in json.dumps(node, ensure_ascii=False):
+                block_type = str(node.get("type", "")).lower()
+                if role in ("tool", "function") and contains_marker(node):
                     return True
-                result_keys = {
-                    "tool_result", "tool_output", "function_result",
-                    "execution_result", "stdout", "stderr", "result",
-                }
+                if block_type in ("tool_result", "function_result", "execution_result") and contains_marker(node):
+                    return True
                 for key, value in node.items():
-                    if key in result_keys and marker in str(value):
+                    if str(key).lower() in result_keys and contains_marker(value):
                         return True
+                    # A tool-call argument is not evidence that a tool was executed.
+                    if str(key).lower() in ("tool_calls", "function_call", "arguments"):
+                        continue
                     if has_tool_result(value):
                         return True
-            elif isinstance(node, list):
+            elif isinstance(node, (list, tuple)):
                 return any(has_tool_result(value) for value in node)
             return False
 
         if any(has_tool_result(candidate) for candidate in candidates):
             return True
-        low = raw.lower()
+        low = (raw + "\n" + combined).lower()
         explicit_result_terms = (
             "function result", "tool result", "tool output",
             "stdout", "stderr", "execution result", "query result",
