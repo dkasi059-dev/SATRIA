@@ -6973,19 +6973,20 @@ class SatriaBaruScanner:
 
         default_routes = (
             "/chat", "/live-chat", "/livechat", "/api/chat", "/api/v1/chat",
+            "/v1/chat/completions", "/api/chat/completions",
+            "/api/v1/chat/completions", "/openai/v1/chat/completions",
             "/api/live-chat", "/api/chat/message", "/chat/send",
             "/api/messages", "/api/message", "/assistant", "/api/assistant",
             "/api/v1/assistant", "/ai", "/api/ai", "/api/llm",
             "/api/v1/llm", "/ask", "/api/ask", "/prompt", "/api/prompt",
             "/completion", "/api/completion", "/api/completions",
             "/conversation", "/api/conversation", "/api/conversations",
-            "/v1/chat/completions",
         )
         for path in default_routes:
             add(urljoin(origin + "/", path.lstrip("/")), "POST", "json", "message",
                 page_url=self.target_url, source="common route")
         # Preserve discovery order: forms and real crawler/JS endpoints outrank guesses.
-        return found[:12]
+        return found[:18]
 
     def _llm_send(
         self, ep: dict, prompt: str, field: str | None = None,
@@ -7046,7 +7047,7 @@ class SatriaBaruScanner:
     def _llm_validate(self, eps: list[dict]) -> list[dict]:
         """Validasi route chat dengan canary tanpa menganggap echo HTTP sebagai LLM."""
         valid: list[dict] = []
-        for original_ep in eps[:12]:
+        for original_ep in eps[:18]:
             if not self._within_budget():
                 break
             ep = dict(original_ep)
