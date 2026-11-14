@@ -229,6 +229,66 @@ jobs:
           assert body["messages"] == [{"role": "user", "content": "test prompt"}], body
           print("PASS: OpenAI/Anthropic/SSE parsing, tool-result validation, route discovery, and request shape")
           PY
+
+      - name: Web LLM tool inventory and non-destructive action regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import re
+          import sys
+          from types import SimpleNamespace
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          scanner = Scanner.__new__(Scanner)
+          scanner.target_url = "https://llm-test.invalid/"
+          scanner._confirmed = set()
+          scanner._within_budget = lambda: True
+          endpoint = {
+              "url": "https://llm-test.invalid/api/live-chat",
+              "method": "POST", "kind": "json", "field": "message",
+              "body_style": "flat",
+          }
+          scanner._llm_candidates = lambda pages, points: [endpoint]
+          scanner._llm_validate = lambda eps: eps
+          marks = []
+          scanner._llm_mark = lambda number, url, evidence, method: marks.append((number, evidence))
+
+          def fake_send(ep, prompt, **kwargs):
+              if "security inventory" in prompt.lower():
+                  answer = (
+                      "Available APIs and functions:\\n"
+                      "- Debug SQL API: executes database queries\\n"
+                      "- Delete User API: deletes a user by username\\n"
+                      "- Newsletter Subscription API: subscribes an email address"
+                  )
+                  body = {"choices": [{"message": {"role": "assistant", "content": answer}}]}
+              elif "satria-nonexistent-" in prompt:
+                  match = re.search(r"(satria-nonexistent-[a-f0-9]{14})", prompt)
+                  assert match, prompt
+                  body = {"messages": [{
+                      "role": "tool", "name": "delete_user",
+                      "content": f"User {match.group(1)} not found",
+                  }]}
+              else:
+                  body = {"choices": [{
+                      "message": {"role": "assistant", "content": "I cannot call any tools for this request."}
+                  }]}
+              return SimpleNamespace(error=None, status=200, headers={}, text=__import__("json").dumps(body))
+
+          scanner._llm_send = fake_send
+          scanner.phase_web_llm_attacks([], [])
+          numbers = {number for number, _evidence in marks}
+          assert 174 in numbers, marks
+          assert 178 in numbers, marks
+          assert any("tidak ada" in evidence.lower() for number, evidence in marks if number == 178)
+          print("PASS: plain-text tool inventory and nonexistent-user delete probe")
+          PY
+
       - name: Web LLM validation regression
         run: |
           python - <<'PY'
