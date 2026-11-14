@@ -6846,7 +6846,8 @@ class SatriaBaruScanner:
             ignored = {
                 "role", "id", "model", "created", "created_at", "object",
                 "index", "finish_reason", "usage", "metadata", "tool_calls",
-                "function_call", "prompt_tokens", "completion_tokens",
+                "function_call", "prompt_tokens", "completion_tokens", "type",
+                "event", "name", "tool_use_id", "partial_json",
             }
             for key, value in node.items():
                 if key not in visited and key not in ignored:
