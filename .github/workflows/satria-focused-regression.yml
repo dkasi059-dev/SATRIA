@@ -35,7 +35,7 @@ jobs:
           scanner = Scanner.__new__(Scanner)
 
           has_cache, is_hit, summary = scanner._wcp_cache_state(
-              SimpleNamespace(headers={"Cache-Status": "edge; hit; ttl=60", "Age": "4"})
+              SimpleNamespace(headers={"Cache-Status": "edge; hit; ttl=60"})
           )
           assert has_cache and is_hit and "cache-status" in summary.lower(), (has_cache, is_hit, summary)
 
