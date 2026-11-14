@@ -28,6 +28,8 @@ jobs:
 
           spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
           module = importlib.util.module_from_spec(spec)
+          import sys
+          sys.modules[spec.name] = module
           spec.loader.exec_module(module)
           Scanner = module.SatriaBaruScanner
           scanner = Scanner.__new__(Scanner)
@@ -76,6 +78,8 @@ jobs:
 
           spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
           module = importlib.util.module_from_spec(spec)
+          import sys
+          sys.modules[spec.name] = module
           spec.loader.exec_module(module)
           Scanner = module.SatriaBaruScanner
           scanner = Scanner.__new__(Scanner)
