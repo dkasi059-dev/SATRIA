@@ -6926,7 +6926,6 @@ class SatriaBaruScanner:
         return raw
 
     @staticmethod
-    def _llm_refusal(text: str) -> bool:    @staticmethod
     def _llm_refusal(text: str) -> bool:
         low = (text or "").lower()
         return any(term in low for term in (
@@ -7118,7 +7117,7 @@ class SatriaBaruScanner:
         found.sort(key=lambda item: (item.get("priority", 9), item["url"]))
         return found[:48]
 
-    def _llm_send(    def _llm_send(
+    def _llm_send(
         self, ep: dict, prompt: str, field: str | None = None,
         kind: str | None = None, extra: dict | None = None,
         body_style: str | None = None,
