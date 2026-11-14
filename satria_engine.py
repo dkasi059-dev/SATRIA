@@ -4824,6 +4824,75 @@ class SatriaBaruScanner:
             or value.endswith(".web-security-academy.net")
         )
 
+    def _jwt_discover_auth_pages(self, pages: list[Page]) -> list[Page]:
+        """Temukan halaman login same-origin yang mungkin terlewat oleh crawler."""
+        discovered = list(pages[:60])
+        seen = {str(getattr(page, "url", "") or "") for page in discovered}
+        candidates: list[str] = []
+        auth_path = re.compile(
+            r"(?:^|/)(?:login|log-in|signin|sign-in|authenticate|auth)(?:/|$)",
+            re.I,
+        )
+
+        for page in pages[:60]:
+            for link in getattr(page, "links", []) or []:
+                if not self._same_origin(link):
+                    continue
+                if auth_path.search(urlparse(link).path or "/") and link not in candidates:
+                    candidates.append(link)
+
+        known_paths = (
+            "/login", "/signin", "/sign-in", "/log-in", "/auth/login",
+            "/auth/signin", "/account/login", "/user/login",
+            "/users/sign_in", "/api/login", "/api/auth/login",
+        )
+        for path in known_paths:
+            candidate = urljoin(self.target_url, path)
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        for url in candidates[:12]:
+            if not self._within_budget():
+                break
+            if url in seen or not self._same_origin(url):
+                continue
+            response = self._request("GET", url, allow_redirects=False)
+            if response.error or response.status != 200 or not response.text:
+                continue
+            content_type = str((response.headers or {}).get("Content-Type", "")).lower()
+            body = response.text or ""
+            if "html" not in content_type and "<form" not in body.lower():
+                continue
+            soup = BeautifulSoup(body, "html.parser")
+            forms = self._parse_forms(response.url or url, soup)
+            if not forms and not re.search(
+                r"(password|sign[\s-]?in|log[\s-]?in|authentication)", body, re.I
+            ):
+                continue
+            links = []
+            for anchor in soup.find_all("a", href=True):
+                link = urljoin(response.url or url, str(anchor.get("href") or ""))
+                if self._same_origin(link):
+                    links.append(link)
+            inline_js = [
+                script.string[:120_000]
+                for script in soup.find_all("script")
+                if script.string
+            ]
+            page_url = response.url if self._same_origin(response.url or url) else url
+            discovered.append(Page(
+                url=page_url,
+                text=body,
+                links=list(dict.fromkeys(links)),
+                forms=forms,
+                cookie_names={cookie.name: cookie.value or "" for cookie in self.session.cookies},
+                js_text="\n".join(inline_js),
+                status=response.status,
+                headers=dict(response.headers or {}),
+            ))
+            seen.add(url)
+        return discovered
+
     @staticmethod
     def _jwt_b64d(value: str) -> bytes:
         import base64
@@ -5161,8 +5230,9 @@ class SatriaBaruScanner:
 
         parsed_target = urlparse(self.target_url)
         origin = f"{parsed_target.scheme}://{parsed_target.netloc}"
-        auth = self._jwt_login(pages)
-        tokens = self._jwt_collect_tokens(pages, auth)
+        auth_pages = self._jwt_discover_auth_pages(pages)
+        auth = self._jwt_login(auth_pages)
+        tokens = self._jwt_collect_tokens(auth_pages, auth)
         if not tokens:
             return
 
@@ -5226,13 +5296,13 @@ class SatriaBaruScanner:
             if not self._within_budget():
                 break
             anon_map[url] = self._request(
-                "GET", url, session=self._jwt_anon_session(), allow_redirects=True
+                "GET", url, session=self._jwt_anon_session(), allow_redirects=False
             )
 
         own_identity = ""
         if auth is not None and account_urls and self._within_budget():
             own_page = self._request(
-                "GET", account_urls[0], session=auth, allow_redirects=True
+                "GET", account_urls[0], session=auth, allow_redirects=False
             )
             if own_page and not own_page.error:
                 own_identity = self._jwt_identity(own_page.text or "")
@@ -5260,15 +5330,33 @@ class SatriaBaruScanner:
                 return "konten sesi terautentikasi terbuka"
             return None
 
-        def get_with(token: str, url: str, mode: str, cookie_name: str) -> Response:
+        active_header_name = "Authorization"
+
+        def get_with(
+            token: str, url: str, mode: str, cookie_name: str, header_name: str,
+        ) -> Response:
+            # Pertahankan cookie konteks (mis. CSRF/session non-JWT), tetapi jangan
+            # biarkan JWT asli menimpa token uji yang sedang diuji.
             session = self._jwt_anon_session()
+            source_session = auth or self.session
+            try:
+                session.cookies.update(source_session.cookies)
+                for cookie in list(session.cookies):
+                    if self._jwt_decode(cookie.value or ""):
+                        session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+            except Exception:
+                pass
+
             headers: dict[str, str] = {}
             if mode == "cookie":
                 session.cookies.set(cookie_name or "session", token)
             else:
-                headers["Authorization"] = "Bearer " + token
+                allowed_headers = {"authorization", "x-auth-token", "x-access-token"}
+                selected = header_name if str(header_name).lower() in allowed_headers else "Authorization"
+                prefix = "Bearer " if selected.lower() == "authorization" else ""
+                headers[selected] = prefix + token
             return self._request(
-                "GET", url, session=session, headers=headers, allow_redirects=True
+                "GET", url, session=session, headers=headers, allow_redirects=False
             )
 
         def confirm(
@@ -5280,16 +5368,16 @@ class SatriaBaruScanner:
             for url in use_urls:
                 if number in self._confirmed or not self._within_budget():
                     break
-                for mode in ("cookie", "bearer"):
+                for mode in ("cookie", "header"):
                     if not self._within_budget():
                         break
-                    response = get_with(forged, url, mode, cookie_name)
+                    response = get_with(forged, url, mode, cookie_name, active_header_name)
                     tag = verdict(url, response)
                     if not tag:
                         continue
                     control_tag = None
                     if control:
-                        control_response = get_with(control, url, mode, cookie_name)
+                        control_response = get_with(control, url, mode, cookie_name, active_header_name)
                         control_tag = verdict(url, control_response)
                     if control_tag and not allow_control_accept:
                         continue
@@ -5304,7 +5392,7 @@ class SatriaBaruScanner:
                     return True
             return False
 
-        for token, location, cookie_name in tokens[:6]:
+        for token, location, token_name in tokens[:8]:
             if not self._within_budget():
                 break
             decoded = self._jwt_decode(token)
@@ -5313,7 +5401,12 @@ class SatriaBaruScanner:
             header = dict(decoded["header"] or {})
             payload = dict(decoded["payload"] or {})
             parts = decoded["parts"]
-            cookie_name = cookie_name if location == "cookie" and cookie_name else "session"
+            cookie_name = token_name if location == "cookie" and token_name else "session"
+            active_header_name = (
+                token_name if location == "header"
+                and str(token_name).lower() in ("authorization", "x-auth-token", "x-access-token")
+                else "Authorization"
+            )
             algorithm = str(header.get("alg", "")).upper()
             random_key = ("satria-jwt-" + uuid.uuid4().hex).encode()
 
@@ -6767,7 +6860,7 @@ class SatriaBaruScanner:
 
     @classmethod
     def _llm_text(cls, resp: Response | None) -> str:
-        """Baca JSON chat umum, OpenAI/Anthropic, dan event-stream/SSE."""
+        """Baca JSON chat umum serta delta SSE secara berurutan tanpa memisahkan token."""
         if resp is None:
             return ""
         raw = str(getattr(resp, "text", "") or "")
@@ -6778,32 +6871,54 @@ class SatriaBaruScanner:
         if "data:" in stripped:
             for line in stripped.splitlines():
                 line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                item = line[5:].strip()
-                if item and item != "[DONE]":
-                    data_events.append(item)
+                if line.startswith("data:"):
+                    item = line[5:].strip()
+                    if item and item != "[DONE]":
+                        data_events.append(item)
 
-        parsed_candidates: list[Any] = []
-        for candidate in [stripped, *data_events]:
-            if not candidate:
-                continue
+        parsed_events: list[Any] = []
+        for item in data_events:
             try:
-                parsed_candidates.append(json.loads(candidate))
+                parsed_events.append(json.loads(item))
             except Exception:
                 continue
+
+        if parsed_events:
+            fragments: list[str] = []
+            for event in parsed_events:
+                if not isinstance(event, dict):
+                    continue
+                choices = event.get("choices")
+                if isinstance(choices, list):
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        content = choice.get("delta") or choice.get("message") or choice.get("text")
+                        if content is not None:
+                            cls._llm_strings(content, fragments)
+                elif isinstance(event.get("delta"), (dict, list, str)):
+                    cls._llm_strings(event.get("delta"), fragments)
+                elif isinstance(event.get("candidates"), (dict, list)):
+                    cls._llm_strings(event.get("candidates"), fragments)
+                elif isinstance(event.get("output_text"), str):
+                    fragments.append(event["output_text"])
+            if fragments:
+                return "".join(fragments)
+
+        parsed_candidates: list[Any] = []
+        try:
+            parsed_candidates.append(json.loads(stripped))
+        except Exception:
+            parsed_candidates.extend(parsed_events)
 
         extracted: list[str] = []
         for parsed in parsed_candidates:
             cls._llm_strings(parsed, extracted)
         if extracted:
-            # Remove repeated fragments emitted by streaming transports while
-            # preserving chunk order (delta tokens must remain concatenated).
             joined = "\n".join(dict.fromkeys(item.strip() for item in extracted if item.strip()))
             if joined.strip():
                 return joined
 
-        # Fallback for plain text, HTML wrappers, and non-standard SSE frames.
         if data_events:
             return "\n".join(item for item in data_events if item.strip())
         if "<" in raw and ">" in raw:
@@ -6811,6 +6926,7 @@ class SatriaBaruScanner:
         return raw
 
     @staticmethod
+    def _llm_refusal(text: str) -> bool:    @staticmethod
     def _llm_refusal(text: str) -> bool:
         low = (text or "").lower()
         return any(term in low for term in (
@@ -6825,7 +6941,8 @@ class SatriaBaruScanner:
         if resp is None or not marker:
             return False
         raw = str(getattr(resp, "text", "") or "")
-        if marker not in raw:
+        reconstructed = SatriaBaruScanner._llm_text(resp)
+        if marker not in raw and marker not in reconstructed:
             return False
         candidates: list[Any] = []
         try:
@@ -6873,7 +6990,7 @@ class SatriaBaruScanner:
         return any(term in low for term in explicit_result_terms)
 
     def _llm_candidates(self, pages: list[Page], points: list[Point] | None = None) -> list[dict]:
-        """Temukan chat/agent API dari form, crawler points, JavaScript, dan route umum."""
+        """Temukan endpoint LLM dari form, HTML/JS, crawler, dan rute API umum."""
         parsed_target = urlparse(self.target_url)
         origin = f"{parsed_target.scheme}://{parsed_target.netloc}"
         found: list[dict] = []
@@ -6882,7 +6999,7 @@ class SatriaBaruScanner:
         def add(
             url: str, method: str = "POST", kind: str = "json", field: str = "message",
             fields: tuple = (), *, page_url: str = "", source: str = "discovery",
-            body_style: str = "flat",
+            body_style: str = "flat", json_fields: dict | None = None,
         ) -> None:
             if not url:
                 return
@@ -6897,27 +7014,33 @@ class SatriaBaruScanner:
             if key in seen:
                 return
             seen.add(key)
+            priority = {
+                "HTML form": 0, "HTML/JavaScript": 1,
+                "crawler endpoint": 2, "common route": 4,
+            }.get(source, 3)
             found.append({
                 "url": action, "method": method, "kind": kind, "field": field,
                 "fields": tuple(fields or ()), "page_url": page_url or self.target_url,
                 "source": source, "body_style": body_style,
+                "json_fields": dict(json_fields or {}), "priority": priority,
             })
 
-        text_fields = (
+        text_fields = {
             "message", "prompt", "query", "input", "q", "text", "content",
             "chat", "ask", "question", "user_input", "userinput",
             "chatinput", "usermessage", "messagecontent", "request",
-        )
+            "instruction", "human_input", "user_message",
+        }
         llm_hints = (
             "chat", "assistant", "llm", "ai", "ask", "prompt", "message",
             "bot", "agent", "completion", "conversation", "copilot", "support",
+            "inference", "generate", "chatbot", "response", "model",
         )
 
-        for page in pages[:80]:
+        for page in pages[:120]:
             page_url = getattr(page, "url", "") or self.target_url
-            for form in (getattr(page, "forms", []) or [])[:12]:
+            for form in (getattr(page, "forms", []) or [])[:20]:
                 names = [str(name) for name, _value, _kind in getattr(form, "fields", ())]
-                lowered = [name.lower() for name in names]
                 action = getattr(form, "action", "") or page_url
                 hint = (str(action) + " " + page_url).lower()
                 field = next((name for name in names if name.lower() in text_fields), "")
@@ -6933,20 +7056,26 @@ class SatriaBaruScanner:
                 (getattr(page, "text", "") or "") + "\n"
                 + (getattr(page, "js_text", "") or "")
             )
-            # URL literals in fetch(), axios.post(), XMLHttpRequest, and app config.
+            model_match = re.search(
+                r"""["']model["']\s*:\s*["']([^"']{1,160})["']""",
+                page_blob, re.I,
+            )
+            model_fields = {"model": model_match.group(1)} if model_match else {}
             route_pattern = re.compile(
-                r"""["']([^"' ]{1,220}(?:chat|assistant|prompt|completion|ask|agent|conversation|message|copilot)[^"' ]{0,100})["']""",
+                r"""["']([^"' ]{1,220}(?:chat|assistant|prompt|completion|ask|agent|conversation|message|copilot|generate|inference|predict|responses|models)[^"' ]{0,100})["']""",
                 re.I,
             )
             for match in route_pattern.finditer(page_blob):
                 value = match.group(1)
-                if value.startswith("/") or value.startswith("http"):
-                    add(value, "POST", "json", "message", page_url=page_url, source="HTML/JavaScript")
-                elif "/" in value or value.lower().startswith(("api", "chat", "assistant", "llm")):
-                    # Resolve relative fetch()/axios routes against the page URL.
-                    add(value, "POST", "json", "message", page_url=page_url, source="HTML/JavaScript")
+                if value.startswith(("/", "http")) or "/" in value or value.lower().startswith(
+                    ("api", "chat", "assistant", "llm", "v1")
+                ):
+                    add(
+                        value, "POST", "json", "message", page_url=page_url,
+                        source="HTML/JavaScript", json_fields=model_fields,
+                    )
 
-        for point in (points or [])[:160]:
+        for point in (points or [])[:240]:
             url = getattr(point, "url", "") or ""
             method = (getattr(point, "method", "GET") or "GET").upper()
             names = [str(name) for name, _value, _kind in getattr(point, "fields", ()) or ()]
@@ -6958,7 +7087,9 @@ class SatriaBaruScanner:
             field = next((name for name in names if name.lower() in text_fields), "")
             if not field and candidate_name.lower() in text_fields:
                 field = candidate_name
-            if any(term in context for term in llm_hints) and (field or method in ("GET", "POST", "PUT", "PATCH")):
+            if any(term in context for term in llm_hints) and (
+                field or method in ("GET", "POST", "PUT", "PATCH")
+            ):
                 add(
                     url, method, "form" if names or method == "GET" else "json",
                     field or candidate_name or "message", tuple(getattr(point, "fields", ()) or ()),
@@ -6967,22 +7098,27 @@ class SatriaBaruScanner:
                 )
 
         default_routes = (
-            "/chat", "/live-chat", "/livechat", "/api/chat", "/api/v1/chat",
-            "/api/chat/message", "/chat/send", "/api/messages", "/api/message",
+            "/chat", "/chat/", "/live-chat", "/livechat", "/chatbot",
+            "/api/chat", "/api/v1/chat", "/api/chat/message", "/api/chat/completions",
+            "/chat/send", "/api/messages", "/api/message",
             "/assistant", "/api/assistant", "/api/v1/assistant",
             "/ai", "/api/ai", "/api/llm", "/api/v1/llm",
             "/ask", "/api/ask", "/prompt", "/api/prompt",
             "/completion", "/api/completion", "/api/completions",
             "/conversation", "/api/conversation", "/api/conversations",
-            "/v1/chat/completions",
+            "/v1/chat/completions", "/v1/responses", "/responses", "/api/responses",
+            "/generate", "/api/generate", "/api/infer", "/inference",
+            "/api/inference", "/api/predict", "/predict",
         )
         for path in default_routes:
-            add(urljoin(origin + "/", path.lstrip("/")), "POST", "json", "message",
-                page_url=self.target_url, source="common route")
-        # Preserve discovery order: forms and real crawler/JS endpoints outrank guesses.
-        return found[:16]
+            add(
+                urljoin(origin + "/", path.lstrip("/")), "POST", "json", "message",
+                page_url=self.target_url, source="common route",
+            )
+        found.sort(key=lambda item: (item.get("priority", 9), item["url"]))
+        return found[:48]
 
-    def _llm_send(
+    def _llm_send(    def _llm_send(
         self, ep: dict, prompt: str, field: str | None = None,
         kind: str | None = None, extra: dict | None = None,
         body_style: str | None = None,
@@ -7036,7 +7172,7 @@ class SatriaBaruScanner:
     def _llm_validate(self, eps: list[dict]) -> list[dict]:
         """Validasi route chat dengan canary tanpa menganggap echo HTTP sebagai LLM."""
         valid: list[dict] = []
-        for original_ep in eps[:12]:
+        for original_ep in eps[:20]:
             if not self._within_budget():
                 break
             ep = dict(original_ep)
@@ -7050,11 +7186,27 @@ class SatriaBaruScanner:
             if ep.get("kind") == "form":
                 variants.append(("form", ep.get("field", "message")))
             else:
-                for style, field in (
-                    ("flat", "message"), ("flat", "prompt"), ("flat", "input"),
-                    ("flat", "query"), ("messages", "messages"),
-                ):
-                    variants.append((style, field))
+                route = str(ep.get("url") or "").lower()
+                preferred = str(ep.get("field") or "message")
+                if "/chat/completions" in route:
+                    variants.extend([
+                        ("messages", "messages"), ("flat", preferred),
+                        ("flat", "message"), ("flat", "prompt"),
+                        ("flat", "input"), ("flat", "query"),
+                    ])
+                elif "/responses" in route:
+                    variants.extend([
+                        ("input", "input"), ("flat", preferred),
+                        ("flat", "message"), ("flat", "prompt"),
+                        ("flat", "query"), ("messages", "messages"),
+                    ])
+                else:
+                    variants.extend([
+                        ("flat", preferred), ("flat", "message"),
+                        ("flat", "prompt"), ("flat", "input"),
+                        ("flat", "query"), ("messages", "messages"),
+                    ])
+                variants = list(dict.fromkeys(variants))[:6]
             for style, field in variants:
                 if not self._within_budget():
                     break
@@ -7082,28 +7234,75 @@ class SatriaBaruScanner:
     def phase_web_llm_attacks(self, pages: list[Page], points: list[Point]) -> None:
         if not self._within_budget():
             return
-        # A small shared non-SQL quota previously stopped discovery before the
-        # actual chat endpoint and test prompts could run.
+        # Discovery LLM diberi kuota sendiri agar rute chat tidak terpotong
+        # oleh kuota default kategori non-SQL.
         if isinstance(self._scan_progress, dict):
             self._scan_progress["request_limit"] = max(
-                int(self._scan_progress.get("request_limit", self.non_sql_category_request_limit)), 120
+                int(self._scan_progress.get("request_limit", self.non_sql_category_request_limit)), 180
             )
-        endpoints = self._llm_validate(self._llm_candidates(pages, points))
+        origin = f"{urlparse(self.target_url).scheme}://{urlparse(self.target_url).netloc}"
+        llm_pages = list(pages[:120])
+        known_page_urls = {str(getattr(page, "url", "") or "") for page in llm_pages}
+        surface_paths = (
+            "/chat", "/live-chat", "/assistant", "/support/chat", "/support",
+            "/ask", "/ai", "/bot", "/chatbot",
+        )
+        for path in surface_paths:
+            if not self._within_budget():
+                break
+            surface_url = urljoin(origin + "/", path.lstrip("/"))
+            if surface_url in known_page_urls:
+                continue
+            surface = self._request("GET", surface_url, allow_redirects=False)
+            if surface.error or surface.status != 200 or not surface.text:
+                continue
+            content_type = str((surface.headers or {}).get("Content-Type", "")).lower()
+            if "html" not in content_type and "<html" not in (surface.text or "").lower():
+                continue
+            soup = BeautifulSoup(surface.text, "html.parser")
+            inline_js = [
+                script.string[:120_000]
+                for script in soup.find_all("script")
+                if script.string
+            ]
+            llm_pages.append(Page(
+                url=surface.url or surface_url,
+                text=surface.text,
+                links=[
+                    urljoin(surface.url or surface_url, str(anchor.get("href") or ""))
+                    for anchor in soup.find_all("a", href=True)
+                    if self._same_origin(urljoin(surface.url or surface_url, str(anchor.get("href") or "")))
+                ],
+                forms=self._parse_forms(surface.url or surface_url, soup),
+                cookie_names={cookie.name: cookie.value or "" for cookie in self.session.cookies},
+                js_text="\n".join(inline_js),
+                status=surface.status,
+                headers=dict(surface.headers or {}),
+            ))
+            known_page_urls.add(surface_url)
+
+        endpoints = self._llm_validate(self._llm_candidates(llm_pages, points))
         if not endpoints:
             return
-        origin = f"{urlparse(self.target_url).scheme}://{urlparse(self.target_url).netloc}"
 
         def ask(prompt: str) -> tuple[dict, Response, str] | None:
+            first_refusal = None
             for endpoint in endpoints:
                 if not self._within_budget():
-                    return None
+                    break
                 response = self._llm_send(endpoint, prompt)
                 if response.error or (response.status or 0) >= 400:
                     continue
-                output = self._llm_text(response)
-                if output.strip():
-                    return endpoint, response, output
-            return None
+                output = self._llm_text(response).strip()
+                if not output:
+                    continue
+                candidate = (endpoint, response, output)
+                if self._llm_refusal(output):
+                    if first_refusal is None:
+                        first_refusal = candidate
+                    continue
+                return candidate
+            return first_refusal
 
         # 174 excessive agency: inventory available tools, methods, and schemas.
         # Never invoke a destructive tool merely to prove that it exists.
