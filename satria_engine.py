@@ -7002,11 +7002,11 @@ class SatriaBaruScanner:
         return any(term in low for term in explicit_result_terms)
 
     def _llm_candidates(self, pages: list[Page], points: list[Point] | None = None) -> list[dict]:
-        """Temukan chat/agent API dari form, crawler points, JavaScript, dan route umum."""
+        """Temukan chat/agent API dari form, crawler, JavaScript, dan route umum."""
         parsed_target = urlparse(self.target_url)
         origin = f"{parsed_target.scheme}://{parsed_target.netloc}"
         found: list[dict] = []
-        seen: set[tuple[str, str, str]] = set()
+        seen: set[tuple[str, str, str, str]] = set()
 
         def add(
             url: str, method: str = "POST", kind: str = "json", field: str = "message",
@@ -7022,7 +7022,8 @@ class SatriaBaruScanner:
             except Exception:
                 return
             method = (method or "POST").upper()
-            key = (action, method, kind)
+            field = str(field or "message")
+            key = (action, method, kind, field.lower())
             if key in seen:
                 return
             seen.add(key)
@@ -7032,84 +7033,90 @@ class SatriaBaruScanner:
                 "source": source, "body_style": body_style,
             })
 
-        text_fields = (
-            "message", "prompt", "query", "input", "q", "text", "content",
-            "chat", "ask", "question", "user_input", "userinput",
-            "chatinput", "usermessage", "messagecontent", "request",
+        text_field_pattern = re.compile(
+            r"(message|prompt|query|question|input|text|content|chat|ask|request|"
+            r"conversation|user.?input|user.?message|chat.?input|inquiry|utterance)",
+            re.I,
         )
         llm_hints = (
             "chat", "assistant", "llm", "ai", "ask", "prompt", "message",
             "bot", "agent", "completion", "conversation", "copilot", "support",
+            "inference", "generate", "respond", "answer",
         )
 
-        for page in pages[:80]:
+        for page in pages[:100]:
             page_url = getattr(page, "url", "") or self.target_url
-            for form in (getattr(page, "forms", []) or [])[:12]:
-                names = [str(name) for name, _value, _kind in getattr(form, "fields", ())]
-                lowered = [name.lower() for name in names]
-                action = getattr(form, "action", "") or page_url
-                hint = (str(action) + " " + page_url).lower()
-                field = next((name for name in names if name.lower() in text_fields), "")
+            for form in (getattr(page, "forms", []) or [])[:16]:
+                fields = tuple(getattr(form, "fields", ()) or ())
+                names = [str(name) for name, _value, _kind in fields]
+                hint = (str(getattr(form, "action", "") or "") + " " + page_url).lower()
+                field = next((name for name in names if text_field_pattern.search(name)), "")
                 looks_like_chat = any(term in hint for term in llm_hints) or bool(field)
                 if looks_like_chat and field:
+                    action = getattr(form, "action", "") or page_url
                     add(
                         action, getattr(form, "method", "POST") or "POST",
-                        "form", field, tuple(getattr(form, "fields", ())),
-                        page_url=page_url, source="HTML form",
+                        "form", field, fields, page_url=page_url, source="HTML form",
                     )
 
             page_blob = (
                 (getattr(page, "text", "") or "") + "\n"
                 + (getattr(page, "js_text", "") or "")
             )
-            # URL literals in fetch(), axios.post(), XMLHttpRequest, and app config.
             route_pattern = re.compile(
-                r"""["']([^"' ]{1,220}(?:chat|assistant|prompt|completion|ask|agent|conversation|message|copilot)[^"' ]{0,100})["']""",
+                r"""["']([^"' ]{1,220}(?:chat|assistant|prompt|completion|completions|responses|"
+                r"ask|agent|conversation|message|copilot|inference|generate|llm|bot|support|query)"
+                r"[^"' ]{0,120})["']""",
                 re.I,
             )
             for match in route_pattern.finditer(page_blob):
                 value = match.group(1)
                 if value.startswith("/") or value.startswith("http"):
                     add(value, "POST", "json", "message", page_url=page_url, source="HTML/JavaScript")
-                elif "/" in value or value.lower().startswith(("api", "chat", "assistant", "llm")):
-                    # Resolve relative fetch()/axios routes against the page URL.
+                elif "/" in value or value.lower().startswith(("api", "chat", "assistant", "llm", "v1")):
                     add(value, "POST", "json", "message", page_url=page_url, source="HTML/JavaScript")
 
-        for point in (points or [])[:160]:
+        for point in (points or [])[:200]:
             url = getattr(point, "url", "") or ""
             method = (getattr(point, "method", "GET") or "GET").upper()
-            names = [str(name) for name, _value, _kind in getattr(point, "fields", ()) or ()]
+            fields = tuple(getattr(point, "fields", ()) or ())
+            names = [str(name) for name, _value, _kind in fields]
             candidate_name = str(getattr(point, "name", "") or "")
             context = " ".join((
                 url, candidate_name, str(getattr(point, "label", "")),
                 str(getattr(point, "original", "")),
             )).lower()
-            field = next((name for name in names if name.lower() in text_fields), "")
-            if not field and candidate_name.lower() in text_fields:
+            field = next((name for name in names if text_field_pattern.search(name)), "")
+            if not field and text_field_pattern.search(candidate_name):
                 field = candidate_name
-            if any(term in context for term in llm_hints) and (field or method in ("GET", "POST", "PUT", "PATCH")):
+            if any(term in context for term in llm_hints) and (
+                field or method in ("GET", "POST", "PUT", "PATCH")
+            ):
                 add(
                     url, method, "form" if names or method == "GET" else "json",
-                    field or candidate_name or "message", tuple(getattr(point, "fields", ()) or ()),
+                    field or candidate_name or "message", fields,
                     page_url=getattr(point, "page_url", "") or self.target_url,
                     source="crawler endpoint",
                 )
 
         default_routes = (
             "/chat", "/live-chat", "/livechat", "/api/chat", "/api/v1/chat",
-            "/api/chat/message", "/chat/send", "/api/messages", "/api/message",
-            "/assistant", "/api/assistant", "/api/v1/assistant",
+            "/api/v2/chat", "/api/chat/message", "/chat/send", "/api/messages",
+            "/api/message", "/assistant", "/api/assistant", "/api/v1/assistant",
             "/ai", "/api/ai", "/api/llm", "/api/v1/llm",
             "/ask", "/api/ask", "/prompt", "/api/prompt",
             "/completion", "/api/completion", "/api/completions",
             "/conversation", "/api/conversation", "/api/conversations",
-            "/v1/chat/completions",
+            "/bot", "/api/bot", "/api/agent", "/api/v1/agent",
+            "/api/inference", "/api/generate", "/generate",
+            "/v1/chat/completions", "/v1/responses",
         )
         for path in default_routes:
-            add(urljoin(origin + "/", path.lstrip("/")), "POST", "json", "message",
-                page_url=self.target_url, source="common route")
-        # Preserve discovery order: forms and real crawler/JS endpoints outrank guesses.
-        return found[:16]
+            add(
+                urljoin(origin + "/", path.lstrip("/")), "POST", "json", "message",
+                page_url=self.target_url, source="common route",
+            )
+        return found[:24]
 
     def _llm_send(
         self, ep: dict, prompt: str, field: str | None = None,
@@ -7119,6 +7126,7 @@ class SatriaBaruScanner:
         kind = kind or ep.get("kind", "json")
         field = field or ep.get("field", "message")
         body_style = body_style or ep.get("body_style", "flat")
+        session = ep.get("session")
         if kind == "form":
             data = {str(name): value for name, value, _kind in ep.get("fields", ())}
             data.update(ep.get("csrf") or {})
@@ -7126,12 +7134,12 @@ class SatriaBaruScanner:
             data[field] = prompt
             if ep.get("method", "POST").upper() == "GET":
                 return self._request(
-                    ep["method"], ep["url"], params=data,
+                    ep["method"], ep["url"], session=session, params=data,
                     headers={"Accept": "application/json,text/event-stream,text/html,*/*"},
                     allow_redirects=True,
                 )
             return self._request(
-                ep["method"], ep["url"], data=data,
+                ep["method"], ep["url"], session=session, data=data,
                 headers={"Accept": "application/json,text/event-stream,text/html,*/*"},
                 allow_redirects=True,
             )
@@ -7154,7 +7162,7 @@ class SatriaBaruScanner:
             body = dict(base_fields)
             body[field] = prompt
         return self._request(
-            ep["method"], ep["url"], data=json.dumps(body),
+            ep["method"], ep["url"], session=session, data=json.dumps(body),
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json,text/event-stream,*/*",
@@ -7165,12 +7173,12 @@ class SatriaBaruScanner:
     def _llm_validate(self, eps: list[dict]) -> list[dict]:
         """Validasi route chat dengan canary tanpa menganggap echo HTTP sebagai LLM."""
         valid: list[dict] = []
-        for original_ep in eps[:12]:
+        for original_ep in eps[:16]:
             if not self._within_budget():
                 break
             ep = dict(original_ep)
             if ep.get("kind") == "form" and ep.get("page_url"):
-                page = self._request("GET", ep["page_url"], allow_redirects=True)
+                page = self._request("GET", ep["page_url"], session=ep.get("session"), allow_redirects=True)
                 if not page.error:
                     ep["csrf"] = self._ac_csrf(page.text or "")
             marker = f"SATRIA-LLM-CANARY-{uuid.uuid4().hex[:12]}"
