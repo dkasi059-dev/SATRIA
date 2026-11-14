@@ -212,6 +212,7 @@ jobs:
           candidates = scanner._llm_candidates([unrelated, actual_chat], points)
           urls = [item["url"] for item in candidates]
           assert "https://llm-test.invalid/api/live-chat" in urls, urls
+          assert "https://llm-test.invalid/v1/chat/completions" in urls, urls
           assert "https://llm-test.invalid/api/email" not in urls, urls
 
           # Chat Completions/messages body is created in the expected shape.
@@ -321,5 +322,10 @@ jobs:
           }]
           valid = scanner._llm_validate(endpoints)
           assert valid and valid[0]["body_style"] in ("flat", "messages", "input", "query")
-          print(f"PASS: LLM endpoint validation using {valid[0]['body_style']} payload")
+          # An HTTP echo that repeats the whole prompt must not validate as an LLM.
+          scanner._llm_send = lambda ep, prompt, **kwargs: SimpleNamespace(
+              error=None, status=200, headers={}, text=prompt
+          )
+          assert scanner._llm_validate(endpoints) == []
+          print(f"PASS: transformed canary validation rejects plain echo; payload={valid[0]['body_style']}")
           PY
