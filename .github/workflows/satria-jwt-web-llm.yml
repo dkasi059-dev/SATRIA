@@ -1,0 +1,325 @@
+name: SATRIA JWT and Web LLM regression
+
+on:
+  push:
+    branches:
+      - fix/jwt-web-llm-20261114
+
+permissions:
+  contents: read
+
+jobs:
+  focused-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install focused dependencies
+        run: python -m pip install --upgrade requests beautifulsoup4 "PyJWT[crypto]"
+      - name: Compile complete engine
+        run: python -m py_compile satria_engine.py
+      - name: JWT helper and crypto regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          import time
+          import jwt
+          from cryptography.hazmat.primitives.asymmetric import rsa
+          from cryptography.hazmat.primitives import serialization
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          token = Scanner._jwt_sign(
+              {"alg": "HS256", "typ": "JWT"},
+              {"sub": "wiener", "exp": int(time.time()) + 3600},
+              key="not-a-weak-secret",
+          )
+          assert token and Scanner._jwt_decode(token)["payload"]["sub"] == "wiener"
+          assert token in Scanner._jwt_tokens_in_text("Authorization: Bearer " + token)
+          assert token in Scanner._jwt_tokens_in_text('<div data-token="' + token + '"></div>')
+          assert token in Scanner._jwt_tokens_in_text(token.replace(".", "%2E"))
+
+          private_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+          private_pem = private_key.private_bytes(
+              serialization.Encoding.PEM,
+              serialization.PrivateFormat.PKCS8,
+              serialization.NoEncryption(),
+          )
+          token_a = jwt.encode({"sub": "one", "n": 1}, private_pem, algorithm="RS256")
+          token_b = jwt.encode({"sub": "two", "n": 2}, private_pem, algorithm="RS256")
+          derived = Scanner._jwt_rsa_pem_from_tokens([token_a, token_b])
+          assert derived and "BEGIN PUBLIC KEY" in derived[0], "RSA modulus derivation failed"
+          assert "BEGIN RSA PUBLIC KEY" in derived[1], "PKCS1 public key variant missing"
+          print("PASS: JWT extraction, decode, RS256 modulus derivation")
+          PY
+      - name: JWT live verification regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          import threading
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import urlparse
+          import requests
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          state = {"mode": "ignore"}
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  token = ""
+                  auth = self.headers.get("Authorization", "")
+                  if auth.lower().startswith("bearer "):
+                      token = auth.split(None, 1)[1]
+                  if not token:
+                      cookie = self.headers.get("Cookie", "")
+                      for part in cookie.split(";"):
+                          if part.strip().startswith("session="):
+                              token = part.strip().split("=", 1)[1]
+                  decoded = Scanner._jwt_decode(token) if token else None
+                  accepted = False
+                  username = ""
+                  if decoded:
+                      header = decoded["header"]
+                      payload = decoded["payload"]
+                      username = str(payload.get("sub", ""))
+                      if state["mode"] == "ignore":
+                          accepted = bool(username)
+                      elif state["mode"] == "none_only":
+                          accepted = str(header.get("alg", "")).lower() == "none" and not decoded["parts"][2]
+                  if accepted:
+                      body = (
+                          "<html><h1>Admin panel</h1> User management "
+                          f"Your username is: {username} <a>Log out</a></html>"
+                      ).encode()
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/html")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  elif decoded and username == "wiener" and state["mode"] == "ignore":
+                      body = b"<html>Your username is: wiener <a>Log out</a></html>"
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/html")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  else:
+                      body = b"<html>Please log in</html>"
+                      self.send_response(302)
+                      self.send_header("Location", "/login")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+              def log_message(self, *_args):
+                  pass
+
+          server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+          thread = threading.Thread(target=server.serve_forever, daemon=True)
+          thread.start()
+          base = f"http://127.0.0.1:{server.server_port}"
+          def scanner_for(token, confirmed=None):
+              scanner = Scanner.__new__(Scanner)
+              scanner.target_url = base + "/"
+              scanner.session = requests.Session()
+              scanner.session.cookies.set("session", token)
+              scanner.timeout = 2.0
+              scanner.started = time.monotonic()
+              scanner.deadline_seconds = 25.0
+              scanner.max_requests = 400
+              scanner.non_sql_category_request_limit = 32
+              scanner.request_count = 0
+              scanner._scan_progress = {
+                  "index": 17, "label": "JWT", "event_seq": 0,
+                  "request_start": 0, "request_limit": 160,
+              }
+              scanner.stats = {"requests": 0, "errors": []}
+              scanner._confirmed = set(confirmed or [])
+              scanner._jwt_login_artifacts = []
+              scanner._jwt_mark = lambda number, url, evidence, method: scanner._confirmed.add(number)
+              return scanner
+
+          try:
+              source = Scanner._jwt_sign(
+                  {"alg": "HS256", "typ": "JWT"},
+                  {"sub": "wiener", "exp": int(time.time()) + 3600},
+                  key="unrelated-random-source-key",
+              )
+              state["mode"] = "ignore"
+              scanner = scanner_for(source)
+              scanner.phase_jwt(
+                  [module.Page(url=base + "/my-account", text="<title>My account</title>")],
+                  [],
+              )
+              assert 147 in scanner._confirmed, scanner._confirmed
+
+              state["mode"] = "none_only"
+              scanner = scanner_for(source, confirmed={147})
+              scanner.phase_jwt(
+                  [module.Page(url=base + "/my-account", text="<title>My account</title>")],
+                  [],
+              )
+              assert 148 in scanner._confirmed, scanner._confirmed
+              print("PASS: live JWT unverified-signature and alg=none detection")
+          finally:
+              server.shutdown()
+              server.server_close()
+              thread.join(timeout=2)
+          PY
+      - name: Web LLM discovery, JSON and SSE regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import json
+          import re
+          import sys
+          import threading
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import urlparse
+          import requests
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+          Response = module.Response
+          Page = module.Page
+
+          json_response = Response(
+              200, "http://example.test", 
+              json.dumps({"choices": [{"message": {"role": "assistant", "content": "hello from model"}}]}),
+              {"Content-Type": "application/json"}, 0.01
+          )
+          assert "hello from model" in Scanner._llm_text(json_response)
+
+          sse = Response(
+              200, "http://example.test",
+              'data: {"choices":[{"delta":{"content":"hello "}}]}\n\n'
+              'data: {"choices":[{"delta":{"content":"world"}}]}\n\n'
+              'data: [DONE]\n',
+              {"Content-Type": "text/event-stream"}, 0.01
+          )
+          parsed_sse = Scanner._llm_text(sse)
+          assert "hello" in parsed_sse and "world" in parsed_sse, parsed_sse
+
+          marker = "SATRIA-TOOL-CANARY"
+          tool_result = Response(
+              200, "http://example.test",
+              json.dumps({"messages": [{"role": "tool", "content": marker}]}), {}, 0.01
+          )
+          fake_tool_call = Response(
+              200, "http://example.test",
+              json.dumps({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                  {"function": {"name": "run", "arguments": marker}}
+              ]}}]}), {}, 0.01
+          )
+          assert Scanner._llm_tool_evidence(tool_result, marker)
+          assert not Scanner._llm_tool_evidence(fake_tool_call, marker)
+
+          class ScannerStub:
+              target_url = "https://example.test/"
+              def _same_origin(self, url):
+                  p, q = urlparse(url), urlparse(self.target_url)
+                  return p.scheme == q.scheme and p.netloc == q.netloc
+
+          stub = ScannerStub()
+          page = Page(
+              url="https://example.test/",
+              text='<script>fetch("/api/v1/chat", {method:"POST"})</script>',
+              js_text='axios.post("/assistant/message", body)',
+          )
+          candidates = Scanner._llm_candidates(stub, [page], [])
+          urls = {item["url"] for item in candidates}
+          assert "https://example.test/api/v1/chat" in urls
+          assert "https://example.test/assistant/message" in urls
+          print("PASS: JSON/SSE parsing, tool result distinction, endpoint discovery")
+          PY
+      - name: Web LLM body-shape validation regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import json
+          import re
+          import sys
+          import threading
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          import requests
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          seen = []
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  size = int(self.headers.get("Content-Length", "0"))
+                  body = json.loads(self.rfile.read(size) or b"{}")
+                  seen.append(body)
+                  if not isinstance(body.get("messages"), list):
+                      self.send_response(400)
+                      self.send_header("Content-Length", "0")
+                      self.end_headers()
+                      return
+                  prompt = body["messages"][0].get("content", "")
+                  match = re.search(r"(SATRIA-LLM-CANARY-[A-Fa-f0-9]+)", prompt)
+                  result = match.group(1) if match else "missing"
+                  payload = json.dumps({
+                      "choices": [{"message": {"role": "assistant", "content": result}}]
+                  }).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(payload)))
+                  self.end_headers()
+                  self.wfile.write(payload)
+              def log_message(self, *_args):
+                  pass
+
+          server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+          thread = threading.Thread(target=server.serve_forever, daemon=True)
+          thread.start()
+          base = f"http://127.0.0.1:{server.server_port}/api/chat"
+          try:
+              scanner = Scanner.__new__(Scanner)
+              scanner.target_url = base
+              scanner.session = requests.Session()
+              scanner.timeout = 2.0
+              scanner.started = time.monotonic()
+              scanner.deadline_seconds = 25.0
+              scanner.max_requests = 100
+              scanner.non_sql_category_request_limit = 32
+              scanner.request_count = 0
+              scanner._scan_progress = {
+                  "index": 20, "label": "Web LLM", "event_seq": 0,
+                  "request_start": 0, "request_limit": 100,
+              }
+              scanner.stats = {"requests": 0, "errors": []}
+              endpoint = {
+                  "url": base, "method": "POST", "kind": "json",
+                  "field": "message", "page_url": base,
+              }
+              valid = scanner._llm_validate([endpoint])
+              assert valid and valid[0]["body_style"] == "messages", valid
+              assert any("messages" in body for body in seen), seen
+              print("PASS: endpoint validates OpenAI-compatible messages body after invalid shapes")
+          finally:
+              server.shutdown()
+              server.server_close()
+              thread.join(timeout=2)
+          PY
