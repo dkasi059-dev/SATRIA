@@ -247,6 +247,7 @@ jobs:
           scanner = Scanner.__new__(Scanner)
           scanner.target_url = "https://llm-test.invalid/"
           scanner._confirmed = set()
+          scanner._scan_progress = None
           scanner._within_budget = lambda: True
           endpoint = {
               "url": "https://llm-test.invalid/api/live-chat",
