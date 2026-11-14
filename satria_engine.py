@@ -9515,92 +9515,100 @@ class SatriaBaruScanner:
     # ======================== HTTP Request Smuggling (91-112) ========================
 
     def _smug_target(self) -> tuple[str, int, str, str]:
-        parsed = urlparse(self.target_url)
-        scheme = (parsed.scheme or "http").lower()
-        host = parsed.hostname or ""
-        port = parsed.port or (443 if scheme == "https" else 80)
-        path = parsed.path or "/"
-        if parsed.query:
-            path += "?" + parsed.query
+        pu = urlparse(self.target_url)
+        scheme = (pu.scheme or "http").lower()
+        host = pu.hostname or ""
+        port = pu.port or (443 if scheme == "https" else 80)
+        path = pu.path or "/"
+        if pu.query:
+            path += "?" + pu.query
         return scheme, port, host, path
 
     def _smug_connect(self, timeout: float | None = None):
-        import socket
-        import ssl as _ssl
-
+        import socket, ssl as _ssl
         scheme, port, host, _ = self._smug_target()
         if not host:
             return None
-        conn_timeout = timeout if timeout is not None else max(
-            3.0, float(getattr(self, "timeout", 8.0) or 8.0)
-        )
+        t = timeout if timeout is not None else max(3.0, float(getattr(self, "timeout", 8.0) or 8.0))
         try:
-            sock = socket.create_connection((host, port), timeout=conn_timeout)
-            sock.settimeout(conn_timeout)
+            s = socket.create_connection((host, port), timeout=t)
         except Exception:
             return None
+        try:
+            s.settimeout(t)
+        except Exception:
+            pass
         if scheme == "https":
             try:
-                context = _ssl.create_default_context()
-                context.set_alpn_protocols(["http/1.1"])
-                sock = context.wrap_socket(sock, server_hostname=host)
+                ctx = _ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                # Raw scanner constructs HTTP/1.1 framing; explicitly negotiate HTTP/1.1.
+                try:
+                    ctx.set_alpn_protocols(["http/1.1"])
+                except Exception:
+                    pass
+                s = ctx.wrap_socket(s, server_hostname=host)
             except Exception:
                 try:
-                    sock.close()
+                    s.close()
                 except Exception:
                     pass
                 return None
-        return sock
+        return s
 
     @staticmethod
     def _smug_dechunk(data: bytes) -> tuple[bytes | None, int]:
-        output = bytearray()
-        position = 0
+        """Dekode satu body chunked. Kembalikan (body, byte_terpakai) atau (None, 0)."""
+        out = bytearray()
+        pos = 0
         while True:
-            newline = data.find(b"\r\n", position)
-            if newline < 0:
+            nl = data.find(b"\r\n", pos)
+            if nl < 0:
                 return None, 0
             try:
-                size = int(data[position:newline].split(b";")[0].strip() or b"0", 16)
+                size = int(data[pos:nl].split(b";")[0].strip() or b"0", 16)
             except ValueError:
                 return None, 0
-            position = newline + 2
+            pos = nl + 2
             if size == 0:
-                end = data.find(b"\r\n", position)
+                end = data.find(b"\r\n", pos)
                 if end < 0:
                     return None, 0
-                return bytes(output), end + 2
-            if len(data) < position + size + 2:
+                return bytes(out), end + 2
+            if len(data) < pos + size + 2:
                 return None, 0
-            output.extend(data[position:position + size])
-            position += size + 2
+            out += data[pos:pos + size]
+            pos += size + 2
 
     def _smug_parse_responses(self, raw: bytes) -> list[dict[str, Any]]:
-        responses: list[dict[str, Any]] = []
+        """Parse satu atau lebih respons HTTP/1.1 berurutan (Content-Length/chunked)."""
+        out: list[dict[str, Any]] = []
         data = raw or b""
         while data:
-            boundary = data.find(b"\r\n\r\n")
-            if boundary < 0:
+            idx = data.find(b"\r\n\r\n")
+            if idx < 0:
                 break
-            head, rest = data[:boundary], data[boundary + 4:]
+            head, rest = data[:idx], data[idx + 4:]
             lines = head.split(b"\r\n")
             if not lines:
                 break
-            match = re.match(br"HTTP/\d(?:\.\d)?\s+(\d{3})", lines[0])
-            if not match:
+            m = re.match(br"HTTP/\d(?:\.\d)?\s+(\d{3})", lines[0])
+            if not m:
+                # sisa request yang tidak valid (mis. "GGET ...") -> bukan respons.
                 break
-            status = int(match.group(1))
+            status = int(m.group(1))
             headers: dict[str, str] = {}
             for line in lines[1:]:
                 if b":" in line:
-                    key, value = line.split(b":", 1)
-                    headers[key.decode("latin-1", "ignore").strip().lower()] = (
-                        value.decode("latin-1", "ignore").strip()
-                    )
+                    k, v = line.split(b":", 1)
+                    headers[k.decode("latin-1", "ignore").strip().lower()] = v.decode("latin-1", "ignore").strip()
+            body = b""
             if 100 <= status < 200 and status != 101:
+                # Interim response (mis. 100 Continue) bukan respons request final;
+                # jangan dihitung sebagai slot respons kedua pada tes desync.
                 data = rest
                 continue
-            body = b""
             if status in (101, 204, 304):
                 data = b""
             elif "chunked" in headers.get("transfer-encoding", "").lower():
@@ -9609,40 +9617,15 @@ class SatriaBaruScanner:
                     break
                 data = rest[used:]
             elif headers.get("content-length", "").strip().isdigit():
-                size = int(headers["content-length"].strip())
-                if len(rest) < size:
-                    break
-                body = rest[:size]
-                data = rest[size:]
+                n = int(headers["content-length"].strip())
+                body = rest[:n]
+                data = rest[n:]
             else:
                 body = rest
                 data = b""
-            responses.append({
-                "status": status,
-                "headers": headers,
-                "body": body.decode("latin-1", "ignore"),
-            })
-        return responses
-
-    def _smug_build(
-        self, start_line: str, headers: list[tuple[str, str]], body: bytes = b""
-    ) -> bytes:
-        _, _, host, _ = self._smug_target()
-        lines = [start_line]
-        if not any(name.lower() == "host" for name, _ in headers):
-            lines.append(f"Host: {host}")
-        lines.extend(f"{name}: {value}" for name, value in headers)
-        lines.extend(["", ""])
-        return "\r\n".join(lines).encode("latin-1", "ignore") + (body or b"")
-
-    def _smug_get(self, path: str | None = None, close: bool = True) -> bytes:
-        _, _, host, default_path = self._smug_target()
-        request_path = path or default_path or "/"
-        headers = [
-            ("Host", host),
-            ("Connection", "close" if close else "keep-alive"),
-        ]
-        return self._smug_build(f"GET {request_path} HTTP/1.1", headers)
+            out.append({"status": status, "headers": headers,
+                        "body": body.decode("latin-1", "ignore")})
+        return out
 
     def _smug_exchange(self, requests_list: list[bytes], expect: int = 2,
                        timeout: float | None = None, pause: float = 0.0) -> tuple[list[dict[str, Any]], float, str | None]:
@@ -9745,6 +9728,34 @@ class SatriaBaruScanner:
     # menutup koneksi setelah batas waktu; tidak melakukan cache poisoning,
     # menyisipkan request admin, atau memengaruhi antrean request pengguna lain.
 
+    def _smug_timing_connect(self, timeout: float | None = None):
+        import socket
+        import ssl as _ssl
+
+        scheme, port, host, _ = self._smug_target()
+        if not host:
+            return None
+        conn_timeout = timeout if timeout is not None else max(
+            3.0, float(getattr(self, "timeout", 8.0) or 8.0)
+        )
+        try:
+            sock = socket.create_connection((host, port), timeout=conn_timeout)
+            sock.settimeout(conn_timeout)
+        except Exception:
+            return None
+        if scheme == "https":
+            try:
+                context = _ssl.create_default_context()
+                context.set_alpn_protocols(["http/1.1"])
+                sock = context.wrap_socket(sock, server_hostname=host)
+            except Exception:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                return None
+        return sock
+
     def _smug_timing_trial(
         self, raw: bytes, *, timeout: float = 4.0
     ) -> tuple[float, int | None, str | None]:
@@ -9753,7 +9764,7 @@ class SatriaBaruScanner:
 
         if not self._within_budget():
             return 0.0, None, "budget_exhausted"
-        sock = self._smug_connect(timeout=timeout)
+        sock = self._smug_timing_connect(timeout=timeout)
         if sock is None:
             return 0.0, None, "connect_failed"
 
