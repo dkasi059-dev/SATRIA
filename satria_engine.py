@@ -9722,14 +9722,6 @@ class SatriaBaruScanner:
         )
         return elapsed, status, error
 
-    def _smug_active_allowed(self) -> bool:
-        host = (urlparse(self.target_url).hostname or "").lower().rstrip(".")
-        academy_target = host.endswith(".web-security-academy.net")
-        explicit_opt_in = os.getenv("SATRIA_ENABLE_ACTIVE_SMUGGLING", "").lower() in {
-            "1", "true", "yes", "on"
-        }
-        return academy_target or explicit_opt_in
-
     def phase_smuggling(self, pages: list[Page], points: list[Point]) -> None:
         """Uji CL.TE dan TE.CL berbasis timing dengan baseline berpasangan.
 
@@ -9743,13 +9735,6 @@ class SatriaBaruScanner:
         scheme, port, host, path = self._smug_target()
         if not host:
             return
-        if not self._smug_active_allowed():
-            self._scan_progress_event(
-                "Probe desync aktif dilewati pada target non-Academy; "
-                "set SATRIA_ENABLE_ACTIVE_SMUGGLING=1 hanya untuk sistem yang Anda kuasai."
-            )
-            return
-
         try:
             timeout = float(os.getenv("SATRIA_SMUGGLING_TIMEOUT", "4.0"))
         except (TypeError, ValueError):
