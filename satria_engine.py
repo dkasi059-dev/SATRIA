@@ -6909,18 +6909,11 @@ class SatriaBaruScanner:
             "chat", "ask", "question", "user_input", "userinput",
             "chatinput", "usermessage", "messagecontent", "request",
         )
-        llm_hints = (
-            "chat", "assistant", "llm", "ask", "prompt", "message",
-            "bot", "agent", "completion", "conversation", "copilot", "support",
-            "livechat", "live-chat",
-        )
-
         def has_llm_context(value: str) -> bool:
-            # Token boundaries avoid matching unrelated words such as "email"
-            # merely because they contain the substring "ai".
+            # Word boundaries avoid matching unrelated words such as "email".
             return bool(re.search(
-                r"(?:^|[/_.\\-\\s])(?:chat|assistant|llm|ask|prompt|message|bot|agent|"
-                r"completion|conversation|copilot|support|live[-_]?chat)(?:$|[/_.\\-\\s?])",
+                r"\\b(?:chat|assistant|llm|ask|prompt|message|bot|agent|completion|"
+                r"conversation|copilot|support|live[-_ ]?chat)\\b",
                 (value or "").lower(),
             ))
 
