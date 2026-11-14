@@ -4889,6 +4889,54 @@ class SatriaBaruScanner:
                 return m.group(1).strip()
         return ""
 
+    @staticmethod
+    def _jwt_privilege_evidence(text: str) -> str:
+        """Kenali klaim admin/role pada JSON atau HTML tanpa mengandalkan frasa UI."""
+        raw = html_module.unescape(str(text or ""))[:500_000]
+        if not raw.strip():
+            return ""
+        strong_patterns = (
+            (r'"(?:role|user_role|account_role|type)"\s*:\s*"?admin(?:istrator)?\b', "claim role admin"),
+            (r'"(?:isadmin|is_admin|administrator|admin)"\s*:\s*(?:true|1|"true"|"1")', "claim admin aktif"),
+            (r'"(?:roles|groups|permissions)"\s*:\s*\[[^\]]*\badmin(?:istrator)?\b', "daftar role berisi admin"),
+            (r'"(?:sub|username|user|login|preferred_username)"\s*:\s*"administrator"', "identitas administrator"),
+        )
+        for pattern, description in strong_patterns:
+            if re.search(pattern, raw, re.I):
+                return description
+        try:
+            root = json.loads(raw)
+        except Exception:
+            root = None
+
+        def walk(node: Any) -> str:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    name = str(key).lower().replace("-", "_")
+                    if name in ("isadmin", "is_admin", "administrator", "admin") and value is True:
+                        return "claim admin aktif"
+                    if name in ("role", "user_role", "account_role", "type") and isinstance(value, str):
+                        if value.strip().lower() in ("admin", "administrator", "superadmin", "super_admin"):
+                            return "claim role admin"
+                    if name in ("roles", "groups", "permissions") and isinstance(value, (list, tuple, str)):
+                        values = value if isinstance(value, (list, tuple)) else [value]
+                        if any(str(item).strip().lower() in (
+                            "admin", "administrator", "superadmin", "super_admin"
+                        ) for item in values):
+                            return "daftar role berisi admin"
+                for value in node.values():
+                    found = walk(value)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for value in node:
+                    found = walk(value)
+                    if found:
+                        return found
+            return ""
+
+        return walk(root) if root is not None else ""
+
     def _jwt_anon_session(self, cookie_name: str | None = None, token: str | None = None) -> requests.Session:
         sess = requests.Session()
         sess.headers.update({
@@ -5055,8 +5103,12 @@ class SatriaBaruScanner:
                     "x-auth-token", "x-access-token",
                 ):
                     harvest(header_value, "header", str(header_name))
-            harvest(getattr(page, "text", ""), "page", getattr(page, "url", ""))
-            harvest(getattr(page, "js_text", ""), "javascript", getattr(page, "url", ""))
+            page_url = getattr(page, "url", "") or ""
+            harvest(page_url, "url", page_url)
+            for link in (getattr(page, "links", []) or []):
+                harvest(link, "link", page_url)
+            harvest(getattr(page, "text", ""), "page", page_url)
+            harvest(getattr(page, "js_text", ""), "javascript", page_url)
 
         for artifact in getattr(self, "_jwt_login_artifacts", []) or []:
             harvest(artifact.get("text", ""), "login-response", str(artifact.get("url", "login")))
@@ -5177,27 +5229,36 @@ class SatriaBaruScanner:
                 seen_urls.add(clean)
                 collection.append(clean)
 
-        for page in pages[:60]:
+        for page in pages[:80]:
             url = getattr(page, "url", "") or ""
             low = url.lower()
             if any(term in low for term in (
                 "my-account", "account", "profile", "dashboard", "settings",
-                "/me", "/user", "/customer",
+                "/me", "/user", "/customer", "/member", "/session",
             )):
                 add_url(account_urls, url)
-        for point in points[:100]:
+            if re.search(r"/(?:api/)?(?:admin|administrator)(?:/|$)", urlparse(url).path, re.I):
+                add_url(admin_urls, url)
+        for point in points[:180]:
             url = getattr(point, "url", "") or ""
             descriptor = " ".join((
                 url, str(getattr(point, "name", "")),
                 str(getattr(point, "label", "")),
             )).lower()
-            if any(term in descriptor for term in ("account", "profile", "user", "customer", "session", "/me")):
-                add_url(account_urls, url)
+            if any(term in descriptor for term in (
+                "account", "profile", "user", "customer", "session", "/me",
+                "member", "auth", "admin", "jwt", "token",
+            )):
+                if re.search(r"/(?:api/)?(?:admin|administrator)(?:/|$)", urlparse(url).path, re.I):
+                    add_url(admin_urls, url)
+                else:
+                    add_url(account_urls, url)
 
         for path in (
-            "/my-account", "/account", "/profile", "/dashboard",
+            "/my-account", "/account", "/profile", "/dashboard", "/me",
             "/api/me", "/api/account", "/api/profile", "/api/user",
-            "/user/profile", "/customer/profile",
+            "/api/users/me", "/api/v1/me", "/api/v1/user", "/api/v1/account",
+            "/user/profile", "/customer/profile", "/account/me",
         ):
             add_url(account_urls, urljoin(origin + "/", path.lstrip("/")))
 
@@ -5217,7 +5278,7 @@ class SatriaBaruScanner:
         ):
             add_url(admin_urls, urljoin(origin + "/", path.lstrip("/")))
 
-        use_urls = list(dict.fromkeys(account_urls[:3] + admin_urls[:5]))[:8]
+        use_urls = list(dict.fromkeys(account_urls[:6] + admin_urls[:8]))[:14]
         if not use_urls:
             return
 
@@ -5238,26 +5299,53 @@ class SatriaBaruScanner:
                 own_identity = self._jwt_identity(own_page.text or "")
 
         def verdict(url: str, response: Response | None) -> str | None:
-            if response is None or response.error or response.status not in (200, 201, 202):
+            if response is None or response.error or response.status not in (200, 201, 202, 203, 206):
                 return None
             text = response.text or ""
             low = text.lower()
             baseline = anon_map.get(url)
-            baseline_text = (baseline.text or "") if baseline else ""
+            baseline_text = (baseline.text or "") if baseline and not baseline.error else ""
             baseline_low = baseline_text.lower()
+            final_path = urlparse(getattr(response, "url", "") or url).path.lower()
+            login_wall = (
+                any(term in final_path for term in ("/login", "/signin", "/sign-in", "/authenticate"))
+                or any(term in low[:12000] for term in (
+                    "please log in", "please login", "sign in to continue",
+                    "you must be logged in", "name=\"password\"", "type=\"password\"",
+                ))
+            )
+            if login_wall and not any(term in low for term in ("log out", "logout", "sign out")):
+                return None
 
+            privilege = self._jwt_privilege_evidence(text)
+            baseline_privilege = self._jwt_privilege_evidence(baseline_text)
+            if privilege and not baseline_privilege:
+                return privilege
             if self._ac_admin_text(text) and not self._ac_admin_text(baseline_text):
                 return "konten panel admin terbuka"
+
             identity = self._jwt_identity(text)
             baseline_identity = self._jwt_identity(baseline_text)
             if identity and identity.lower() != baseline_identity.lower():
                 if not own_identity or identity.lower() != own_identity.lower():
                     return f"identitas akun berubah menjadi {identity}"
+
             auth_markers = ("log out", "logout", "sign out", "my account", "your account")
             if any(marker in low for marker in auth_markers) and not any(
                 marker in baseline_low for marker in auth_markers
             ):
                 return "konten sesi terautentikasi terbuka"
+
+            # Differential access: anonymous was explicitly denied, but the forged
+            # token now receives a substantial non-login 2xx resource.
+            if (
+                baseline is not None and not baseline.error
+                and baseline.status in (401, 403)
+                and response.status in (200, 201, 202)
+                and len(text.strip()) >= 80
+                and text.strip() != baseline_text.strip()
+            ):
+                return f"endpoint berubah dari HTTP {baseline.status} anonim menjadi HTTP {response.status} dengan konten terproteksi"
             return None
 
         def get_with(token: str, url: str, mode: str, cookie_name: str) -> Response:
