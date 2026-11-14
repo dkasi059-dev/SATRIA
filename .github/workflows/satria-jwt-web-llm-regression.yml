@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install engine runtime dependencies
-        run: python -m pip install --upgrade requests beautifulsoup4
+        run: python -m pip install --upgrade requests beautifulsoup4 'PyJWT[crypto]'
       - name: Compile complete engine
         run: python -m py_compile satria_engine.py
       - name: Import complete engine
@@ -31,6 +31,84 @@ jobs:
           spec.loader.exec_module(module)
           print("PASS: import complete engine")
           PY
+
+      - name: JWT external JKU regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import os
+          import sys
+          from cryptography.hazmat.primitives.asymmetric import rsa
+          from cryptography.hazmat.primitives import serialization
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+          pem = private_key.private_bytes(
+              serialization.Encoding.PEM,
+              serialization.PrivateFormat.PKCS8,
+              serialization.NoEncryption(),
+          ).decode()
+          env = {
+              "SATRIA_JWT_JKU_URL": "https://keys.example.net/.well-known/jwks.json",
+              "SATRIA_JWT_JKU_PRIVATE_KEY": pem.replace("\\n", "\\\\n"),
+              "SATRIA_JWT_JKU_KID": "satria-jku-regression",
+          }
+          old = {key: os.environ.get(key) for key in env}
+          os.environ.update(env)
+          try:
+              token = Scanner._jwt_sign(
+                  {"alg":"HS256","typ":"JWT"},
+                  {"sub":"alice","role":"user","exp":4102444800},
+                  key="secret1",
+              )
+              scanner = Scanner.__new__(Scanner)
+              scanner.target_url = "https://example.test/"
+              scanner.session = module.requests.Session()
+              scanner._scan_progress = None
+              scanner.non_sql_category_request_limit = 32
+              scanner._within_budget = lambda: True
+              scanner._jwt_login = lambda _pages: None
+              scanner._jwt_collect_tokens = lambda _pages, _session: [(token, "cookie", "session")]
+              scanner._ac_admin_urls = lambda _pages, _origin: []
+              scanner._confirmed = {147,148,149,150,152,153,154}
+              scanner.stats = {"errors": [], "requests": 0}
+              observed = {"forged_jku": "", "marked": []}
+
+              def fake_request(method, url, **kwargs):
+                  session = kwargs.get("session")
+                  headers = dict(kwargs.get("headers") or {})
+                  auth = headers.get("Authorization", "")
+                  token_value = auth[7:] if auth.lower().startswith("bearer ") else ""
+                  if not token_value and session is not None:
+                      token_value = session.cookies.get("session", "")
+                  decoded = Scanner._jwt_decode(token_value) if token_value else None
+                  if decoded and decoded["header"].get("jku"):
+                      observed["forged_jku"] = decoded["header"]["jku"]
+                      return module.Response(
+                          200, url, "<h1>Admin panel</h1><p>Delete user</p>",
+                          {"Content-Type":"text/html"}, 0.01
+                      )
+                  return module.Response(401, url, "Unauthorized", {}, 0.01)
+
+              scanner._request = fake_request
+              scanner._jwt_mark = lambda number, url, evidence, method: observed["marked"].append(number)
+              scanner.phase_jwt([module.Page(url="https://example.test/", text="")], [])
+              assert observed["forged_jku"] == env["SATRIA_JWT_JKU_URL"], observed
+              assert 151 in observed["marked"], observed
+              print("PASS: JWT jku uses owner-supplied matching RSA key, URL, and kid")
+          finally:
+              for key, value in old.items():
+                  if value is None:
+                      os.environ.pop(key, None)
+                  else:
+                      os.environ[key] = value
+          PY
+
       - name: JWT discovery and access-proof regression
         run: |
           python - <<'PY'
