@@ -7248,7 +7248,10 @@ class SatriaBaruScanner:
         )
         scan_route = re.compile(r"(?:^|/)(?:scan|scanner|site-scan|scan-site|audit)(?:/|$)", re.I)
 
-        def add(action: str, method: str, fields: tuple, page_url: str, source: str) -> None:
+        def add(
+            action: str, method: str, fields: tuple, page_url: str, source: str,
+            encoding: str = "form",
+        ) -> None:
             absolute = urljoin(page_url or self.target_url, action or page_url or self.target_url)
             if not self._same_origin(absolute):
                 return
@@ -7259,7 +7262,8 @@ class SatriaBaruScanner:
             seen.add(key)
             found.append({
                 "url": absolute, "method": method, "fields": tuple(fields or ()),
-                "page_url": page_url or self.target_url, "kind": "scanner", "source": source,
+                "page_url": page_url or self.target_url, "kind": "scanner",
+                "encoding": encoding, "source": source,
             })
 
         for page in pages[:100]:
@@ -7289,6 +7293,46 @@ class SatriaBaruScanner:
                         action, getattr(form, "method", "POST") or "POST",
                         fields, page_url, "AI scanner HTML form",
                     )
+
+            # React/Vue scanner pages may submit through fetch()/axios rather than
+            # native HTML forms. Discover quoted same-origin routes in their JS bundle.
+            if any(term in page_blob for term in scan_ui_terms):
+                route_pattern = re.compile(
+                    r"""["']([^"' ]{1,220}(?:scan|scanner|site-scan|scan-site|audit)[^"' ]{0,100})["']""",
+                    re.I,
+                )
+                key_pattern = re.compile(
+                    r"""["']([A-Za-z][A-Za-z0-9_-]{1,48})["']\s*:""",
+                    re.I,
+                )
+                names = list(dict.fromkeys(key_pattern.findall(page_blob)))
+                target_id = ""
+                parsed_page = urlparse(page_url)
+                path_parts = [part for part in parsed_page.path.split("/") if part]
+                for part in reversed(path_parts):
+                    if part.isdigit():
+                        target_id = part
+                        break
+                inferred_fields: list[tuple[str, str, str]] = []
+                for name in names:
+                    if re.search(r"(post|article|blog|content)[_-]?id|^(id|targetid)$", name, re.I):
+                        inferred_fields.append((name, target_id, "text"))
+                    elif re.search(r"(target|website|site|scan)[_-]?(url|uri)$", name, re.I):
+                        inferred_fields.append((name, page_url, "url"))
+                if not inferred_fields:
+                    inferred_fields.append(("target_url", page_url, "url"))
+                encoding = "json" if (
+                    "json.stringify" in page_blob or "application/json" in page_blob
+                    or "axios.post" in page_blob
+                ) else "form"
+                method = "GET" if re.search(r"method\\s*:\\s*['\\\"]get['\\\"]", page_blob) else "POST"
+                for match in route_pattern.finditer(page_blob):
+                    route = match.group(1)
+                    if route.startswith("/") or route.lower().startswith("http"):
+                        add(
+                            route, method, tuple(inferred_fields), page_url,
+                            "AI scanner JavaScript route", encoding,
+                        )
 
         for point in (points or [])[:200]:
             url = getattr(point, "url", "") or ""
@@ -7462,6 +7506,13 @@ class SatriaBaruScanner:
                 started = self._request(
                     method, job["url"], session=llm_session,
                     params=data, allow_redirects=True,
+                )
+            elif job.get("encoding") == "json":
+                started = self._request(
+                    method, job["url"], session=llm_session,
+                    data=json.dumps(data),
+                    headers={"Content-Type": "application/json", "Accept": "application/json,text/html,*/*"},
+                    allow_redirects=True,
                 )
             else:
                 started = self._request(
