@@ -1,0 +1,171 @@
+name: SATRIA JWT and Web LLM regression
+
+on:
+  push:
+    branches:
+      - fix/jwt-web-llm-rework-20261114
+
+permissions:
+  contents: read
+
+jobs:
+  jwt-web-llm-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install engine runtime dependencies
+        run: python -m pip install --upgrade requests beautifulsoup4
+      - name: Compile complete engine
+        run: python -m py_compile satria_engine.py
+      - name: Import complete engine
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          print("PASS: import complete engine")
+          PY
+      - name: JWT discovery and access-proof regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          import requests
+          from urllib.parse import urlparse
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          token = Scanner._jwt_sign(
+              {"alg": "HS256", "typ": "JWT"},
+              {"sub": "alice", "role": "user", "exp": 4102444800},
+              key="secret1",
+          )
+          assert token and Scanner._jwt_decode(token)
+          assert Scanner._jwt_privilege_evidence('{"user":{"role":"admin"}}')
+          assert Scanner._jwt_privilege_evidence('{"isAdmin":true}')
+          assert Scanner._jwt_privilege_evidence('{"roles":["user","administrator"]}')
+          assert not Scanner._jwt_privilege_evidence('{"user":{"role":"customer"}}')
+
+          scanner = Scanner.__new__(Scanner)
+          scanner.session = requests.Session()
+          scanner._jwt_login_artifacts = []
+          page = module.Page(
+              url=f"https://example.test/account?access_token={token}",
+              text="",
+              links=[f"https://example.test/api/me?token={token}"],
+              js_text="",
+              cookie_names={},
+              headers={},
+          )
+          harvested = scanner._jwt_collect_tokens([page], None)
+          assert any(value == token for value, _location, _name in harvested), harvested
+
+          # Exercise complete JWT phase setup on an admin URL: this previously
+          # exposed an undeclared admin route-list variable before any probes ran.
+          scanner.target_url = "https://example.test/admin"
+          scanner._scan_progress = None
+          scanner.non_sql_category_request_limit = 24
+          scanner._within_budget = lambda: True
+          scanner._jwt_login = lambda _pages: None
+          scanner._jwt_collect_tokens = lambda _pages, _session: [(token, "cookie", "session")]
+          scanner._ac_admin_urls = lambda _pages, _origin: []
+          scanner._confirmed = {147, 148, 149, 150, 151, 152, 153, 154}
+          scanner.stats = {"errors": [], "requests": 0}
+          scanner._request = lambda method, url, **kwargs: module.Response(
+              404, url, "not found", {}, 0.001
+          )
+          scanner.phase_jwt([module.Page(url="https://example.test/admin", text="")], [])
+          print("PASS: JWT token harvesting, privilege evidence, and phase setup")
+          PY
+      - name: Web LLM parsing, discovery, and authenticated transport regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          from types import SimpleNamespace
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          # OpenAI-compatible SSE deltas must remain adjacent to preserve canaries.
+          sse = (
+              'data: {"choices":[{"delta":{"content":"SATRIA-"}}]}\\n'
+              'data: {"choices":[{"delta":{"content":"CANARY-123"}}]}\\n'
+              'data: [DONE]\\n'
+          )
+          response = module.Response(200, "https://example.test/api/chat", sse, {}, 0.01)
+          assert Scanner._llm_text(response) == "SATRIA-CANARY-123", Scanner._llm_text(response)
+
+          # Anthropic-compatible content_block_delta and Gemini parts payloads.
+          anthropic = (
+              'event: content_block_delta\\n'
+              'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello "}}\\n'
+              'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}\\n'
+          )
+          assert Scanner._llm_text(module.Response(200, "u", anthropic, {}, 0.01)) == "hello world"
+          gemini = '{"candidates":[{"content":{"parts":[{"text":"gemini answer"}]}}]}'
+          assert Scanner._llm_text(module.Response(200, "u", gemini, {}, 0.01)) == "gemini answer"
+
+          # The scanner must not confuse a tool-call argument with a tool result.
+          tool_result = (
+              'data: {"type":"tool_result","content":[{"type":"text","text":"SATRIA-CMD-123"}]}\\n'
+          )
+          assert Scanner._llm_tool_evidence(
+              module.Response(200, "u", tool_result, {}, 0.01), "SATRIA-CMD-123"
+          )
+          tool_call_only = (
+              '{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"SATRIA-CMD-123"}}]}}]}'
+          )
+          assert not Scanner._llm_tool_evidence(
+              module.Response(200, "u", tool_call_only, {}, 0.01), "SATRIA-CMD-123"
+          )
+
+          scanner = Scanner.__new__(Scanner)
+          scanner.target_url = "https://example.test/support"
+          form = module.FormSpec(
+              "https://example.test/support", "/api/customer-support",
+              "POST", (("customer_message", "", "textarea"),), False,
+          )
+          page = module.Page(
+              url="https://example.test/support", text="",
+              forms=[form], js_text="fetch('/api/chat/send')",
+          )
+          candidates = scanner._llm_candidates([page], [])
+          assert any(item["url"].endswith("/api/customer-support") for item in candidates), candidates
+          assert any(item["url"].endswith("/api/chat/send") for item in candidates), candidates
+          assert any(item["url"].endswith("/v1/chat/completions") for item in candidates), candidates
+
+          # Form and JSON requests must carry the authenticated session object.
+          sentinel_session = object()
+          calls = []
+          scanner._request = lambda *args, **kwargs: (
+              calls.append((args, kwargs)) or module.Response(200, args[1], "ok", {}, 0.01)
+          )
+          scanner._llm_send({
+              "url":"https://example.test/api/customer-support",
+              "method":"POST","kind":"form","field":"customer_message",
+              "fields":(("customer_message","","textarea"),),
+              "session":sentinel_session,
+          }, "hello")
+          assert calls[-1][1].get("session") is sentinel_session, calls[-1]
+          scanner._llm_send({
+              "url":"https://example.test/api/chat",
+              "method":"POST","kind":"json","field":"message",
+              "session":sentinel_session,
+          }, "hello")
+          assert calls[-1][1].get("session") is sentinel_session, calls[-1]
+          print("PASS: LLM SSE providers, tool-result evidence, route discovery, and login session")
+          PY
