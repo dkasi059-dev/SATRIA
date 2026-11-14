@@ -5100,19 +5100,22 @@ class SatriaBaruScanner:
                 # native dependency. Bound work to the common RSA JWT key sizes.
                 gcd = math.gcd
 
-            candidates: list[int] = []
+            gcd_values: list[int] = []
             for left, right in pairs:
                 a = pow(signatures[left], exponent) - encoded_messages[left]
                 b = pow(signatures[right], exponent) - encoded_messages[right]
-                candidate = gcd(a, b)
-                for prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97):
-                    while candidate > 1 and candidate % prime == 0:
-                        candidate //= prime
-                if 1024 <= candidate.bit_length() <= 8192:
-                    candidates.append(candidate)
-            if not candidates:
+                gcd_values.append(gcd(a, b))
+            # For more than two signatures, combine pairwise GCDs to remove
+            # any accidental cofactor left in one pair.
+            candidate = gcd_values[0]
+            for value in gcd_values[1:]:
+                candidate = gcd(candidate, value)
+            for prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97):
+                while candidate > 1 and candidate % prime == 0:
+                    candidate //= prime
+            if not 1024 <= candidate.bit_length() <= 8192:
                 return None
-            modulus = max(candidates, key=lambda value: value.bit_length())
+            modulus = candidate
         except Exception:
             return None
 
@@ -6782,16 +6785,43 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _llm_tool_evidence(resp: Response | None, marker: str) -> bool:
-        """Canary harus muncul bersama jejak hasil tool, bukan sekadar echo prompt."""
-        if resp is None or not marker or marker not in (getattr(resp, "text", "") or ""):
+        """Pastikan canary berasal dari hasil eksekusi tool, bukan permintaan tool-call."""
+        if resp is None or not marker:
             return False
-        raw = (getattr(resp, "text", "") or "").lower()
-        evidence_terms = (
-            "tool_calls", "tool_call", "function_call", "function result",
-            "tool result", "tool output", "stdout", "stderr", "execution result",
-            "debug sql", "sql result", "query result", "called tool",
+        raw = str(getattr(resp, "text", "") or "")
+        if marker not in raw:
+            return False
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = None
+
+        def has_tool_result(node: Any) -> bool:
+            if isinstance(node, dict):
+                role = str(node.get("role", "")).lower()
+                if role in ("tool", "function") and marker in json.dumps(node, ensure_ascii=False):
+                    return True
+                result_keys = {
+                    "tool_result", "tool_output", "function_result",
+                    "execution_result", "stdout", "stderr", "result",
+                }
+                for key, value in node.items():
+                    if key in result_keys and marker in str(value):
+                        return True
+                    if has_tool_result(value):
+                        return True
+            elif isinstance(node, list):
+                return any(has_tool_result(value) for value in node)
+            return False
+
+        if parsed is not None and has_tool_result(parsed):
+            return True
+        low = raw.lower()
+        explicit_result_terms = (
+            "function result", "tool result", "tool output",
+            "stdout", "stderr", "execution result", "query result",
         )
-        return any(term in raw for term in evidence_terms)
+        return any(term in low for term in explicit_result_terms)
 
     def _llm_candidates(self, pages: list[Page], points: list[Point] | None = None) -> list[dict]:
         """Temukan chat/agent API dari form, crawler points, JavaScript, dan route umum."""
@@ -6876,10 +6906,10 @@ class SatriaBaruScanner:
             field = next((name for name in names if name.lower() in text_fields), "")
             if not field and candidate_name.lower() in text_fields:
                 field = candidate_name
-            if any(term in context for term in llm_hints) and (field or method in ("POST", "PUT", "PATCH")):
+            if any(term in context for term in llm_hints) and (field or method in ("GET", "POST", "PUT", "PATCH")):
                 add(
-                    url, method, "json" if not names else "form",
-                    field or "message", tuple(getattr(point, "fields", ()) or ()),
+                    url, method, "form" if names or method == "GET" else "json",
+                    field or candidate_name or "message", tuple(getattr(point, "fields", ()) or ()),
                     page_url=getattr(point, "page_url", "") or self.target_url,
                     source="crawler endpoint",
                 )
@@ -6954,7 +6984,7 @@ class SatriaBaruScanner:
     def _llm_validate(self, eps: list[dict]) -> list[dict]:
         """Validasi route chat dengan canary tanpa menganggap echo HTTP sebagai LLM."""
         valid: list[dict] = []
-        for original_ep in eps[:16]:
+        for original_ep in eps[:12]:
             if not self._within_budget():
                 break
             ep = dict(original_ep)
@@ -6970,8 +7000,7 @@ class SatriaBaruScanner:
             else:
                 for style, field in (
                     ("flat", "message"), ("flat", "prompt"), ("flat", "input"),
-                    ("flat", "query"), ("flat", "question"), ("messages", "messages"),
-                    ("input", "input"), ("query", "query"),
+                    ("flat", "query"), ("messages", "messages"),
                 ):
                     variants.append((style, field))
             for style, field in variants:
@@ -6986,7 +7015,7 @@ class SatriaBaruScanner:
                     continue
                 output = self._llm_text(response).strip()
                 # A plain echo endpoint returns the full prompt, not the canary response.
-                if marker not in output or output == probe:
+                if marker not in output or probe in output:
                     continue
                 validated = dict(ep)
                 validated["kind"] = "form" if ep.get("kind") == "form" else "json"
