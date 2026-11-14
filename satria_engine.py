@@ -5093,8 +5093,8 @@ class SatriaBaruScanner:
             return None
 
         try:
-            import gmpy2  # type: ignore
-            gcd = lambda a, b: int(gmpy2.gcd(gmpy2.mpz(a), gmpy2.mpz(b)))
+            import gmpy2 as _gmpy2  # type: ignore
+            gcd = lambda a, b: int(_gmpy2.gcd(_gmpy2.mpz(a), _gmpy2.mpz(b)))
         except Exception:
             # RSA sign2n requires GCD over tens of millions of bits. A Python
             # fallback can stall the scanner for minutes, so this technique is
@@ -5108,8 +5108,10 @@ class SatriaBaruScanner:
         try:
             gcd_values: list[int] = []
             for left, right in pairs:
-                a = pow(signatures[left], exponent) - encoded_messages[left]
-                b = pow(signatures[right], exponent) - encoded_messages[right]
+                # Do the enormous exponentiation in GMP as well; Python int
+                # exponentiation can dominate runtime for 1024-4096 bit RSA keys.
+                a = _gmpy2.mpz(signatures[left]) ** exponent - _gmpy2.mpz(encoded_messages[left])
+                b = _gmpy2.mpz(signatures[right]) ** exponent - _gmpy2.mpz(encoded_messages[right])
                 gcd_values.append(gcd(a, b))
             # For more than two signatures, combine pairwise GCDs to remove
             # any accidental cofactor left in one pair.
