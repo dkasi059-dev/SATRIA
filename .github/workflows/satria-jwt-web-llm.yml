@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install focused dependencies
-        run: python -m pip install --upgrade requests beautifulsoup4 "PyJWT[crypto]"
+        run: python -m pip install --upgrade requests beautifulsoup4 "PyJWT[crypto]" "gmpy2>=2.3,<3"
       - name: Compile complete engine
         run: python -m py_compile satria_engine.py
       - name: JWT helper and crypto regression
