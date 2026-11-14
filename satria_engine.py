@@ -9303,31 +9303,51 @@ class SatriaBaruScanner:
                         )
                         break
 
-                # Flawed verification logic: satu kode invalid tidak boleh menghasilkan sesi akun.
+                # 221: hanya gunakan kode uji yang secara eksplisit dipastikan invalid
+                # oleh pemilik akun, agar OTP statis yang kebetulan benar tidak dianggap bug.
                 challenge_url = challenge_resp.url or challenge_url or login_resp.url or page_url
                 challenge_forms = self._parse_forms(
                     challenge_url, BeautifulSoup(challenge_body, "html.parser")
                 )
-                for otp_form in challenge_forms[:4]:
-                    otp_fields = self._auth_form_fields(otp_form)
-                    code_field = self._auth_pick(
-                        otp_fields, ("code", "otp", "mfa", "verification", "token")
-                    )
-                    if not code_field:
-                        continue
-                    otp_action = urljoin(challenge_url, otp_form.action or challenge_url)
-                    otp_result = self._auth_submit(
-                        otp_action, otp_form.method, otp_fields, challenge_url,
-                        {code_field: "000000"},
-                    )
-                    if self._auth_is_account_page(otp_result):
-                        self._auth_mark(
-                            221, otp_action,
-                            f"Langkah 2FA menerima kode uji invalid 000000 dan mengembalikan "
-                            f"konten akun terautentikasi (HTTP {otp_result.status}).",
-                            "auth_2fa_broken_logic",
+                invalid_otp_code = (os.getenv("SATRIA_AUTH_INVALID_2FA_CODE") or "").strip()
+                if invalid_otp_code:
+                    for otp_form in challenge_forms[:4]:
+                        otp_fields = self._auth_form_fields(otp_form)
+                        code_field = self._auth_pick(
+                            otp_fields, ("code", "otp", "mfa", "verification", "token")
                         )
-                    break
+                        if not code_field:
+                            continue
+                        otp_action = urljoin(challenge_url, otp_form.action or challenge_url)
+                        otp_result = self._auth_submit(
+                            otp_action, otp_form.method, otp_fields, challenge_url,
+                            {code_field: invalid_otp_code},
+                        )
+                        authenticated_response = otp_result
+                        if (
+                            otp_result.status in (301, 302, 303, 307, 308)
+                            and self._auth_location(otp_result)
+                        ):
+                            follow_url = urljoin(otp_action, self._auth_location(otp_result))
+                            if self._same_origin(follow_url):
+                                followed = self._request(
+                                    "GET", follow_url, allow_redirects=True
+                                )
+                                if not followed.error:
+                                    authenticated_response = followed
+                        if self._auth_is_account_page(authenticated_response):
+                            self._auth_mark(
+                                221, otp_action,
+                                f"Langkah 2FA menerima kode yang ditetapkan pemilik sebagai "
+                                f"invalid dan membuka konten akun terautentikasi "
+                                f"(HTTP {authenticated_response.status}).",
+                                "auth_2fa_broken_logic",
+                            )
+                        break
+                else:
+                    self._scan_progress_event(
+                        "Uji 2FA broken logic dilewati: SATRIA_AUTH_INVALID_2FA_CODE belum disediakan."
+                    )
                 break
 
         # 216: reset tanpa token valid dapat mengubah password akun uji.
