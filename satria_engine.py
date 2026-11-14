@@ -4565,7 +4565,10 @@ class SatriaBaruScanner:
         headers: dict[str, str] | None = None,
     ) -> Response:
         """Submit form reset dengan hidden/CSRF fields terbaru."""
-        identity = os.getenv("SATRIA_TEST_EMAIL") or os.getenv("SATRIA_TEST_USERNAME") or ""
+        if "email" in field.lower():
+            identity = os.getenv("SATRIA_TEST_EMAIL") or os.getenv("SATRIA_TEST_USERNAME") or ""
+        else:
+            identity = os.getenv("SATRIA_TEST_USERNAME") or os.getenv("SATRIA_TEST_EMAIL") or ""
         if not identity and self._jwt_is_academy_host(urlparse(self.target_url).hostname or ""):
             identity = "wiener"
         if not identity:
