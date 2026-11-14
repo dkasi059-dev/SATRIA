@@ -5532,8 +5532,9 @@ class SatriaBaruScanner:
 
             # 152: kid path traversal, including the canonical /dev/null lab payload.
             if 152 not in self._confirmed and self._within_budget():
-                kid_paths = (
-                    "../../../../../../../dev/null", "../../../../../../../../dev/null",
+                kid_paths = tuple(
+                    "../" * depth + "dev/null" for depth in (6, 7, 8, 9, 10, 12, 16)
+                ) + (
                     "/dev/null", "....//....//....//....//dev/null",
                     "..%2f..%2f..%2f..%2f..%2fdev%2fnull",
                 )
@@ -6797,9 +6798,9 @@ class SatriaBaruScanner:
         for parsed in parsed_candidates:
             cls._llm_strings(parsed, extracted)
         if extracted:
-            # Remove repeated fragments emitted by streaming transports while
-            # preserving chunk order (delta tokens must remain concatenated).
-            joined = "\n".join(dict.fromkeys(item.strip() for item in extracted if item.strip()))
+            # Streaming deltas are incremental, so repeated text fragments may
+            # be meaningful. Preserve event order instead of set-based deduplication.
+            joined = "\n".join(item.strip() for item in extracted if item.strip())
             if joined.strip():
                 return joined
 
@@ -6909,9 +6910,19 @@ class SatriaBaruScanner:
             "chatinput", "usermessage", "messagecontent", "request",
         )
         llm_hints = (
-            "chat", "assistant", "llm", "ai", "ask", "prompt", "message",
+            "chat", "assistant", "llm", "ask", "prompt", "message",
             "bot", "agent", "completion", "conversation", "copilot", "support",
+            "livechat", "live-chat",
         )
+
+        def has_llm_context(value: str) -> bool:
+            # Token boundaries avoid matching unrelated words such as "email"
+            # merely because they contain the substring "ai".
+            return bool(re.search(
+                r"(?:^|[/_.\\-\\s])(?:chat|assistant|llm|ask|prompt|message|bot|agent|"
+                r"completion|conversation|copilot|support|live[-_]?chat)(?:$|[/_.\\-\\s?])",
+                (value or "").lower(),
+            ))
 
         for page in pages[:80]:
             page_url = getattr(page, "url", "") or self.target_url
@@ -6921,7 +6932,7 @@ class SatriaBaruScanner:
                 action = getattr(form, "action", "") or page_url
                 hint = (str(action) + " " + page_url).lower()
                 field = next((name for name in names if name.lower() in text_fields), "")
-                looks_like_chat = any(term in hint for term in llm_hints) or bool(field)
+                looks_like_chat = has_llm_context(hint) or bool(field)
                 if looks_like_chat and field:
                     add(
                         action, getattr(form, "method", "POST") or "POST",
@@ -6958,7 +6969,7 @@ class SatriaBaruScanner:
             field = next((name for name in names if name.lower() in text_fields), "")
             if not field and candidate_name.lower() in text_fields:
                 field = candidate_name
-            if any(term in context for term in llm_hints) and (field or method in ("GET", "POST", "PUT", "PATCH")):
+            if has_llm_context(context) and (field or method in ("GET", "POST", "PUT", "PATCH")):
                 add(
                     url, method, "form" if names or method == "GET" else "json",
                     field or candidate_name or "message", tuple(getattr(point, "fields", ()) or ()),
@@ -6968,10 +6979,10 @@ class SatriaBaruScanner:
 
         default_routes = (
             "/chat", "/live-chat", "/livechat", "/api/chat", "/api/v1/chat",
-            "/api/chat/message", "/chat/send", "/api/messages", "/api/message",
-            "/assistant", "/api/assistant", "/api/v1/assistant",
-            "/ai", "/api/ai", "/api/llm", "/api/v1/llm",
-            "/ask", "/api/ask", "/prompt", "/api/prompt",
+            "/api/live-chat", "/api/chat/message", "/chat/send",
+            "/api/messages", "/api/message", "/assistant", "/api/assistant",
+            "/api/v1/assistant", "/ai", "/api/ai", "/api/llm",
+            "/api/v1/llm", "/ask", "/api/ask", "/prompt", "/api/prompt",
             "/completion", "/api/completion", "/api/completions",
             "/conversation", "/api/conversation", "/api/conversations",
             "/v1/chat/completions",
@@ -6980,7 +6991,7 @@ class SatriaBaruScanner:
             add(urljoin(origin + "/", path.lstrip("/")), "POST", "json", "message",
                 page_url=self.target_url, source="common route")
         # Preserve discovery order: forms and real crawler/JS endpoints outrank guesses.
-        return found[:16]
+        return found[:12]
 
     def _llm_send(
         self, ep: dict, prompt: str, field: str | None = None,
@@ -7024,13 +7035,18 @@ class SatriaBaruScanner:
         else:
             body = dict(base_fields)
             body[field] = prompt
+        request_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json,text/event-stream,*/*",
+        }
+        if ep["method"].upper() == "GET":
+            return self._request(
+                "GET", ep["url"], params=body, headers=request_headers,
+                allow_redirects=True,
+            )
         return self._request(
             ep["method"], ep["url"], data=json.dumps(body),
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json,text/event-stream,*/*",
-            },
-            allow_redirects=True,
+            headers=request_headers, allow_redirects=True,
         )
 
     def _llm_validate(self, eps: list[dict]) -> list[dict]:
@@ -7094,16 +7110,25 @@ class SatriaBaruScanner:
         origin = f"{urlparse(self.target_url).scheme}://{urlparse(self.target_url).netloc}"
 
         def ask(prompt: str) -> tuple[dict, Response, str] | None:
+            first_refusal: tuple[dict, Response, str] | None = None
             for endpoint in endpoints:
                 if not self._within_budget():
-                    return None
+                    break
                 response = self._llm_send(endpoint, prompt)
                 if response.error or (response.status or 0) >= 400:
                     continue
                 output = self._llm_text(response)
-                if output.strip():
-                    return endpoint, response, output
-            return None
+                if not output.strip():
+                    continue
+                candidate = (endpoint, response, output)
+                if self._llm_refusal(output):
+                    if first_refusal is None:
+                        first_refusal = candidate
+                    continue
+                return candidate
+            # Preserve one refusal response for the explicit refusal/bypass check,
+            # but do not let the first refusing endpoint mask other chat endpoints.
+            return first_refusal
 
         # 174 excessive agency: inventory available tools, methods, and schemas.
         # Never invoke a destructive tool merely to prove that it exists.
