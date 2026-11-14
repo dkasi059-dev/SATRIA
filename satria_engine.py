@@ -7099,6 +7099,7 @@ class SatriaBaruScanner:
                 )
 
         default_routes = (
+            "/v1/chat/completions", "/v1/responses",
             "/chat", "/live-chat", "/livechat", "/api/chat", "/api/v1/chat",
             "/api/v2/chat", "/api/chat/message", "/chat/send", "/api/messages",
             "/api/message", "/assistant", "/api/assistant", "/api/v1/assistant",
@@ -7108,7 +7109,6 @@ class SatriaBaruScanner:
             "/conversation", "/api/conversation", "/api/conversations",
             "/bot", "/api/bot", "/api/agent", "/api/v1/agent",
             "/api/inference", "/api/generate", "/generate",
-            "/v1/chat/completions", "/v1/responses",
         )
         for path in default_routes:
             add(
