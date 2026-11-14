@@ -5219,6 +5219,7 @@ class SatriaBaruScanner:
             return
 
         account_urls: list[str] = []
+        admin_urls: list[str] = []
         seen_urls: set[str] = set()
 
         def add_url(collection: list[str], url: str) -> None:
@@ -5262,7 +5263,6 @@ class SatriaBaruScanner:
         ):
             add_url(account_urls, urljoin(origin + "/", path.lstrip("/")))
 
-        admin_urls: list[str] = []
         try:
             for url in self._ac_admin_urls(pages, origin):
                 if len(admin_urls) >= 6:
