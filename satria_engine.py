@@ -3338,7 +3338,7 @@ class SatriaBaruScanner:
             if not value:
                 continue
             found.append(f"{key}={value}")
-            if re.search(r"\b(hit|cached|fresh|stale|revalidated)\\b", value, re.I):
+            if re.search(r"\b(hit|cached|fresh|stale|revalidated)\b", value, re.I):
                 hit = True
             if key == "x-cache-hits":
                 try:
@@ -3350,7 +3350,7 @@ class SatriaBaruScanner:
         server_timing = headers.get("server-timing", "")
         if server_timing and re.search(r"cache", server_timing, re.I):
             found.append(f"server-timing={server_timing}")
-            if re.search(r"\b(hit|cached|fresh|stale|revalidated)\\b", server_timing, re.I):
+            if re.search(r"\b(hit|cached|fresh|stale|revalidated)\b", server_timing, re.I):
                 hit = True
 
         age = headers.get("age", "")
