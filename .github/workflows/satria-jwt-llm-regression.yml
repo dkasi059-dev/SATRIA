@@ -248,7 +248,7 @@ jobs:
           def fake_send(ep, prompt, **kwargs):
               calls.append((ep["url"], kwargs))
               match = re.search(r"(SATRIA-LLM-CANARY-[A-Fa-f0-9]+)", prompt)
-              marker = match.group(1) if match else "missing"
+              marker = match.group(1)[::-1] if match else "missing"
               return SimpleNamespace(
                   error=None, status=200, headers={},
                   text='{"choices":[{"message":{"role":"assistant","content":"' + marker + '"}}]}',
