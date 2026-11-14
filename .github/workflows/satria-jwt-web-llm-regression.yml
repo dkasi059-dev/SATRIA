@@ -87,6 +87,95 @@ jobs:
           scanner.phase_jwt([module.Page(url="https://example.test/admin", text="")], [])
           print("PASS: JWT token harvesting, privilege evidence, and phase setup")
           PY
+
+      - name: AI scanner workflow and report-evidence regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          from types import SimpleNamespace
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+
+          scanner = Scanner.__new__(Scanner)
+          scanner.target_url = "https://example.test/blog/7"
+          scanner.session = module.requests.Session()
+          page = module.Page(
+              url="https://example.test/blog/7",
+              text="<title>Blog article</title>",
+              forms=[
+                  module.FormSpec(
+                      "https://example.test/blog/7", "/reviews",
+                      "POST", (("comment", "", "textarea"),), False
+                  )
+              ],
+          )
+          scan_form = module.FormSpec(
+              "https://example.test/scanner", "/scan/site", "POST",
+              (("post_id", "7", "hidden"),), False
+          )
+          scanner._within_budget = lambda: True
+          scanner._scan_progress = None
+          scanner.non_sql_category_request_limit = 24
+          scanner._jwt_login = lambda _pages: None
+          scanner._llm_candidates = lambda _pages, _points: []
+          scanner._llm_validate = lambda endpoints: []
+          scanner._llm_scanner_candidates = lambda _pages, _points: [{
+              "url": "https://example.test/scan/site",
+              "method": "POST",
+              "fields": (("post_id", "7", "hidden"),),
+              "page_url": "https://example.test/scanner",
+          }]
+          scanner._ac_csrf = lambda _body: {}
+          scanner.oob = None
+          scanner._confirmed = {}
+          marks = []
+          scanner._llm_mark = lambda number, url, evidence, method: marks.append((number, url, evidence))
+          injected_review = {"text": ""}
+
+          def request(method, url, **kwargs):
+              method = method.upper()
+              if method == "GET" and url.endswith("/blog/7"):
+                  return module.Response(200, url, "<title>Blog article</title>", {"Content-Type":"text/html"}, 0.01)
+              if method == "GET" and url.endswith("/scanner"):
+                  return module.Response(200, url, "<button>Scan site</button>", {"Content-Type":"text/html"}, 0.01)
+              if method == "GET" and url.endswith("/scan-results/77"):
+                  public = __import__("re").search(r"SATRIA-INDIRECT-CANARY-[A-Fa-f0-9]+", injected_review["text"]).group(0)
+                  private = __import__("re").search(r"SATRIA-PRIVATE-CANARY-[A-Fa-f0-9]+", injected_review["text"]).group(0)
+                  body = (
+                      '<div class="ai-summary">AI summary: ' + public + " " + private + '</div>'
+                      '<div class="review-source">Original input: ' + injected_review["text"] + '</div>'
+                  )
+                  return module.Response(200, url, body, {"Content-Type":"text/html"}, 0.01)
+              if method == "POST" and url.endswith("/reviews"):
+                  injected_review["text"] = str((kwargs.get("data") or {}).get("comment", ""))
+                  return module.Response(201, url, "review saved", {}, 0.01)
+              if method == "POST" and url.endswith("/scan/site"):
+                  return module.Response(303, url, "", {"Location":"/scan-results/77"}, 0.01)
+              return module.Response(404, url, "not found", {}, 0.01)
+
+          scanner._request = request
+          scanner.phase_web_llm_attacks([page], [])
+          numbers = {item[0] for item in marks}
+          assert 176 in numbers, marks
+          assert 179 in numbers, marks
+          assert 181 in numbers, marks
+
+          # A canary that appears only in a quoted source/review field is not output evidence.
+          quoted_only = (
+              '<div class="ai-summary">The review was safely ignored.</div>'
+              '<div class="review-source">SATRIA-PRIVATE-CANARY-abcdef</div>'
+          )
+          assert "SATRIA-PRIVATE-CANARY-abcdef" not in Scanner._llm_scanner_result_text(quoted_only)
+          structured = '{"summary":"Generated answer SATRIA-CANARY-123","review":"quoted SATRIA-CANARY-123"}'
+          assert Scanner._llm_scanner_result_text(structured) == "Generated answer SATRIA-CANARY-123"
+          print("PASS: Scan site discovery, trigger, AI result extraction, synthetic canary checks")
+          PY
+
       - name: Web LLM parsing, discovery, and authenticated transport regression
         run: |
           python - <<'PY'
