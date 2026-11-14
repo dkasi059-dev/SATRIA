@@ -54,7 +54,8 @@ jobs:
           )
           token_a = jwt.encode({"sub": "one", "n": 1}, private_pem, algorithm="RS256")
           token_b = jwt.encode({"sub": "two", "n": 2}, private_pem, algorithm="RS256")
-          derived = Scanner._jwt_rsa_pem_from_tokens([token_a, token_b])
+          token_c = jwt.encode({"sub": "three", "n": 3}, private_pem, algorithm="RS256")
+          derived = Scanner._jwt_rsa_pem_from_tokens([token_a, token_b, token_c])
           assert derived and "BEGIN PUBLIC KEY" in derived[0], "RSA modulus derivation failed"
           assert "BEGIN RSA PUBLIC KEY" in derived[1], "PKCS1 public key variant missing"
           print("PASS: JWT extraction, decode, RS256 modulus derivation")
