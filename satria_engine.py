@@ -5541,9 +5541,9 @@ class SatriaBaruScanner:
                 except Exception as exc:
                     self.stats["errors"].append(f"JWT JWK injection probe: {type(exc).__name__}")
 
-            # 151: jku injection requires a real same-origin JSON resource containing
-            # the attacker's JWKS. Only reflected JSON responses are eligible; a
-            # textual HTML reflection is not a usable key set.
+            # 151: jku injection requires a real JWKS endpoint. It can be supplied
+            # explicitly by the tester or discovered as a same-origin JSON reflection.
+            # The key pair must match the public JWK hosted at that URL.
             if 151 not in self._confirmed and self._within_budget():
                 try:
                     from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
@@ -5553,7 +5553,7 @@ class SatriaBaruScanner:
 
                     configured_jku = os.getenv("SATRIA_JWT_JKU_URL", "").strip()
                     private_pem_env = os.getenv("SATRIA_JWT_JKU_PRIVATE_KEY", "").replace("\\n", "\n").strip()
-                    configured_kid = os.getenv("SATRIA_JWT_JKU_KID", "").strip()
+                    configured_kid = os.getenv("SATRIA_JWT_JKU_KID", "satria-jku-static").strip() or "satria-jku-static"
                     external_jku_ready = False
                     private_key = None
                     if configured_jku and private_pem_env:
@@ -7154,6 +7154,88 @@ class SatriaBaruScanner:
             )
         return found[:24]
 
+    @staticmethod
+    def _llm_scanner_result_text(raw: str) -> str:
+        """Ekstrak bagian keluaran AI dari laporan scan; abaikan sumber/input mentah."""
+        value = str(raw or "")
+        if not value.strip():
+            return ""
+        output_keys = {
+            "summary", "ai_summary", "scan_summary", "analysis", "answer",
+            "output", "output_text", "generated_text", "result_text",
+            "finding", "findings", "recommendation", "recommendations",
+            "report", "response", "message", "explanation", "assessment",
+        }
+        blocked_keys = {
+            "review", "comment", "source", "input", "prompt", "page_content",
+            "article", "raw_content", "user_content", "customer_content",
+        }
+        fragments: list[str] = []
+        try:
+            document = json.loads(value)
+        except Exception:
+            document = None
+
+        def walk(node: Any, permitted: bool = False) -> None:
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    normalized = str(key).lower().replace("-", "_")
+                    if normalized in blocked_keys:
+                        continue
+                    if normalized in output_keys:
+                        if isinstance(child, str) and child.strip():
+                            fragments.append(child.strip())
+                        elif isinstance(child, (dict, list, tuple)):
+                            walk(child, True)
+                    elif permitted and isinstance(child, (dict, list, tuple)):
+                        walk(child, True)
+            elif isinstance(node, (list, tuple)):
+                for child in node:
+                    walk(child, permitted)
+
+        if document is not None:
+            walk(document)
+            if fragments:
+                return "\n".join(dict.fromkeys(fragments))
+
+        # HTML reports: retain only elements explicitly marked as result/summary/
+        # analysis output. Remove review/source/input cards before extracting text.
+        if "<" in value and ">" in value:
+            soup = BeautifulSoup(value[:1_000_000], "html.parser")
+            for tag in soup(["script", "style", "noscript", "svg"]):
+                tag.decompose()
+            for node in list(soup.find_all(True)):
+                names = " ".join((
+                    str(node.get("id", "")),
+                    " ".join(str(item) for item in (node.get("class") or [])),
+                    str(node.get("data-testid", "")),
+                    str(node.get("aria-label", "")),
+                )).lower()
+                if re.search(r"(review|comment|source|prompt|user-input|page-content|article-body)", names):
+                    node.decompose()
+            selected: list[str] = []
+            for node in soup.find_all(True):
+                names = " ".join((
+                    str(node.get("id", "")),
+                    " ".join(str(item) for item in (node.get("class") or [])),
+                    str(node.get("data-testid", "")),
+                    str(node.get("aria-label", "")),
+                )).lower()
+                if re.search(r"(ai[-_ ]?summary|scan[-_ ]?summary|summary|analysis|finding|recommendation|result[-_ ]?output|report[-_ ]?body)", names):
+                    text_value = node.get_text(" ", strip=True)
+                    if text_value:
+                        selected.append(text_value)
+            if selected:
+                return "\n".join(dict.fromkeys(selected))
+
+        # Plain-text reports need an explicit report/output heading before the token
+        # can be treated as generated content; mere presence in source excerpts is not enough.
+        heading = re.search(
+            r"(?:AI\s+summary|scan\s+summary|analysis|findings|recommendations|scan\s+result)\s*[:\n]\s*(.{1,20000})",
+            value, re.I | re.S,
+        )
+        return heading.group(1).strip() if heading else ""
+
     def _llm_scanner_candidates(
         self, pages: list[Page], points: list[Point] | None = None
     ) -> list[dict]:
@@ -7441,7 +7523,9 @@ class SatriaBaruScanner:
                     ))
                 )
                 if result_context:
-                    pieces.append(body)
+                    extracted = self._llm_scanner_result_text(body)
+                    if extracted:
+                        pieces.append(extracted)
             return "\n".join(pieces)
 
         # 174 excessive agency: inventory available tools, methods, and schemas.
@@ -7514,7 +7598,7 @@ class SatriaBaruScanner:
             injection_marker = f"SATRIA-INDIRECT-CANARY-{uuid.uuid4().hex[:12]}"
             private_marker = f"SATRIA-PRIVATE-CANARY-{uuid.uuid4().hex[:12]}"
             oob_url = ""
-            if self.oob and self.oob.poll_url:
+            if self.oob:
                 if self.oob.kind == "webhook_site":
                     oob_url = f"https://webhook.site/{self.oob.token}?satria={private_marker}"
                 else:
