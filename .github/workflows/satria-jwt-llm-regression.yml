@@ -89,6 +89,8 @@ jobs:
               scanner.session = requests.Session()
               scanner.started = time.monotonic()
               scanner.deadline_seconds = 300
+              scanner.request_count = 0
+              scanner._within_budget = lambda: True
               scanner.non_sql_category_request_limit = 32
               scanner._scan_progress = {"index": 16, "request_start": 0, "request_limit": 120}
               scanner._confirmed = set(initial_confirmed)
