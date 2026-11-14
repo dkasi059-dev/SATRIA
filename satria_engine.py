@@ -4912,11 +4912,11 @@ class SatriaBaruScanner:
         except Exception:
             pass
         pattern = re.compile(
-            r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{4,}\\.[A-Za-z0-9_-]{2,}\\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])"
+            r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{4,}[.][A-Za-z0-9_-]{2,}[.][A-Za-z0-9_-]*)(?![A-Za-z0-9_-])"
         )
         found: list[str] = []
         for candidate in candidates:
-            candidate = candidate.replace("\\\\u002e", ".").replace("\\\\/", "/")
+            candidate = candidate.replace("\\u002e", ".").replace("\\/", "/")
             if SatriaBaruScanner._jwt_decode(candidate.strip()):
                 found.append(candidate.strip())
             found.extend(match.group(1) for match in pattern.finditer(candidate))
@@ -5077,7 +5077,7 @@ class SatriaBaruScanner:
                 continue
             if len(signature) < len(digest_info) + 11:
                 continue
-            encoded = b"\\x00\\x01" + b"\\xff" * (len(signature) - 3 - len(digest_info)) + b"\\x00" + digest_info
+            encoded = bytes((0x00, 0x01)) + bytes((0xff,)) * (len(signature) - 3 - len(digest_info)) + bytes((0x00,)) + digest_info
             encoded_messages.append(int.from_bytes(encoded, "big"))
             signatures.append(int.from_bytes(signature, "big"))
             algorithms.append(alg)
@@ -5086,6 +5086,10 @@ class SatriaBaruScanner:
         if len(signatures) < 2:
             return None
 
+        if len(signatures) > 2:
+            pairs = [(0, 1), (0, 2), (1, 2)]
+        else:
+            pairs = [(0, 1)]
         try:
             try:
                 import gmpy2  # type: ignore
@@ -5094,10 +5098,6 @@ class SatriaBaruScanner:
                 import math
                 # Python big integers can derive the same gcd without a mandatory
                 # native dependency. Bound work to the common RSA JWT key sizes.
-                if len(signatures) > 2:
-                    pairs = [(0, 1), (0, 2), (1, 2)]
-                else:
-                    pairs = [(0, 1)]
                 gcd = math.gcd
 
             candidates: list[int] = []
@@ -5542,7 +5542,7 @@ class SatriaBaruScanner:
                 for page in pages[:60]:
                     page_blob = (getattr(page, "text", "") or "") + "\n" + (getattr(page, "js_text", "") or "")
                     for match in re.finditer(
-                        r"""(?i)["']([^"'\\s]{1,180}(?:jwks(?:\\.json)?|\\.pem|/certs|public[-_]key)[^"'\\s]{0,100})["']""",
+                        r"""(?i)["']([^"' ]{1,180}(?:jwks(?:[.]json)?|[.]pem|/certs|public[-_]key)[^"' ]{0,100})["']""",
                         page_blob,
                     ):
                         value = match.group(1)
@@ -5558,6 +5558,7 @@ class SatriaBaruScanner:
                     [urljoin(origin + "/", path.lstrip("/")) for path in known_key_paths]
                     + public_key_candidates
                 )
+                import base64 as _base64
                 pem_variants: list[str] = []
                 for key_url in list(dict.fromkeys(public_key_candidates))[:20]:
                     if 153 in self._confirmed or not self._within_budget():
