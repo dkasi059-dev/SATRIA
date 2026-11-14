@@ -6759,7 +6759,8 @@ class SatriaBaruScanner:
             for key, value in node.items():
                 if key not in visited and key not in (
                     "role", "id", "model", "created", "created_at", "object",
-                    "index", "finish_reason", "usage", "metadata",
+                    "index", "finish_reason", "usage", "metadata", "type",
+                    "name", "tool_call_id", "function_call_id",
                 ):
                     SatriaBaruScanner._llm_strings(value, out)
         elif isinstance(node, (list, tuple)):
