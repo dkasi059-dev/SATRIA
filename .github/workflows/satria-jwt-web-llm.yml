@@ -143,7 +143,7 @@ jobs:
               scanner.non_sql_category_request_limit = 32
               scanner.request_count = 0
               scanner._scan_progress = {
-                  "index": 17, "label": "JWT", "event_seq": 0,
+                  "index": 17, "total": 23, "label": "JWT", "event_seq": 0,
                   "request_start": 0, "request_limit": 160,
               }
               scanner.stats = {"requests": 0, "errors": []}
@@ -307,7 +307,7 @@ jobs:
               scanner.non_sql_category_request_limit = 32
               scanner.request_count = 0
               scanner._scan_progress = {
-                  "index": 20, "label": "Web LLM", "event_seq": 0,
+                  "index": 20, "total": 23, "label": "Web LLM", "event_seq": 0,
                   "request_start": 0, "request_limit": 100,
               }
               scanner.stats = {"requests": 0, "errors": []}
