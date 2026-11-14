@@ -435,6 +435,119 @@ jobs:
           assert "https://example.test/assistant/message" in urls
           print("PASS: JSON/SSE parsing, tool result distinction, endpoint discovery")
           PY
+
+      - name: Web LLM full safe-canary phase regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import json
+          import re
+          import sys
+          import threading
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          import requests
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+          Page = module.Page
+
+          state = {"markup": ""}
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path != "/":
+                      self.send_response(404)
+                      self.send_header("Content-Length", "0")
+                      self.end_headers()
+                      return
+                  body = f"<html><body>{state['markup']}</body></html>".encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_POST(self):
+                  size = int(self.headers.get("Content-Length", "0"))
+                  body = json.loads(self.rfile.read(size) or b"{}")
+                  prompt = str(body.get("message") or body.get("prompt") or body.get("input") or "")
+                  if isinstance(body.get("messages"), list) and body["messages"]:
+                      prompt = str(body["messages"][0].get("content", ""))
+                  if "Reply with exactly this random canary token" in prompt:
+                      match = re.search(r"(SATRIA-LLM-CANARY-[A-Fa-f0-9]+)", prompt)
+                      content = match.group(1) if match else "validation-missing"
+                      payload = {"choices": [{"message": {"role": "assistant", "content": content}}]}
+                  elif "list the exact names" in prompt.lower():
+                      content = json.dumps({"tools": [
+                          {"name": "delete_user", "description": "Delete a user account"},
+                          {"name": "query_database", "description": "Run SQL queries"},
+                      ]})
+                      payload = {"choices": [{"message": {"role": "assistant", "content": content}}]}
+                  elif "printf '%s'" in prompt:
+                      match = re.search(r"(SATRIA-CMD-CANARY-[A-Fa-f0-9]+)", prompt)
+                      marker = match.group(1) if match else "missing"
+                      payload = {"messages": [{"role": "tool", "content": "stdout: " + marker}]}
+                  elif "return this inert custom html element" in prompt.lower():
+                      match = re.search(r"(<satria-canary\b.*?</satria-canary>)", prompt, re.I | re.S)
+                      state["markup"] = match.group(1) if match else ""
+                      payload = {"choices": [{"message": {"role": "assistant", "content": state["markup"]}}]}
+                  elif "select '" in prompt.lower() and "satria_canary" in prompt.lower():
+                      match = re.search(r"SELECT '([^']+)' AS satria_canary", prompt, re.I)
+                      marker = match.group(1) if match else "missing"
+                      payload = {"messages": [{"role": "tool", "content": "query result: " + marker}]}
+                  else:
+                      payload = {"choices": [{"message": {"role": "assistant", "content": "I can summarize the supplied text."}}]}
+                  response_body = json.dumps(payload).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(response_body)))
+                  self.end_headers()
+                  self.wfile.write(response_body)
+              def log_message(self, *_args):
+                  pass
+
+          server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+          thread = threading.Thread(target=server.serve_forever, daemon=True)
+          thread.start()
+          base = f"http://127.0.0.1:{server.server_port}"
+          try:
+              scanner = Scanner.__new__(Scanner)
+              scanner.target_url = base + "/"
+              scanner.session = requests.Session()
+              scanner.timeout = 2.0
+              scanner.started = time.monotonic()
+              scanner.deadline_seconds = 40.0
+              scanner.max_requests = 400
+              scanner.non_sql_category_request_limit = 32
+              scanner.request_count = 0
+              scanner._scan_progress = {
+                  "index": 20, "total": 23, "label": "Web LLM", "event_seq": 0,
+                  "request_start": 0, "request_limit": 160,
+              }
+              scanner.stats = {"requests": 0, "errors": []}
+              scanner._confirmed = set()
+              scanner._llm_mark = lambda number, url, evidence, method: scanner._confirmed.add(number)
+              page = Page(
+                  url=base + "/",
+                  text='<script>fetch("/api/chat", {method:"POST"})</script>',
+                  js_text="",
+              )
+              scanner.phase_web_llm_attacks([page], [])
+              assert 174 in scanner._confirmed, scanner._confirmed
+              assert 175 in scanner._confirmed, scanner._confirmed
+              assert 177 in scanner._confirmed, scanner._confirmed
+              assert 180 in scanner._confirmed, scanner._confirmed
+              assert 178 not in scanner._confirmed and 179 not in scanner._confirmed and 181 not in scanner._confirmed
+              print("PASS: Web LLM inventory, read-only tools, inert output and SQL canaries")
+          finally:
+              server.shutdown()
+              server.server_close()
+              thread.join(timeout=2)
+          PY
+
       - name: Web LLM body-shape validation regression
         run: |
           python - <<'PY'
