@@ -3483,6 +3483,14 @@ class SatriaBaruScanner:
                                 "os_cmdi_blind_output_redirection",
                             )
                             break
+                    # Hapus hanya file canary yang dibuat oleh probe ini.
+                    if self._within_budget():
+                        try:
+                            self.send(point, self._os_cmdi_value(point, f"||rm -f {directory}||"))
+                        except Exception:
+                            pass
+                    if 115 in self._confirmed:
+                        break
 
         # 116/117: OOB hanya menggunakan poller yang memang dikonfigurasi pengguna.
         if self.oob and self.oob.poll_url and (
@@ -4557,11 +4565,11 @@ class SatriaBaruScanner:
         headers: dict[str, str] | None = None,
     ) -> Response:
         """Submit form reset dengan hidden/CSRF fields terbaru."""
-        identity = (
-            os.getenv("SATRIA_TEST_EMAIL")
-            or os.getenv("SATRIA_TEST_USERNAME")
-            or "wiener"
-        )
+        identity = os.getenv("SATRIA_TEST_EMAIL") or os.getenv("SATRIA_TEST_USERNAME") or ""
+        if not identity and self._jwt_is_academy_host(urlparse(self.target_url).hostname or ""):
+            identity = "wiener"
+        if not identity:
+            return Response(None, url, "", {}, 0.0, error="missing_test_reset_identity")
         source_url = url
         target_path = urlparse(url).path
         data: dict[str, str] = {}
