@@ -7154,6 +7154,79 @@ class SatriaBaruScanner:
             )
         return found[:24]
 
+    def _llm_scanner_candidates(
+        self, pages: list[Page], points: list[Point] | None = None
+    ) -> list[dict]:
+        """Temukan kontrol pemindai AI yang dipicu lewat Scan site/audit, bukan chat langsung."""
+        found: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        scan_ui_terms = (
+            "scan site", "scan this site", "scan website", "site scan",
+            "security scan", "ai scanner", "run scan", "start scan",
+        )
+        scan_route = re.compile(r"(?:^|/)(?:scan|scanner|site-scan|scan-site|audit)(?:/|$)", re.I)
+
+        def add(action: str, method: str, fields: tuple, page_url: str, source: str) -> None:
+            absolute = urljoin(page_url or self.target_url, action or page_url or self.target_url)
+            if not self._same_origin(absolute):
+                return
+            method = (method or "POST").upper()
+            key = (absolute, method)
+            if key in seen:
+                return
+            seen.add(key)
+            found.append({
+                "url": absolute, "method": method, "fields": tuple(fields or ()),
+                "page_url": page_url or self.target_url, "kind": "scanner", "source": source,
+            })
+
+        for page in pages[:100]:
+            page_url = getattr(page, "url", "") or self.target_url
+            page_blob = (
+                str(getattr(page, "text", "") or "") + "\n"
+                + str(getattr(page, "js_text", "") or "")
+            ).lower()
+            for form in (getattr(page, "forms", []) or [])[:16]:
+                fields = tuple(getattr(form, "fields", ()) or ())
+                field_text = " ".join(
+                    f"{name} {value} {kind}" for name, value, kind in fields
+                ).lower()
+                action = getattr(form, "action", "") or page_url
+                action_path = urlparse(urljoin(page_url, action)).path
+                has_scan_ui = (
+                    any(term in page_blob for term in scan_ui_terms)
+                    or any(term in field_text for term in scan_ui_terms)
+                    or bool(scan_route.search(action_path))
+                )
+                has_target_input = any(
+                    re.search(r"(url|target|site|website|domain|post|article|blog|scan)", str(name), re.I)
+                    for name, _value, _kind in fields
+                )
+                if has_scan_ui and (has_target_input or scan_route.search(action_path)):
+                    add(
+                        action, getattr(form, "method", "POST") or "POST",
+                        fields, page_url, "AI scanner HTML form",
+                    )
+
+        for point in (points or [])[:200]:
+            url = getattr(point, "url", "") or ""
+            method = (getattr(point, "method", "POST") or "POST").upper()
+            context = " ".join((
+                url, str(getattr(point, "name", "")),
+                str(getattr(point, "label", "")), str(getattr(point, "original", "")),
+            )).lower()
+            path = urlparse(url).path
+            if scan_route.search(path) or (
+                any(term in context for term in scan_ui_terms)
+                and re.search(r"(scan|audit|crawl)", context, re.I)
+            ):
+                add(
+                    url, method, tuple(getattr(point, "fields", ()) or ()),
+                    getattr(point, "page_url", "") or self.target_url,
+                    "AI scanner crawler endpoint",
+                )
+        return found[:8]
+
     def _llm_send(
         self, ep: dict, prompt: str, field: str | None = None,
         kind: str | None = None, extra: dict | None = None,
