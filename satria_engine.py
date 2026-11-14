@@ -6801,7 +6801,7 @@ class SatriaBaruScanner:
         if extracted:
             # Streaming deltas are incremental, so repeated text fragments may
             # be meaningful. Preserve event order instead of set-based deduplication.
-            joined = "\n".join(item.strip() for item in extracted if item.strip())
+            joined = "\n".join(item for item in extracted if item.strip())
             if joined.strip():
                 return joined
 
