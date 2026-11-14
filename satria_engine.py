@@ -9644,6 +9644,90 @@ class SatriaBaruScanner:
         ]
         return self._smug_build(f"GET {request_path} HTTP/1.1", headers)
 
+    def _smug_exchange(self, requests_list: list[bytes], expect: int = 2,
+                       timeout: float | None = None, pause: float = 0.0) -> tuple[list[dict[str, Any]], float, str | None]:
+        """Kirim beberapa request mentah pada satu koneksi, baca hingga `expect` respons."""
+        import socket, time as _time
+        t = timeout if timeout is not None else max(4.0, min(12.0, float(getattr(self, "timeout", 8.0) or 8.0)))
+        if not self._within_budget():
+            return [], 0.0, "budget_exhausted"
+        s = self._smug_connect(timeout=t)
+        if s is None:
+            return [], 0.0, "connect_failed"
+        start = _time.time()
+        buf = b""
+        responses: list[dict[str, Any]] = []
+        err: str | None = None
+        try:
+            for i, raw in enumerate(requests_list):
+                if not self._within_budget():
+                    err = "budget_exhausted"
+                    break
+                self.request_count += 1
+                self.stats["requests"] = self.request_count
+                request_line = raw.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+                request_parts = request_line.split()
+                safe_request = " ".join(
+                    request_parts[:1] + ([request_parts[1].split("?", 1)[0]] if len(request_parts) > 1 else [])
+                )
+                self._scan_progress_event(f"KIRIM RAW HTTP/1 {safe_request}")
+                s.sendall(raw)
+                if pause and i == 0:
+                    _time.sleep(pause)
+            # Jangan half-close koneksi sebelum respons dibaca; request terakhir
+            # pada setiap probe memakai Connection: close untuk terminasi yang eksplisit.
+            deadline = start + t
+            while _time.time() < deadline:
+                try:
+                    s.settimeout(max(0.5, min(3.0, deadline - _time.time())))
+                    chunk = s.recv(8192)
+                except socket.timeout:
+                    break
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                responses = self._smug_parse_responses(buf)
+                if len(responses) >= expect:
+                    break
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {str(exc)[:100]}"
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+        if not responses:
+            responses = self._smug_parse_responses(buf)
+        self._scan_progress_event(
+            f"RAW HTTP/1 selesai: {len(responses)} respons diterima"
+            + (f"; {err}" if err else "")
+        )
+        return responses, _time.time() - start, err
+
+    def _smug_build(self, start_line: str, headers: list[tuple[str, str]], body: bytes = b"") -> bytes:
+        _, _, host, _ = self._smug_target()
+        lines = [start_line]
+        if not any(k.lower() == "host" for k, _ in headers):
+            lines.append(f"Host: {host}")
+        lines.extend(f"{k}: {v}" for k, v in headers)
+        lines.extend(["", ""])
+        return ("\r\n".join(lines)).encode("latin-1", "ignore") + (body or b"")
+
+    def _smug_get(self, path: str | None = None, close: bool = True) -> bytes:
+        _, _, host, dpath = self._smug_target()
+        p = path or dpath or "/"
+        headers = [("Host", host), ("Connection", "close" if close else "keep-alive")]
+        return self._smug_build(f"GET {p} HTTP/1.1", headers)
+
+
+    def _smug_normal_status(self, path: str | None = None) -> tuple[int | None, str, float, str | None]:
+        res, elapsed, err = self._smug_exchange([self._smug_get(path, close=True)], 1)
+        if not res:
+            return None, "", elapsed, err
+        return res[0]["status"], res[0].get("body", ""), elapsed, err
+
     def _smug_mark(self, number: int, evidence: str, method_name: str):
         point = Point(
             key=f"smuggling-{number}", kind="endpoint",
