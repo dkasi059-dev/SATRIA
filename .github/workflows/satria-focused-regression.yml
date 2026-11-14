@@ -1,0 +1,96 @@
+name: SATRIA focused regression
+
+on:
+  push:
+    branches:
+      - fix/wcp-race-regression-v2
+
+permissions:
+  contents: read
+
+jobs:
+  focused-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install minimal runtime dependencies
+        run: python -m pip install --upgrade requests beautifulsoup4
+      - name: Compile complete engine
+        run: python -m py_compile satria_engine.py
+      - name: WCP cache-state and proof regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          from types import SimpleNamespace
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+          scanner = Scanner.__new__(Scanner)
+
+          has_cache, is_hit, summary = scanner._wcp_cache_state(
+              SimpleNamespace(headers={"Cache-Status": "edge; hit; ttl=60", "Age": "4"})
+          )
+          assert has_cache and is_hit and "cache-status" in summary.lower(), (has_cache, is_hit, summary)
+
+          has_cache, is_hit, _ = scanner._wcp_cache_state(
+              SimpleNamespace(headers={"CF-Cache-Status": "MISS"})
+          )
+          assert has_cache and not is_hit
+
+          marker = "satria-regression-marker-unique"
+          responses = iter([
+              SimpleNamespace(status=200, headers={"Cache-Control": "no-store"}, text="clean baseline", error=None),
+              SimpleNamespace(status=200, headers={"X-Cache": "MISS"}, text="origin response", error=None),
+              SimpleNamespace(status=200, headers={"X-Cache": "HIT"}, text=f"<html>{marker}</html>", error=None),
+              SimpleNamespace(status=200, headers={"Cache-Status": "edge; hit"}, text=f"<html>{marker}</html>", error=None),
+              SimpleNamespace(status=404, headers={}, text="not found", error=None),
+          ])
+          scanner._within_budget = lambda: True
+          scanner._wcp_clone_session = lambda extra_cookies=None: object()
+          scanner._request = lambda *args, **kwargs: next(responses)
+          proof = scanner._wcp_attempt("https://example.test/", marker)
+          assert proof and marker in proof and "cache-status" in proof.lower(), proof
+
+          responses = iter([
+              SimpleNamespace(status=200, headers={}, text="clean baseline", error=None),
+              SimpleNamespace(status=200, headers={}, text="origin response", error=None),
+              SimpleNamespace(status=200, headers={}, text=f"<html>{marker}</html>", error=None),
+              SimpleNamespace(status=200, headers={}, text=f"<html>{marker}</html>", error=None),
+              SimpleNamespace(status=404, headers={}, text="not found", error=None),
+          ])
+          scanner._request = lambda *args, **kwargs: next(responses)
+          assert scanner._wcp_attempt("https://example.test/", marker) is None
+
+          print("PASS: cache indicators and poisoning proof controls")
+          PY
+      - name: Race-condition helper regression
+        run: |
+          python - <<'PY'
+          import importlib.util
+          from types import SimpleNamespace
+
+          spec = importlib.util.spec_from_file_location("satria_engine", "satria_engine.py")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          Scanner = module.SatriaBaruScanner
+          scanner = Scanner.__new__(Scanner)
+
+          assert not scanner._race_rejected(SimpleNamespace(
+              status=200, text="The operation completed; no errors were reported.", headers={}, error=None
+          ))
+          assert not scanner._race_rejected(SimpleNamespace(
+              status=200, text="The request failed validation only in the optional field.", headers={}, error=None
+          ))
+          assert scanner._race_rejected(SimpleNamespace(
+              status=200, text="This token is invalid or already used.", headers={}, error=None
+          ))
+          assert scanner._race_rejected(SimpleNamespace(
+              status=429, text="Please retry later.", headers={}, error=None
+          ))
+          print("PASS: race rejection classification")
+          PY
