@@ -5510,43 +5510,7 @@ class SatriaBaruScanner:
                     from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
                     from cryptography.hazmat.primitives import serialization as _serialization
                     import base64 as _base64
-                    # Optional external JWKS pair: the user hosts the public JWK
-                    # at SATRIA_JWT_JKU_URL and supplies its matching private PEM.
-                    # Without explicit configuration, use a generated key and a
-                    # same-origin reflected JSON resource as the existing safe fallback.
-                    configured_jku = os.getenv("SATRIA_JWT_JKU_URL", "").strip()
-                    private_pem_env = os.getenv("SATRIA_JWT_JKU_PRIVATE_KEY", "").replace("\\n", "\n").strip()
-                    configured_kid = os.getenv("SATRIA_JWT_JKU_KID", "").strip()
-                    external_jku_ready = False
-                    private_key = None
-                    if configured_jku and private_pem_env:
-                        parsed_jku = urlparse(configured_jku)
-                        valid_jku = (
-                            parsed_jku.scheme in ("http", "https")
-                            and bool(parsed_jku.hostname)
-                            and not parsed_jku.username and not parsed_jku.password
-                        )
-                        host_name = (parsed_jku.hostname or "").lower().rstrip(".")
-                        if host_name in ("localhost", "localhost.localdomain") or host_name.endswith(
-                            (".localhost", ".local", ".internal", ".test", ".invalid")
-                        ):
-                            valid_jku = False
-                        try:
-                            if valid_jku:
-                                literal_ip = ipaddress.ip_address(host_name)
-                                if not literal_ip.is_global:
-                                    valid_jku = False
-                        except ValueError:
-                            pass
-                        if valid_jku:
-                            loaded = _serialization.load_pem_private_key(
-                                private_pem_env.encode(), password=None
-                            )
-                            if isinstance(loaded, _rsa.RSAPrivateKey):
-                                private_key = loaded
-                                external_jku_ready = True
-                    if private_key is None:
-                        private_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                    private_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
                     numbers = private_key.public_key().public_numbers()
 
                     def b64u_int(value: int) -> str:
@@ -5587,8 +5551,41 @@ class SatriaBaruScanner:
                     from urllib.parse import quote as _quote
                     import base64 as _base64
 
-                    private_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                    configured_jku = os.getenv("SATRIA_JWT_JKU_URL", "").strip()
+                    private_pem_env = os.getenv("SATRIA_JWT_JKU_PRIVATE_KEY", "").replace("\\n", "\n").strip()
+                    configured_kid = os.getenv("SATRIA_JWT_JKU_KID", "").strip()
+                    external_jku_ready = False
+                    private_key = None
+                    if configured_jku and private_pem_env:
+                        parsed_jku = urlparse(configured_jku)
+                        valid_jku = (
+                            parsed_jku.scheme in ("http", "https")
+                            and bool(parsed_jku.hostname)
+                            and not parsed_jku.username and not parsed_jku.password
+                        )
+                        host_name = (parsed_jku.hostname or "").lower().rstrip(".")
+                        if host_name in ("localhost", "localhost.localdomain") or host_name.endswith(
+                            (".localhost", ".local", ".internal", ".test", ".invalid")
+                        ):
+                            valid_jku = False
+                        try:
+                            if valid_jku:
+                                literal_ip = ipaddress.ip_address(host_name)
+                                if not literal_ip.is_global:
+                                    valid_jku = False
+                        except ValueError:
+                            pass
+                        if valid_jku:
+                            loaded = _serialization.load_pem_private_key(
+                                private_pem_env.encode(), password=None
+                            )
+                            if isinstance(loaded, _rsa.RSAPrivateKey):
+                                private_key = loaded
+                                external_jku_ready = True
+                    if private_key is None:
+                        private_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
                     numbers = private_key.public_key().public_numbers()
+
 
                     def b64u_int(value: int) -> str:
                         raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
