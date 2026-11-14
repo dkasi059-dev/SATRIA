@@ -3307,8 +3307,13 @@ class SatriaBaruScanner:
     # ======================== Web Cache Poisoning (118-130, bukti cache terverifikasi) ========================
 
     WCP_CACHE_KEYS = (
-        "x-cache", "x-cache-status", "cf-cache-status", "x-cache-hits",
-        "cache-status", "x-drupal-cache", "x-proxy-cache", "x-varnish-cache",
+        # Header yang secara eksplisit mengidentifikasi cache atau status cache.
+        "cache-status", "cdn-cache-status", "cf-cache-status",
+        "x-cache", "x-cache-status", "x-cache-hits", "x-cache-remote",
+        "x-proxy-cache", "x-proxy-cache-status", "x-varnish-cache",
+        "x-varnish", "x-drupal-cache", "x-litespeed-cache", "x-page-cache",
+        "x-nginx-cache", "x-sucuri-cache", "akamai-cache-status",
+        "fastly-cache-status",
     )
     WCP_ADMIN_HINTS = (
         "admin panel", "admin interface", "admin dashboard", "delete user",
@@ -3321,19 +3326,43 @@ class SatriaBaruScanner:
         self._mark(num, point, ev, method_name)
 
     def _wcp_cache_state(self, resp: Response | None) -> tuple[bool, bool, str]:
-        """(ada header cache, hit, ringkasan indikator)."""
-        headers = {str(k).lower(): str(v) for k, v in (getattr(resp, "headers", {}) or {}).items()}
+        """Mendeteksi indikator cache dan membedakan respons HIT dari MISS."""
+        headers = {
+            str(k).strip().lower(): str(v).strip()
+            for k, v in (getattr(resp, "headers", {}) or {}).items()
+        }
         found: list[str] = []
+        hit = False
         for key in self.WCP_CACHE_KEYS:
-            val = (headers.get(key) or "").strip()
-            if val:
-                found.append(f"{key}={val}")
-        age = (headers.get("age") or "").strip()
-        if age.isdigit() and int(age) >= 1:
-            found.append(f"age={age}")
-        hit = any(("hit" in item.lower() or "cached" in item.lower() or "fresh" in item.lower())
-                  for item in found)
-        return bool(found), hit, "; ".join(found[:4])
+            value = headers.get(key, "")
+            if not value:
+                continue
+            found.append(f"{key}={value}")
+            if re.search(r"\b(hit|cached|fresh|stale|revalidated)\\b", value, re.I):
+                hit = True
+            if key == "x-cache-hits":
+                try:
+                    hit = hit or int(value.split(",", 1)[0].strip()) > 0
+                except (TypeError, ValueError):
+                    pass
+
+        # Server-Timing lazim dipakai CDN untuk mengirim status seperti cdn-cache;desc=HIT.
+        server_timing = headers.get("server-timing", "")
+        if server_timing and re.search(r"cache", server_timing, re.I):
+            found.append(f"server-timing={server_timing}")
+            if re.search(r"\b(hit|cached|fresh|stale|revalidated)\\b", server_timing, re.I):
+                hit = True
+
+        age = headers.get("age", "")
+        try:
+            age_value = int(age)
+        except (TypeError, ValueError):
+            age_value = 0
+        if age_value > 0:
+            found.append(f"age={age_value}")
+            hit = True
+
+        return bool(found), hit, "; ".join(found[:6])
 
     @staticmethod
     def _wcp_has(resp: Response | None, marker: str) -> bool:
@@ -3391,50 +3420,91 @@ class SatriaBaruScanner:
     def _wcp_attempt(self, base: str, marker: str, *, headers: dict | None = None,
                      cookies: dict | None = None, method: str = "GET", data: Any = None,
                      poison_url: str | None = None, require_dom: bool = False) -> str | None:
-        """Bukti poisoning: marker tidak ada pada baseline, muncul pada permintaan BERSIH tanpa marker,
-        dan hilang pada permintaan cache-buster. Sesi poison dan sesi bersih dipisah (anti-FP cookie)."""
+        """Konfirmasi poisoning lewat baseline no-store, dua klien bersih, dan bukti cache HIT."""
         if not self._within_budget():
             return None
-        clean_sess = self._wcp_clone_session()
+
+        baseline_sess = self._wcp_clone_session()
         poison_sess = self._wcp_clone_session(cookies)
+        clean_sess = self._wcp_clone_session()
+        verify_sess = self._wcp_clone_session()
         purl = poison_url or base
+
+        # Marker acak harus tidak ada sebelum injeksi. no-store mencegah baseline
+        # menghangatkan atau mengganti objek yang sedang diuji pada shared cache.
+        baseline = self._request(
+            "GET", base, session=baseline_sess,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            allow_redirects=True,
+        )
+        if baseline is None or baseline.error or self._wcp_has(baseline, marker):
+            return None
+
         pr = None
         cr = None
         for _attempt in range(3):
             if not self._within_budget():
                 return None
-            pr = self._request(method, purl, session=poison_sess, headers=headers, data=data,
-                               allow_redirects=True)
-            if pr.error:
-                return None
+            pr = self._request(
+                method, purl, session=poison_sess, headers=headers, data=data,
+                allow_redirects=True,
+            )
+            if pr is None or pr.error:
+                continue
             time.sleep(0.15)
             cr = self._request("GET", base, session=clean_sess, allow_redirects=True)
             if cr is not None and not cr.error and self._wcp_has(cr, marker):
                 break
             time.sleep(0.25)
+
         if cr is None or cr.error or not self._wcp_has(cr, marker):
             return None
+
+        # Permintaan dari sesi kedua memastikan marker bukan artefak sesi poison,
+        # cookie khusus, atau sekadar refleksi yang sama pada koneksi asal.
+        if not self._within_budget():
+            return None
+        vr = self._request("GET", base, session=verify_sess, allow_redirects=True)
+        if vr is None or vr.error or not self._wcp_has(vr, marker):
+            return None
+
+        has_ch, hit_ch, ind_ch = self._wcp_cache_state(cr)
+        has_vh, hit_vh, ind_vh = self._wcp_cache_state(vr)
+        has_ph, _hit_ph, ind_ph = self._wcp_cache_state(pr)
+        if not (has_ch or has_vh or has_ph):
+            return None
+        # Header cache tanpa HIT belum membuktikan respons bersih benar-benar
+        # diambil dari cache; minimal satu respons bersih harus menunjukkan HIT/Age.
+        if not (hit_ch or hit_vh):
+            return None
+
         bpu = urlparse(base)
         bypass_url = f"{bpu.scheme}://{bpu.netloc}/satria-nocache-{uuid.uuid4().hex[:10]}"
-        br = self._request("GET", bypass_url, session=self._wcp_clone_session(), allow_redirects=True)
+        br = self._request(
+            "GET", bypass_url, session=self._wcp_clone_session(),
+            allow_redirects=True,
+        )
         if br and not br.error and self._wcp_has(br, marker):
-            return None  # marker muncul pada path lain tanpa input -> refleksi/stored, bukan cache
-        has_ch, hit_ch, ind_ch = self._wcp_cache_state(cr)
-        has_ph, hit_ph, ind_ph = self._wcp_cache_state(pr)
-        if not (has_ch or has_ph):
-            return None  # tidak ada bukti lapisan cache sama sekali
+            return None
+
         if require_dom:
             body = (cr.text or "").lower()
             idx = body.find(marker.lower())
             window = body[max(0, idx - 200): idx + 220] if idx >= 0 else ""
             if not any(tag in window for tag in ("<script", ".js", "src=", "href=")):
                 return None
-            if not any(sink in body for sink in ("innerhtml", "document.write", "insertadjacenthtml",
-                                                "location.hash", "eval(", "setinnerhtml")):
+            if not any(sink in body for sink in (
+                "innerhtml", "document.write", "insertadjacenthtml",
+                "location.hash", "eval(", "setinnerhtml",
+            )):
                 return None
-        ind = ind_ch or ind_ph
-        return (f"marker unik {marker!r} tidak ada pada baseline {base}, muncul pada permintaan bersih "
-                f"(HTTP {cr.status}) tanpa membawa marker, dan hilang pada cache-buster; indikator cache: {ind}.")
+
+        ind = ind_vh or ind_ch or ind_ph
+        return (
+            f"marker unik {marker!r} tidak ada pada baseline no-store, muncul pada "
+            f"dua permintaan GET bersih dari sesi berbeda tanpa membawa marker, "
+            f"dan hilang pada cache-buster; cache HIT teramati: {ind}."
+        )
 
     def phase_web_cache_poisoning(self, pages: list[Page], points: list[Point]) -> None:
         """118-130: konfirmasi hanya bila respons bersih benar-benar dilayani dari cache berisi marker."""
@@ -5815,7 +5885,8 @@ class SatriaBaruScanner:
         if headers:
             base_headers.update(headers)
         base_headers.pop("Cache-Control", None)
-        cookies = list(session.cookies) if session is not None else []
+        cookie_source = session if session is not None else self.session
+        cookies = list(cookie_source.cookies) if cookie_source is not None else []
 
         def reserve_request() -> bool:
             with budget_lock:
@@ -5881,7 +5952,8 @@ class SatriaBaruScanner:
         if session is not None:
             base_headers.update(dict(session.headers))
         base_headers.pop("Cache-Control", None)
-        cookies = list(session.cookies) if session is not None else []
+        cookie_source = session if session is not None else self.session
+        cookies = list(cookie_source.cookies) if cookie_source is not None else []
 
         def worker(spec: tuple[str, str, Any]) -> Response:
             method, url, payload = spec
@@ -5938,13 +6010,22 @@ class SatriaBaruScanner:
 
     @staticmethod
     def _race_rejected(resp: Response | None) -> bool:
+        """Tolak respons dengan sinyal penolakan spesifik, bukan kata generik."""
+        if resp is None or getattr(resp, "error", None):
+            return True
         body = getattr(resp, "text", "") or ""
         headers = getattr(resp, "headers", {}) or {}
         low = (body + " " + " ".join(f"{key}: {value}" for key, value in headers.items())).lower()
-        return bool(resp) and (resp.status in (400, 401, 403, 404, 409, 410, 422, 429) or any(
-            k in low for k in ("already", "invalid", "expired", "too many", "not allowed",
-                               "only one", "error", "failed", "used", "/login", "signin", "sign-in",
-                               "unauthorized", "access denied")))
+        rejected_phrases = (
+            "already used", "already redeemed", "already claimed", "already exists",
+            "invalid token", "invalid or expired", "token expired", "expired token",
+            "too many requests", "rate limit", "limit exceeded", "not allowed",
+            "only one", "already applied", "already submitted", "unauthorized",
+            "access denied", "try again later",
+        )
+        return resp.status in (400, 401, 403, 404, 409, 410, 422, 429) or any(
+            phrase in low for phrase in rejected_phrases
+        )
 
     def _race_endpoint_exists(self, url: str, session: requests.Session | None) -> bool:
         r = self._request("GET", url, session=session, allow_redirects=False)
@@ -6187,15 +6268,31 @@ class SatriaBaruScanner:
                                     f"paralel dengan dua nilai diterima dan email akun berubah.", "race_single_endpoint")
                     break
 
-        # ---- 172: token time-sensitive dipakai berkali-kali ----
+        # ---- 172: token sekali-pakai pada alur sensitif waktu ----
         if 172 not in self._confirmed and self._within_budget():
             token_forms: list[FormSpec] = []
+            one_time_context = re.compile(
+                r"(redeem|reset|verify|verification|confirm|confirmation|activate|activation|"
+                r"voucher|coupon|gift|invite|invitation|transfer|payment|checkout|withdraw|"
+                r"password|one[-_ ]time|otp|magic[-_ ]link)",
+                re.I,
+            )
             for pg in pages[:30]:
                 for form in (getattr(pg, "forms", []) or []):
                     if str(form.method).lower() != "post" or not self._same_origin(form.action):
                         continue
-                    if any("token" in str(n).lower() for n, _v, _t in form.fields):
+                    if not any("token" in str(name).lower() for name, _value, _kind in form.fields):
+                        continue
+                    action_url = urljoin(form.page_url, form.action)
+                    context = " ".join((
+                        action_url, getattr(form, "page_url", ""),
+                        *(str(name) for name, _value, _kind in form.fields),
+                    ))
+                    # CSRF/session tokens pada formulir umum boleh dipakai ulang;
+                    # hanya token dalam alur yang semestinya sekali-pakai diuji di sini.
+                    if one_time_context.search(context):
                         token_forms.append(form)
+
             for form in token_forms[:4]:
                 if not self._within_budget():
                     break
@@ -6214,22 +6311,46 @@ class SatriaBaruScanner:
                 token_field = next((name for name in data if "token" in name.lower()), None)
                 if not token_field or not data.get(token_field):
                     continue
-                # Gunakan token valid yang benar-benar diterbitkan aplikasi; token acak
-                # akan menguji validasi token, bukan race pada pemakaian token.
+
+                action_url = urljoin(refreshed.page_url, refreshed.action)
+                # Token yang sama dikirim paralel; sesudahnya replay sekuensial harus
+                # ditolak karena token sekali-pakai telah dikonsumsi.
                 burst = self._race_burst(
                     session, refreshed.method.upper() or "POST",
-                    urljoin(refreshed.page_url, refreshed.action), [data] * 8, n=8
+                    action_url, [data] * 4, n=4,
                 )
                 accepted = [
-                    r for r in burst
-                    if self._race_ok(r) and not self._race_rejected(r)
-                    and (r.status in (201, 202, 302, 303)
-                         or self._race_has(r, "success", "verified", "confirmed", "completed", "updated"))
+                    response for response in burst
+                    if self._race_ok(response) and not self._race_rejected(response)
+                    and (
+                        response.status in (201, 202, 302, 303)
+                        or self._race_has(
+                            response, "success", "verified", "confirmed",
+                            "completed", "updated", "redeemed",
+                        )
+                    )
                 ]
-                if len(accepted) >= 2:
-                    self._race_mark(172, refreshed.action,
-                                    f"Time-sensitive race window terverifikasi: token valid yang sama diterima "
-                                    f"{len(accepted)}/8 kali pada {refreshed.action}.", "race_time_sensitive")
+                if not self._within_budget():
+                    continue
+                replay = self._request(
+                    "POST", action_url, session=session, data=data, allow_redirects=False
+                )
+                replay_token_rejected = bool(replay) and (
+                    replay.status in (409, 410, 422)
+                    or self._race_has(
+                        replay, "already used", "already redeemed", "token expired",
+                        "invalid token", "invalid or expired", "token has expired",
+                        "already consumed", "one-time token",
+                    )
+                )
+                if len(accepted) >= 2 and replay_token_rejected:
+                    self._race_mark(
+                        172, action_url,
+                        f"Race pada token sekali-pakai terverifikasi: token valid yang sama "
+                        f"diterima {len(accepted)}/4 kali secara paralel, tetapi replay "
+                        f"sekuensial sesudah burst ditolak (HTTP {replay.status}).",
+                        "race_time_sensitive",
+                    )
                     break
 
         # ---- 173: partial construction pada registrasi (akun terbentuk dengan state parsial) ----
