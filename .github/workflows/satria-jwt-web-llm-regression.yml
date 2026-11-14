@@ -102,18 +102,18 @@ jobs:
 
           # OpenAI-compatible SSE deltas must remain adjacent to preserve canaries.
           sse = (
-              'data: {"choices":[{"delta":{"content":"SATRIA-"}}]}\\n'
-              'data: {"choices":[{"delta":{"content":"CANARY-123"}}]}\\n'
-              'data: [DONE]\\n'
+              'data: {"choices":[{"delta":{"content":"SATRIA-"}}]}\n'
+              'data: {"choices":[{"delta":{"content":"CANARY-123"}}]}\n'
+              'data: [DONE]\n'
           )
           response = module.Response(200, "https://example.test/api/chat", sse, {}, 0.01)
           assert Scanner._llm_text(response) == "SATRIA-CANARY-123", Scanner._llm_text(response)
 
           # Anthropic-compatible content_block_delta and Gemini parts payloads.
           anthropic = (
-              'event: content_block_delta\\n'
-              'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello "}}\\n'
-              'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}\\n'
+              'event: content_block_delta\n'
+              'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello "}}\n'
+              'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}\n'
           )
           assert Scanner._llm_text(module.Response(200, "u", anthropic, {}, 0.01)) == "hello world"
           gemini = '{"candidates":[{"content":{"parts":[{"text":"gemini answer"}]}}]}'
@@ -121,7 +121,7 @@ jobs:
 
           # The scanner must not confuse a tool-call argument with a tool result.
           tool_result = (
-              'data: {"type":"tool_result","content":[{"type":"text","text":"SATRIA-CMD-123"}]}\\n'
+              'data: {"type":"tool_result","content":[{"type":"text","text":"SATRIA-CMD-123"}]}\n'
           )
           assert Scanner._llm_tool_evidence(
               module.Response(200, "u", tool_result, {}, 0.01), "SATRIA-CMD-123"
