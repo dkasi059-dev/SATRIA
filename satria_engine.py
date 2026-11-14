@@ -4816,6 +4816,15 @@ class SatriaBaruScanner:
         self._mark(num, point, ev, method_name)
 
     @staticmethod
+    def _jwt_is_academy_host(host: str) -> bool:
+        value = str(host or "").strip().lower().rstrip(".")
+        return (
+            value in ("portswigger.net", "web-security-academy.net")
+            or value.endswith(".portswigger.net")
+            or value.endswith(".web-security-academy.net")
+        )
+
+    @staticmethod
     def _jwt_b64d(value: str) -> bytes:
         import base64
         s = str(value or "")
@@ -4941,7 +4950,7 @@ class SatriaBaruScanner:
             password = os.getenv("SATRIA_TEST_PASSWORD", "")
             if user and password:
                 credentials.append((user, password))
-            if host.endswith("web-security-academy.net") or host.endswith("portswigger.net"):
+            if self._jwt_is_academy_host(host):
                 credentials.extend((("wiener", "peter"), ("carlos", "montoya")))
         if not credentials:
             return None
@@ -5660,7 +5669,7 @@ class SatriaBaruScanner:
                 # low-privilege test accounts when available.
                 host = (urlparse(self.target_url).hostname or "").lower()
                 candidate_credentials: list[tuple[str, str]] = []
-                if host.endswith("web-security-academy.net") or host.endswith("portswigger.net"):
+                if self._jwt_is_academy_host(host):
                     candidate_credentials = [("wiener", "peter"), ("carlos", "montoya")]
                 else:
                     env_user = os.getenv("SATRIA_TEST_USERNAME", "").strip()
@@ -6818,10 +6827,23 @@ class SatriaBaruScanner:
         raw = str(getattr(resp, "text", "") or "")
         if marker not in raw:
             return False
+        candidates: list[Any] = []
         try:
-            parsed = json.loads(raw)
+            candidates.append(json.loads(raw))
         except Exception:
-            parsed = None
+            pass
+        if "data:" in raw:
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                event_data = line[5:].strip()
+                if not event_data or event_data == "[DONE]":
+                    continue
+                try:
+                    candidates.append(json.loads(event_data))
+                except Exception:
+                    continue
 
         def has_tool_result(node: Any) -> bool:
             if isinstance(node, dict):
@@ -6841,7 +6863,7 @@ class SatriaBaruScanner:
                 return any(has_tool_result(value) for value in node)
             return False
 
-        if parsed is not None and has_tool_result(parsed):
+        if any(has_tool_result(candidate) for candidate in candidates):
             return True
         low = raw.lower()
         explicit_result_terms = (
@@ -6919,6 +6941,9 @@ class SatriaBaruScanner:
             for match in route_pattern.finditer(page_blob):
                 value = match.group(1)
                 if value.startswith("/") or value.startswith("http"):
+                    add(value, "POST", "json", "message", page_url=page_url, source="HTML/JavaScript")
+                elif "/" in value or value.lower().startswith(("api", "chat", "assistant", "llm")):
+                    # Resolve relative fetch()/axios routes against the page URL.
                     add(value, "POST", "json", "message", page_url=page_url, source="HTML/JavaScript")
 
         for point in (points or [])[:160]:
