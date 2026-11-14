@@ -4857,6 +4857,12 @@ class SatriaBaruScanner:
             if url in seen or not self._same_origin(url):
                 continue
             response = self._request("GET", url, allow_redirects=False)
+            if response.status in (301, 302, 303, 307, 308):
+                location = (response.headers or {}).get("Location") or (response.headers or {}).get("location")
+                redirected = urljoin(url, str(location or ""))
+                if location and self._same_origin(redirected):
+                    response = self._request("GET", redirected, allow_redirects=False)
+                    url = redirected
             if response.error or response.status != 200 or not response.text:
                 continue
             content_type = str((response.headers or {}).get("Content-Type", "")).lower()
@@ -7045,10 +7051,14 @@ class SatriaBaruScanner:
                 field = next((name for name in names if name.lower() in text_fields), "")
                 looks_like_chat = any(term in hint for term in llm_hints) or bool(field)
                 if looks_like_chat and field:
+                    form_source = (
+                        "HTML form" if any(term in hint for term in llm_hints)
+                        else "crawler endpoint"
+                    )
                     add(
                         action, getattr(form, "method", "POST") or "POST",
                         "form", field, tuple(getattr(form, "fields", ())),
-                        page_url=page_url, source="HTML form",
+                        page_url=page_url, source=form_source,
                     )
 
             page_blob = (
@@ -7105,7 +7115,8 @@ class SatriaBaruScanner:
             "/ask", "/api/ask", "/prompt", "/api/prompt",
             "/completion", "/api/completion", "/api/completions",
             "/conversation", "/api/conversation", "/api/conversations",
-            "/v1/chat/completions", "/v1/responses", "/responses", "/api/responses",
+            "/v1/chat/completions", "/v1/completions",
+            "/v1/responses", "/responses", "/api/responses",
             "/generate", "/api/generate", "/api/infer", "/inference",
             "/api/inference", "/api/predict", "/predict",
         )
@@ -7246,6 +7257,7 @@ class SatriaBaruScanner:
             "/chat", "/live-chat", "/assistant", "/support/chat", "/support",
             "/ask", "/ai", "/bot", "/chatbot",
         )
+        seen_llm_script_urls: set[str] = set()
         for path in surface_paths:
             if not self._within_budget():
                 break
@@ -7264,6 +7276,18 @@ class SatriaBaruScanner:
                 for script in soup.find_all("script")
                 if script.string
             ]
+            # Bundle frontend same-origin saja; batasi total fetch agar tidak
+            # berubah menjadi crawler aset tanpa batas.
+            for script in soup.find_all("script", src=True):
+                if len(seen_llm_script_urls) >= 10 or not self._within_budget():
+                    break
+                script_url = urljoin(surface.url or surface_url, str(script.get("src") or ""))
+                if not self._same_origin(script_url) or script_url in seen_llm_script_urls:
+                    continue
+                seen_llm_script_urls.add(script_url)
+                script_response = self._request("GET", script_url, allow_redirects=False)
+                if not script_response.error and script_response.text:
+                    inline_js.append(script_response.text[:120_000])
             llm_pages.append(Page(
                 url=surface.url or surface_url,
                 text=surface.text,
