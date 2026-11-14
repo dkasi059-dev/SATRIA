@@ -5086,20 +5086,20 @@ class SatriaBaruScanner:
         if len(signatures) < 2:
             return None
 
+        try:
+            import gmpy2  # type: ignore
+            gcd = lambda a, b: int(gmpy2.gcd(gmpy2.mpz(a), gmpy2.mpz(b)))
+        except Exception:
+            # RSA sign2n requires GCD over tens of millions of bits. A Python
+            # fallback can stall the scanner for minutes, so this technique is
+            # skipped cleanly when the optimized dependency is unavailable.
+            return None
+
         if len(signatures) > 2:
             pairs = [(0, 1), (0, 2), (1, 2)]
         else:
             pairs = [(0, 1)]
         try:
-            try:
-                import gmpy2  # type: ignore
-                gcd = lambda a, b: int(gmpy2.gcd(gmpy2.mpz(a), gmpy2.mpz(b)))
-            except Exception:
-                import math
-                # Python big integers can derive the same gcd without a mandatory
-                # native dependency. Bound work to the common RSA JWT key sizes.
-                gcd = math.gcd
-
             gcd_values: list[int] = []
             for left, right in pairs:
                 a = pow(signatures[left], exponent) - encoded_messages[left]
