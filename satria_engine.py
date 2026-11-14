@@ -4922,21 +4922,27 @@ class SatriaBaruScanner:
             found.extend(match.group(1) for match in pattern.finditer(candidate))
         return list(dict.fromkeys(token for token in found if SatriaBaruScanner._jwt_decode(token)))
 
-    def _jwt_login(self, pages: list[Page]) -> requests.Session | None:
+    def _jwt_login(
+        self, pages: list[Page], *, reuse_existing: bool = True,
+        credentials_override: list[tuple[str, str]] | None = None,
+    ) -> requests.Session | None:
         """Gunakan sesi/token yang sudah ada; kredensial lab hanya dicoba pada lab PortSwigger."""
         self._jwt_login_artifacts = []
         existing = self._jwt_collect_tokens(pages, self.session)
-        if existing:
+        if existing and reuse_existing:
             return self.session
 
         host = (urlparse(self.target_url).hostname or "").lower()
         credentials: list[tuple[str, str]] = []
-        user = os.getenv("SATRIA_TEST_USERNAME", "").strip()
-        password = os.getenv("SATRIA_TEST_PASSWORD", "")
-        if user and password:
-            credentials.append((user, password))
-        if host.endswith("web-security-academy.net") or host.endswith("portswigger.net"):
-            credentials.append(("wiener", "peter"))
+        if credentials_override is not None:
+            credentials.extend(credentials_override)
+        else:
+            user = os.getenv("SATRIA_TEST_USERNAME", "").strip()
+            password = os.getenv("SATRIA_TEST_PASSWORD", "")
+            if user and password:
+                credentials.append((user, password))
+            if host.endswith("web-security-academy.net") or host.endswith("portswigger.net"):
+                credentials.extend((("wiener", "peter"), ("carlos", "montoya")))
         if not credentials:
             return None
 
@@ -5647,14 +5653,33 @@ class SatriaBaruScanner:
                     candidate for candidate, _loc, _name in tokens
                     if str((self._jwt_decode(candidate) or {}).get("header", {}).get("alg", "")).upper().startswith("RS")
                 ]
-                if len(rsa_tokens) < 2 and self._within_budget():
-                    fresh_session = self._jwt_login(pages)
+                # A pairwise GCD can retain a cofactor. Collect up to three
+                # distinct RS* samples; on PortSwigger use the two supplied
+                # low-privilege test accounts when available.
+                host = (urlparse(self.target_url).hostname or "").lower()
+                candidate_credentials: list[tuple[str, str]] = []
+                if host.endswith("web-security-academy.net") or host.endswith("portswigger.net"):
+                    candidate_credentials = [("wiener", "peter"), ("carlos", "montoya")]
+                else:
+                    env_user = os.getenv("SATRIA_TEST_USERNAME", "").strip()
+                    env_pass = os.getenv("SATRIA_TEST_PASSWORD", "")
+                    if env_user and env_pass:
+                        candidate_credentials = [(env_user, env_pass)]
+                for credentials_pair in candidate_credentials:
+                    if len(rsa_tokens) >= 3 or not self._within_budget():
+                        break
+                    fresh_session = self._jwt_login(
+                        pages, reuse_existing=False,
+                        credentials_override=[credentials_pair],
+                    )
                     extra_tokens = self._jwt_collect_tokens(pages, fresh_session) if fresh_session else []
                     for candidate, _loc, _name in extra_tokens:
                         if candidate not in rsa_tokens and str(
                             (self._jwt_decode(candidate) or {}).get("header", {}).get("alg", "")
                         ).upper().startswith("RS"):
                             rsa_tokens.append(candidate)
+                            if len(rsa_tokens) >= 3:
+                                break
                 if len(rsa_tokens) >= 2:
                     derived = self._jwt_rsa_pem_from_tokens(rsa_tokens[:3])
                     if derived:
